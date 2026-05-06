@@ -43,8 +43,8 @@ def dag_failure_alert(context):
     exception = str(context.get("exception", "Unknown"))[:200]
 
     base_url = airflow_conf.get("webserver", "base_url", fallback="").rstrip("/")
-    dag_run_url = f"{base_url}/dags/{dag_id}/grid?dag_run_id={run_id}" if base_url else ""
-    link = f"<{dag_run_url}|View DAG Run>" if dag_run_url else f"DAG Run: `{run_id}`"
+    dag_url = f"{base_url}/dags/{dag_id}/" if base_url else ""
+    link = f"<{dag_url}|View DAG>" if dag_url else f"DAG: `{dag_id}`"
 
     SlackWebhookHook(slack_webhook_conn_id=SLACK_CONN_ID).send_text(
         f":red_circle: *DAG Failed*\n"
