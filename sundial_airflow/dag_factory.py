@@ -38,7 +38,7 @@ from sundial_airflow.hooks import (
     skip_unselected,
 )
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import task_failure_alert
+from sundial_airflow.slack_alerts import dag_failure_alert
 from sundial_airflow.source_discovery import discover_source_tables_with_tests
 
 logger = logging.getLogger(__name__)
@@ -112,9 +112,9 @@ def make_dbt_dag(
         The default dataset (BigQuery) or schema (Snowflake) that gets used
         when no value is supplied via the DAG params.
     default_args:
-        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory always
-        injects ``on_failure_callback=task_failure_alert``; pass your own to
-        override.
+        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory wires
+        ``dag_failure_alert`` as the DAG-level ``on_failure_callback`` so it
+        fires once per failed DAG run rather than on every failed task.
     extra_tags:
         Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
     pre_tasks:
@@ -135,10 +135,8 @@ def make_dbt_dag(
 
     merged_default_args = {
         **DEFAULT_DEFAULT_ARGS,
-        "on_failure_callback": task_failure_alert,
         **(default_args or {}),
     }
-    merged_default_args.setdefault("on_failure_callback", task_failure_alert)
 
     tags = ["dbt", f"tenant:{tenant}", *(extra_tags or [])]
 
@@ -164,6 +162,7 @@ def make_dbt_dag(
         render_template_as_native_obj=True,
         default_args=merged_default_args,
         params=params,
+        on_failure_callback=dag_failure_alert,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID)
