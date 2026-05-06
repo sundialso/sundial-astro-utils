@@ -72,8 +72,6 @@ def make_dbt_dag(
     venv_execution_config: Any,
     profile_config_factory: Callable[[str, str | None], Any],
     default_dataset_or_schema: str,
-    bigquery: dict[str, Any] | None = None,
-    snowflake: dict[str, Any] | None = None,
     default_args: dict[str, Any] | None = None,
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
@@ -96,8 +94,8 @@ def make_dbt_dag(
         Short tenant slug; used in the Slack alert and the
         ``run_context_tag`` (``"<tenant>_normal"``, etc).
     warehouse:
-        ``"bigquery"`` or ``"snowflake"``. Picks the report task variant and
-        the ``target_dataset`` / ``target_schema`` var key.
+        ``"bigquery"`` or ``"snowflake"``. Controls the ``target_dataset``
+        vs ``target_schema`` var key passed to dbt.
     dbt_project_path:
         Absolute path to the dbt project (the directory containing
         ``dbt_project.yml``).
@@ -113,12 +111,6 @@ def make_dbt_dag(
     default_dataset_or_schema:
         The default dataset (BigQuery) or schema (Snowflake) that gets used
         when no value is supplied via the DAG params.
-    bigquery:
-        Required when ``warehouse="bigquery"``. Dict with keys:
-        ``project``, ``location``, ``gcp_conn_id``.
-    snowflake:
-        Required when ``warehouse="snowflake"``. Dict with keys:
-        ``conn_id``, ``warehouse``.
     default_args:
         Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory always
         injects ``on_failure_callback=task_failure_alert``; pass your own to
@@ -133,19 +125,7 @@ def make_dbt_dag(
     recursive_tests:
         Tuning knobs with sensible defaults; see the implementation.
     """
-    if warehouse == "bigquery":
-        if not bigquery:
-            raise ValueError("bigquery={...} is required when warehouse='bigquery'")
-        for key in ("project", "location", "gcp_conn_id"):
-            if key not in bigquery:
-                raise ValueError(f"bigquery['{key}'] is required")
-    elif warehouse == "snowflake":
-        if not snowflake:
-            raise ValueError("snowflake={...} is required when warehouse='snowflake'")
-        for key in ("conn_id", "warehouse"):
-            if key not in snowflake:
-                raise ValueError(f"snowflake['{key}'] is required")
-    else:  # pragma: no cover - guarded by Literal
+    if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
 
     project_path_str = str(dbt_project_path)
@@ -352,24 +332,6 @@ def make_dbt_dag(
             trigger_rule="none_failed",
         )
 
-        if warehouse == "bigquery":
-            from sundial_airflow.reports.bigquery import make_report_task
-
-            report_task = make_report_task(
-                bq_project=bigquery["project"],
-                bq_location=bigquery["location"],
-                gcp_conn_id=bigquery["gcp_conn_id"],
-            )
-        else:
-            from sundial_airflow.reports.snowflake import make_report_task
-
-            report_task = make_report_task(
-                snowflake_conn_id=snowflake["conn_id"],
-                warehouse=snowflake["warehouse"],
-            )
-
-        pipeline_report = report_task()
-
         # Optional pre-tasks (e.g. ami_dbt's S3 -> Snowflake EMR ingest) run
         # serially before ``prepare_dbt_args``. ``pre_tasks`` items are
         # zero-arg factories that build the TaskFlow task instance.
@@ -379,12 +341,6 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        (
-            dbt_args
-            >> source_test_group
-            >> source_tests_gate
-            >> dbt_models
-            >> pipeline_report
-        )
+        dbt_args >> source_test_group >> source_tests_gate >> dbt_models
 
     return _build()

@@ -15,7 +15,6 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |
-| `sundial_airflow.reports.bigquery` / `.snowflake` | The cost / bytes-processed report task. |
 
 ## Using it from a tenant repo
 
@@ -35,8 +34,6 @@ from sundial_airflow.dag_factory import make_dbt_dag
 
 from include.constants import (
     DBT_BQ_DATASET,
-    DBT_BQ_PROJECT,
-    DBT_GCP_CONN_ID,
     dbt_project_path,
     get_profile_config,
     venv_execution_config,
@@ -53,11 +50,6 @@ dag = make_dbt_dag(
     venv_execution_config=venv_execution_config,
     profile_config_factory=get_profile_config,
     default_dataset_or_schema=DBT_BQ_DATASET,
-    bigquery={
-        "project": DBT_BQ_PROJECT,
-        "location": "US",
-        "gcp_conn_id": DBT_GCP_CONN_ID,
-    },
     default_args={
         "retries": 1,
         "retry_delay": timedelta(minutes=5),
@@ -75,7 +67,6 @@ The factory takes care of:
   selection via `dbt ls`.
 - Per-source-table `DbtTestLocalOperator`s.
 - The Cosmos `DbtTaskGroup`.
-- `report_data_processed` (BigQuery or Snowflake variant).
 
 ## Local development
 
