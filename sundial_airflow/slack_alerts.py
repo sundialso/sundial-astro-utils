@@ -38,9 +38,15 @@ def dag_failure_alert(context):
     tenant = _resolve_tenant(context)
     dag_id = dag_run.dag_id if dag_run else context["task_instance"].dag_id
     run_id = dag_run.run_id if dag_run else "unknown"
-    exec_date = context.get("logical_date") or context.get("execution_date")
-    exec_date_str = exec_date.strftime("%Y-%m-%d %H:%M") if exec_date else "unknown"
-    exception = str(context.get("exception", "Unknown"))[:200]
+
+    failed_tasks = (
+        ", ".join(
+            f"`{ti.task_id}`"
+            for ti in dag_run.get_task_instances(state="failed")
+        )
+        if dag_run
+        else "unknown"
+    )
 
     base_url = airflow_conf.get("webserver", "base_url", fallback="").rstrip("/")
     dag_url = f"{base_url}/dags/{dag_id}/" if base_url else ""
@@ -51,7 +57,6 @@ def dag_failure_alert(context):
         f"*Tenant:* `{tenant}`\n"
         f"*DAG:* `{dag_id}`\n"
         f"*Run ID:* `{run_id}`\n"
-        f"*Execution:* {exec_date_str}\n"
-        f"*Error:* `{exception}`\n"
+        f"*Failed Tasks:* {failed_tasks}\n"
         f"{link}"
     )
