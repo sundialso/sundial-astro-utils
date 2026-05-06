@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sundialso/sundial-airflow-utils"
+Homepage = "https://github.com/sundial-astro-sdk/sundial-astro-utils"
 
 [tool.setuptools.packages.find]
 include = ["sundial_airflow*"]

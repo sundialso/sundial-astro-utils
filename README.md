@@ -21,8 +21,12 @@ its own connection IDs, schedule, and dbt project files.
 In `requirements.txt`:
 
 ```
-sundial-airflow-utils @ git+https://github.com/sundialso/sundial-airflow-utils.git@main
+sundial-airflow-utils @ git+https://github.com/sundial-astro-sdk/sundial-astro-utils.git@main
 ```
+
+(Or, if you're using the BuildKit secrets pattern recommended for tenant
+Dockerfiles, install the SDK from a Dockerfile `RUN` step instead. See
+`citizen_dbt/Dockerfile` for the canonical example.)
 
 In a DAG file:
 
