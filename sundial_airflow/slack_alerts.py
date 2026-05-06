@@ -39,14 +39,15 @@ def dag_failure_alert(context):
     dag_id = dag_run.dag_id if dag_run else context["task_instance"].dag_id
     run_id = dag_run.run_id if dag_run else "unknown"
 
-    failed_tasks = (
-        ", ".join(
-            f"`{ti.task_id}`"
-            for ti in dag_run.get_task_instances(state="failed")
-        )
-        if dag_run
-        else "unknown"
-    )
+    if dag_run:
+        failed_tis = dag_run.get_task_instances(state="failed")
+        shown = [f"`{ti.task_id}`" for ti in failed_tis[:3]]
+        remaining = len(failed_tis) - len(shown)
+        if remaining > 0:
+            shown.append(f"and {remaining} more")
+        failed_tasks = ", ".join(shown) if shown else "none"
+    else:
+        failed_tasks = "unknown"
 
     base_url = airflow_conf.get("webserver", "base_url", fallback="").rstrip("/")
     dag_url = f"{base_url}/dags/{dag_id}/" if base_url else ""
