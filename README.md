@@ -11,7 +11,7 @@ its own connection IDs, schedule, and dbt project files.
 | Module | Purpose |
 | --- | --- |
 | `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG. |
-| `sundial_airflow.slack_alerts.dag_failure_alert` | DAG-level `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
+| `sundial_airflow.slack_alerts.task_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |
@@ -63,7 +63,7 @@ dag = make_dbt_dag(
 ```
 
 The factory takes care of:
-- Slack failure alert wired in as the DAG-level `on_failure_callback` (fires once per failed DAG run, not per failed task).
+- Slack failure alert wired into `default_args["on_failure_callback"]`.
 - `tenant:<name>` DAG tag.
 - The full standard parameter set (`backfill_mode`, `select`, `exclude`,
   `skip_tests`, `empty`, `vars`, `target`, ...).

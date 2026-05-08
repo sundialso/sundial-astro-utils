@@ -1,7 +1,8 @@
 """Discover dbt source tables that need source tests.
 
 Scanned at DAG-parse time so the factory can materialise one
-``DbtTestLocalOperator`` per source table.
+``DbtTestLocalOperator`` per source table, and wire each source test only to
+the models that actually consume that source (no global gate).
 """
 from __future__ import annotations
 
@@ -93,3 +94,38 @@ def discover_source_tables_with_tests(
                     found.add((source_name, table_name))
 
     return sorted(found)
+
+
+def discover_source_to_models(
+    project_path: str | Path,
+    *,
+    models_subdir: str = "models",
+) -> dict[tuple[str, str], list[str]]:
+    """Return ``{(source_name, table_name): [model_name, ...]}``.
+
+    Walks every ``.sql`` file under ``<project>/<models_subdir>/`` and records
+    which models reference each source via ``{{ source('s', 't') }}``. The
+    factory uses this map to wire each per-source ``DbtTestLocalOperator``
+    directly to the model run tasks that consume that source, so a single
+    failing source test only blocks its own subtree instead of the whole
+    pipeline.
+
+    The model name is the SQL file's basename (without ``.sql``), which is the
+    name Cosmos uses when it builds the ``DbtTaskGroup`` tasks.
+    """
+    project = Path(project_path)
+    models_dir = project / models_subdir
+    if not models_dir.exists():
+        return {}
+
+    mapping: dict[tuple[str, str], set[str]] = {}
+    for sql_file in models_dir.rglob("*.sql"):
+        try:
+            content = sql_file.read_text()
+        except OSError:
+            continue
+        model_name = sql_file.stem
+        for source_name, table_name in _SOURCE_REF_RE.findall(content):
+            mapping.setdefault((source_name, table_name), set()).add(model_name)
+
+    return {key: sorted(models) for key, models in sorted(mapping.items())}
