@@ -208,6 +208,7 @@ def make_dbt_dag(
     def _build():
         @task(task_id=PREPARE_TASK_ID)
         def prepare_dbt_args(**context):
+            raise Exception("test")
             params = context["params"]
             dbt_vars: dict[str, Any] = {}
 
