@@ -129,7 +129,7 @@ def make_dbt_dag(
     Parameters
     ----------
     dag_id:
-        Airflow DAG id, e.g. ``"dbt_citizen"``.
+        Airflow DAG id
     tenant:
         Short tenant slug; used in the Slack alert and the
         ``run_context_tag`` (``"<tenant>_normal"``, etc).
@@ -159,8 +159,7 @@ def make_dbt_dag(
         Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
     pre_tasks:
         Optional list of zero-arg callables that return TaskFlow tasks; they
-        run before ``prepare_dbt_args`` (used by ``ami_dbt`` for its EMR
-        ingest step).
+        run before ``prepare_dbt_args``.
     max_active_tasks, catchup, target_choices, sources_yml_candidates,
     recursive_tests:
         Tuning knobs with sensible defaults; see the implementation.

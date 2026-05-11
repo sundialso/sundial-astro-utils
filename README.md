@@ -1,7 +1,7 @@
 # sundial-airflow-utils
 
 Shared Airflow + Astronomer Cosmos utilities used by every Sundial dbt tenant
-repo (`citizen_dbt`, `mirage_dbt`, `chronicle_dbt`, ...).
+repo (`client_a_dbt`, `client_b_dbt`, `client_c_dbt`, ...).
 
 The goal: keep all reusable DAG plumbing here so each tenant repo only carries
 its own connection IDs, schedule, and dbt project files.
@@ -26,7 +26,7 @@ sundial-airflow-utils @ git+https://github.com/sundial-astro-sdk/sundial-astro-u
 
 (Or, if you're using the BuildKit secrets pattern recommended for tenant
 Dockerfiles, install the SDK from a Dockerfile `RUN` step instead. See
-`citizen_dbt/Dockerfile` for the canonical example.)
+your tenant's `Dockerfile` for the canonical example.)
 
 In a DAG file:
 
@@ -44,13 +44,13 @@ from include.constants import (
 )
 
 dag = make_dbt_dag(
-    dag_id="dbt_citizen",
-    tenant="citizen",
+    dag_id="dbt_example_client",
+    tenant="example_client",
     start_date=datetime(2025, 4, 22),
     schedule="0 8 * * *",
     warehouse="bigquery",
     dbt_project_path=dbt_project_path,
-    dbt_profile_name="citizen_dbt",
+    dbt_profile_name="example_client_dbt",
     venv_execution_config=venv_execution_config,
     profile_config_factory=get_profile_config,
     default_dataset_or_schema=DBT_BQ_DATASET,
