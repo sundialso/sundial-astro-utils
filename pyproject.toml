@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Sundial" }]
 license = { text = "Proprietary" }
 dependencies = [
-    "astronomer-cosmos>=1.12,<2.0",
+    "astronomer-cosmos>=1.10.1,<2.0",
     "apache-airflow>=2.8",
     "apache-airflow-providers-slack",
     "PyYAML>=6.0",
