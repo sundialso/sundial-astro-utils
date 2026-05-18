@@ -3,11 +3,28 @@ import logging
 from airflow.configuration import conf as airflow_conf
 from airflow.models import Variable
 from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 logger = logging.getLogger(__name__)
 
 SLACK_CONN_ID = "sundial_slack_webhook"
 TENANT_KEY = "tenant_slug"
+
+# Retry the webhook call on any exception (network blip, 429 rate-limit, 5xx).
+# 5 attempts with exponential backoff caps total wait around ~30s, which fits
+# inside the scheduler's callback budget while surviving Slack's short-lived
+# rate-limit windows.
+_send_with_retry = retry(
+    reraise=True,
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=15),
+    retry=retry_if_exception_type(Exception),
+)
 
 
 def _resolve_tenant(context) -> str:
@@ -79,16 +96,23 @@ def dag_failure_alert(context):
         f"{link}"
     )
 
-    try:
-        logger.info(
-            "%s sending Slack message via conn_id=%r for tenant=%r",
-            log_prefix,
-            SLACK_CONN_ID,
-            tenant,
-        )
+    logger.info(
+        "%s sending Slack message via conn_id=%r for tenant=%r",
+        log_prefix,
+        SLACK_CONN_ID,
+        tenant,
+    )
+
+    @_send_with_retry
+    def _send():
         SlackWebhookHook(slack_webhook_conn_id=SLACK_CONN_ID).send_text(message)
+
+    try:
+        _send()
         logger.info("%s alert sent", log_prefix)
     except Exception:
         logger.exception(
-            "%s failed to send Slack alert via conn_id=%r", log_prefix, SLACK_CONN_ID
+            "%s failed to send Slack alert via conn_id=%r after retries",
+            log_prefix,
+            SLACK_CONN_ID,
         )
