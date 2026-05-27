@@ -175,11 +175,9 @@ def make_dbt_dag(
     param_field = _param_field_name(warehouse)
 
     # Parse ``vars.target_project`` out of dbt_project.yml so we can stash it
-    # on the DAG via ``user_defined_macros``. Airflow serializes user_defined_macros
-    # alongside the DAG, so the value is visible to every process — including
-    # the API server where UI mark-success fires the DbtCompletionsListener.
-    # (A module-level registry doesn't work here because the API server never
-    # parses DAG files in Airflow 3.x — it only reads serialized DAGs.)
+    # on the DAG as a ``dbt_completions_project:<project>`` tag. Tags survive
+    # Airflow 3.x serialization (the API server gets them via SerializedDAG);
+    # ``user_defined_macros`` does not, so it can't carry this metadata.
     # Snowflake tenants with no ``target_project`` declared get a no-op listener.
     completions_project: str | None = None
     try:
@@ -199,6 +197,11 @@ def make_dbt_dag(
     }
 
     tags = ["dbt", f"tenant:{tenant}", *(extra_tags or [])]
+    if completions_project:
+        # Tag-encoded metadata for the DbtCompletionsListener. Tags survive
+        # Airflow's DAG serialization (SerializedDAG carries them through);
+        # ``user_defined_macros`` does NOT, so we can't stash this there.
+        tags.append(f"dbt_completions_project:{completions_project}")
 
     params = build_standard_params(
         warehouse=warehouse,
@@ -213,13 +216,6 @@ def make_dbt_dag(
     )
     source_to_models = discover_source_to_models(project_path_str)
 
-    # ``user_defined_macros`` doubles as a serializable carrier for DAG-level
-    # metadata the DbtCompletionsListener needs to find ``dbt_completions``.
-    # Snowflake / non-BQ tenants leave it empty and the listener no-ops.
-    listener_macros: dict[str, Any] = {}
-    if completions_project:
-        listener_macros["_dbt_completions_project"] = completions_project
-
     @dag(
         dag_id=dag_id,
         start_date=start_date,
@@ -231,7 +227,6 @@ def make_dbt_dag(
         default_args=merged_default_args,
         params=params,
         on_failure_callback=dag_failure_alert,
-        user_defined_macros=listener_macros or None,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID)

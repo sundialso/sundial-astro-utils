@@ -69,19 +69,30 @@ DEFAULT_BQ_CONN_ID = os.environ.get(
 )
 
 # ``make_dbt_dag`` parses ``vars.target_project`` from dbt_project.yml at
-# build time and stashes it on the DAG via ``user_defined_macros``. Airflow
-# serializes user_defined_macros alongside the DAG, so the value is visible
-# in every Airflow process — including the API server where UI mark-success
-# fires this listener. (A module-level registry doesn't work here: the API
-# server doesn't parse DAG files in Airflow 3.x, so a registry populated
-# during DAG parsing would be empty wherever the listener actually runs.)
-_TARGET_PROJECT_MACRO_KEY = "_dbt_completions_project"
+# build time and stashes it on the DAG as a ``dbt_completions_project:<value>``
+# tag. Tags survive Airflow 3.x serialization — the API server sees them in
+# the SerializedDAG it loads from the metadata DB. (``user_defined_macros``
+# does NOT survive serialization, which is why we don't use it.)
+_TARGET_PROJECT_TAG_PREFIX = "dbt_completions_project:"
+
+
+def _tag_strings(dag: Any) -> list[str]:
+    """Normalise tags to a list of strings — they can come back as a set or
+    list of either plain strings or ``DagTag`` model objects."""
+    out: list[str] = []
+    for tag in getattr(dag, "tags", None) or []:
+        name = getattr(tag, "name", None) or tag
+        if isinstance(name, str):
+            out.append(name)
+    return out
 
 
 def _get_target_project(dag_run: Any) -> str | None:
     dag = _load_dag(dag_run)
-    macros = getattr(dag, "user_defined_macros", None) or {}
-    return macros.get(_TARGET_PROJECT_MACRO_KEY)
+    for tag in _tag_strings(dag):
+        if tag.startswith(_TARGET_PROJECT_TAG_PREFIX):
+            return tag[len(_TARGET_PROJECT_TAG_PREFIX):]
+    return None
 
 
 _AIRFLOW_FAILED_STATES = {"failed", "upstream_failed"}
@@ -104,22 +115,19 @@ def _is_natural_completion(previous_state: Any) -> bool:
 # Identification & target discovery
 # ---------------------------------------------------------------------------
 def _load_dag(dag_run: Any) -> Any | None:
-    """Fetch the full deserialized DAG via DagBag.
-
-    Accessing ``dag_run.dag`` directly inside an Airflow 3.x listener returns
-    a partially-populated DAG — ``tags`` and ``user_defined_macros`` may be
-    empty even when the serialized DAG in the metadata DB has them. DagBag
-    reads the serialized DAG fresh from the DB and returns the full object,
-    matching what ``airflow dags details`` / ``DagBag().get_dag(...)`` show.
-    """
+    """Fetch the full deserialized DAG via ``SerializedDagModel`` — the
+    canonical Airflow 3.x way to read a DAG from the metadata DB without
+    parsing files. ``dag_run.dag`` inside the listener context returns a
+    partially-populated DAG (``tags`` / ``user_defined_macros`` may be
+    empty), so we go to the serialized table directly."""
     try:
-        from airflow.models import DagBag
-        dag = DagBag(read_dags_from_db=True, include_examples=False).get_dag(dag_run.dag_id)
+        from airflow.models.serialized_dag import SerializedDagModel
+        dag = SerializedDagModel.get_dag(dag_run.dag_id)
         if dag is not None:
             return dag
     except Exception as exc:
-        log.debug("DagBag.get_dag(%s) failed: %s", dag_run.dag_id, exc)
-    # Fallback in case DagBag is unavailable for some reason.
+        log.debug("SerializedDagModel.get_dag(%s) failed: %s", dag_run.dag_id, exc)
+    # Fallback: ``dag_run.dag``. Tags may be missing but it's better than nothing.
     try:
         return getattr(dag_run, "dag", None)
     except Exception as exc:
@@ -129,8 +137,7 @@ def _load_dag(dag_run: Any) -> Any | None:
 
 def _is_dbt_dag(dag_run: Any) -> bool:
     dag = _load_dag(dag_run)
-    tags = getattr(dag, "tags", None) or []
-    return "dbt" in tags
+    return "dbt" in _tag_strings(dag)
 
 
 def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
