@@ -62,11 +62,57 @@ PREPARE_TASK_ID = "prepare_dbt_args"
 # plumbing it through every DAG.
 COMPLETIONS_TABLE = "dbt_completions"
 
-# Override at deploy time with the env var if the BQ connection isn't the
-# Airflow default.
-DEFAULT_BQ_CONN_ID = os.environ.get(
-    "SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID", "google_cloud_default"
-)
+# BQ connection lookup, in precedence order:
+#   1. ``dbt_completions_bq_conn_id:<value>`` tag on the DAG (set per-DAG via
+#      ``make_dbt_dag(..., completions_bq_conn_id=...)``).
+#   2. The env var ``SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID`` (deployment-level).
+#   3. Auto-discover the single BQ-typed connection in Airflow's metadata DB.
+#   4. Hardcoded Airflow convention ``google_cloud_default`` (last resort).
+_BQ_CONN_ID_TAG_PREFIX = "dbt_completions_bq_conn_id:"
+_BQ_CONN_TYPES = ("google_cloud_platform", "gcpbigquery")
+
+_AUTO_BQ_CONN_CACHE: str | None = None
+_AUTO_BQ_CONN_LOOKED_UP: bool = False
+
+
+def _autodiscover_bq_conn() -> str | None:
+    """Find the single BQ-typed connection in Airflow's connection list.
+
+    Returns the ``conn_id`` if exactly one BQ connection is configured,
+    ``None`` if zero (no BQ conn at all) or multiple (ambiguous — user
+    must disambiguate via tag or env var). Cached per process; restart
+    Airflow if connections change.
+    """
+    global _AUTO_BQ_CONN_CACHE, _AUTO_BQ_CONN_LOOKED_UP
+    if _AUTO_BQ_CONN_LOOKED_UP:
+        return _AUTO_BQ_CONN_CACHE
+    _AUTO_BQ_CONN_LOOKED_UP = True
+    try:
+        from airflow.models import Connection
+        from airflow.utils.session import create_session
+
+        with create_session() as session:
+            conns = (
+                session.query(Connection)
+                .filter(Connection.conn_type.in_(_BQ_CONN_TYPES))
+                .all()
+            )
+        names = [c.conn_id for c in conns]
+        if len(names) == 1:
+            log.info("DbtCompletionsListener: auto-discovered BQ conn=%s", names[0])
+            _AUTO_BQ_CONN_CACHE = names[0]
+        elif len(names) > 1:
+            log.warning(
+                "DbtCompletionsListener: multiple BQ connections (%s); set "
+                "make_dbt_dag(completions_bq_conn_id=...) or "
+                "SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID to disambiguate",
+                names,
+            )
+        else:
+            log.info("DbtCompletionsListener: no BQ-typed connection found")
+    except Exception as exc:
+        log.debug("BQ conn auto-discovery failed: %s", exc)
+    return _AUTO_BQ_CONN_CACHE
 
 # ``make_dbt_dag`` parses ``vars.target_project`` from dbt_project.yml at
 # build time and stashes it on the DAG as a ``dbt_completions_project:<value>``
@@ -93,6 +139,21 @@ def _get_target_project(dag_run: Any) -> str | None:
         if tag.startswith(_TARGET_PROJECT_TAG_PREFIX):
             return tag[len(_TARGET_PROJECT_TAG_PREFIX):]
     return None
+
+
+def _get_bq_conn_id(dag_run: Any) -> str:
+    """Resolve BQ conn_id: tag → env var → auto-discovery → hardcoded default."""
+    dag = _load_dag(dag_run)
+    for tag in _tag_strings(dag):
+        if tag.startswith(_BQ_CONN_ID_TAG_PREFIX):
+            return tag[len(_BQ_CONN_ID_TAG_PREFIX):]
+    explicit_env = os.environ.get("SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID")
+    if explicit_env:
+        return explicit_env
+    auto = _autodiscover_bq_conn()
+    if auto:
+        return auto
+    return "google_cloud_default"
 
 
 _AIRFLOW_FAILED_STATES = {"failed", "upstream_failed"}
@@ -215,8 +276,19 @@ def _derive_status(states: dict[str, str]) -> str | None:
     return None
 
 
-def _states_for_model(dag_run: Any, model_name: str) -> dict[str, str]:
-    """Collect ``{role: airflow_state}`` for one model across all TIs in the run."""
+def _states_for_model(
+    dag_run: Any,
+    model_name: str,
+    just_changed: Any | None = None,
+) -> dict[str, str]:
+    """Collect ``{role: airflow_state}`` for one model across all TIs in the run.
+
+    ``just_changed`` is the ``task_instance`` Airflow handed to the listener.
+    When the listener fires from a manual UI/API state change, the DB row
+    for *that* task may not yet reflect the new state — the in-memory TI
+    object carries the truth. So we let it override the sibling DB read for
+    its own role.
+    """
     out: dict[str, str] = {}
     for ti in dag_run.get_task_instances():
         parsed = _parse_model_task(ti.task_id)
@@ -225,6 +297,13 @@ def _states_for_model(dag_run: Any, model_name: str) -> dict[str, str]:
         m, role = parsed
         if m == model_name:
             out[role] = ti.state or ""
+
+    if just_changed is not None:
+        parsed = _parse_model_task(getattr(just_changed, "task_id", ""))
+        if parsed and parsed[0] == model_name:
+            _, role = parsed
+            new_state = getattr(just_changed, "state", None) or out.get(role, "")
+            out[role] = new_state
     return out
 
 
@@ -343,7 +422,7 @@ def reconcile_model(task_instance: Any) -> None:
         return
     project, dataset, execution_ts = target
 
-    states = _states_for_model(dag_run, model_name)
+    states = _states_for_model(dag_run, model_name, just_changed=task_instance)
     status = _derive_status(states)
     if status is None:
         log.debug(
@@ -368,7 +447,7 @@ def reconcile_model(task_instance: Any) -> None:
             table_fqn,
             execution_ts,
             [{"model_name": model_name, "status": status}],
-            DEFAULT_BQ_CONN_ID,
+            _get_bq_conn_id(dag_run),
         )
     except Exception:
         log.exception("%s/%s: dbt_completions upsert failed", dag_run.dag_id, model_name)

@@ -122,6 +122,7 @@ def make_dbt_dag(
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
+    completions_bq_conn_id: str | None = None,
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -202,6 +203,8 @@ def make_dbt_dag(
         # Airflow's DAG serialization (SerializedDAG carries them through);
         # ``user_defined_macros`` does NOT, so we can't stash this there.
         tags.append(f"dbt_completions_project:{completions_project}")
+    if completions_bq_conn_id:
+        tags.append(f"dbt_completions_bq_conn_id:{completions_bq_conn_id}")
 
     params = build_standard_params(
         warehouse=warehouse,
