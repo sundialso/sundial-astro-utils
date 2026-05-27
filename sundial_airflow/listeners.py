@@ -88,18 +88,13 @@ _AIRFLOW_SUCCESS_STATES = {"success"}
 
 
 def _is_natural_completion(previous_state: Any) -> bool:
-    """True if the task transitioned from ``running`` — i.e. the Airflow
-    executor actually ran it. False for manual UI/API state changes (where
-    the previous state is whatever the task was stuck in: failed,
-    upstream_failed, skipped, success re-mark, …).
-
-    Accepts either the ``TaskInstanceState`` enum or a raw string; both
-    forms appear depending on Airflow version. ``None`` is treated as
-    "unknown — don't reconcile" to avoid false positives during edge-case
-    transitions where Airflow couldn't determine the prior state.
+    """True only if the task transitioned from ``running`` — i.e. the Airflow
+    executor actually ran it. False for manual UI/API state changes AND for
+    ``None`` (we'd rather over-write idempotent rows than miss a real
+    manual intervention; the MERGE is safe to repeat).
     """
     if previous_state is None:
-        return True
+        return False
     value = getattr(previous_state, "value", previous_state)
     return value == "running"
 
@@ -293,15 +288,25 @@ def reconcile_model(task_instance: Any) -> None:
     """
     parsed = _parse_model_task(task_instance.task_id)
     if parsed is None:
+        log.info("DbtCompletionsListener: task_id=%s is not a Cosmos model task, skipping", task_instance.task_id)
         return
     model_name, _role = parsed
 
     dag_run = _get_dag_run(task_instance)
-    if dag_run is None or not _is_dbt_dag(dag_run):
+    if dag_run is None:
+        log.info("DbtCompletionsListener: could not resolve dag_run for %s, skipping", task_instance.task_id)
+        return
+    if not _is_dbt_dag(dag_run):
+        log.info("DbtCompletionsListener: dag %s is not tagged 'dbt', skipping", dag_run.dag_id)
         return
 
     target = _get_completions_target(dag_run)
     if not target:
+        log.info(
+            "DbtCompletionsListener: no completions target resolved for dag=%s "
+            "(missing user_defined_macros._dbt_completions_project or XCom from prepare_dbt_args)",
+            dag_run.dag_id,
+        )
         return
     project, dataset, execution_ts = target
 
@@ -351,13 +356,27 @@ class DbtCompletionsListener:
 
     @hookimpl
     def on_task_instance_success(self, previous_state, task_instance, **kwargs):
+        log.info(
+            "DbtCompletionsListener: on_task_instance_success fired "
+            "(task=%s, previous_state=%r)",
+            getattr(task_instance, "task_id", "?"),
+            previous_state,
+        )
         if _is_natural_completion(previous_state):
+            log.info("DbtCompletionsListener: skipping (natural completion)")
             return
         reconcile_model(task_instance)
 
     @hookimpl
     def on_task_instance_failed(self, previous_state, task_instance, **kwargs):
+        log.info(
+            "DbtCompletionsListener: on_task_instance_failed fired "
+            "(task=%s, previous_state=%r)",
+            getattr(task_instance, "task_id", "?"),
+            previous_state,
+        )
         if _is_natural_completion(previous_state):
+            log.info("DbtCompletionsListener: skipping (natural completion)")
             return
         reconcile_model(task_instance)
 
