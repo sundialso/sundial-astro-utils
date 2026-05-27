@@ -26,6 +26,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import yaml
+
 from airflow.decorators import dag, task
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
@@ -172,6 +174,25 @@ def make_dbt_dag(
     vars_field = _vars_field_name(warehouse)
     param_field = _param_field_name(warehouse)
 
+    # Parse ``vars.target_project`` out of dbt_project.yml so we can stash it
+    # on the DAG via ``user_defined_macros``. Airflow serializes user_defined_macros
+    # alongside the DAG, so the value is visible to every process — including
+    # the API server where UI mark-success fires the DbtCompletionsListener.
+    # (A module-level registry doesn't work here because the API server never
+    # parses DAG files in Airflow 3.x — it only reads serialized DAGs.)
+    # Snowflake tenants with no ``target_project`` declared get a no-op listener.
+    completions_project: str | None = None
+    try:
+        with open(Path(project_path_str) / "dbt_project.yml") as f:
+            dbt_proj_cfg = yaml.safe_load(f) or {}
+        completions_project = (dbt_proj_cfg.get("vars") or {}).get("target_project")
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "Could not parse %s/dbt_project.yml for dbt_completions discovery: %s",
+            project_path_str,
+            exc,
+        )
+
     merged_default_args = {
         **DEFAULT_DEFAULT_ARGS,
         **(default_args or {}),
@@ -192,6 +213,13 @@ def make_dbt_dag(
     )
     source_to_models = discover_source_to_models(project_path_str)
 
+    # ``user_defined_macros`` doubles as a serializable carrier for DAG-level
+    # metadata the DbtCompletionsListener needs to find ``dbt_completions``.
+    # Snowflake / non-BQ tenants leave it empty and the listener no-ops.
+    listener_macros: dict[str, Any] = {}
+    if completions_project:
+        listener_macros["_dbt_completions_project"] = completions_project
+
     @dag(
         dag_id=dag_id,
         start_date=start_date,
@@ -203,6 +231,7 @@ def make_dbt_dag(
         default_args=merged_default_args,
         params=params,
         on_failure_callback=dag_failure_alert,
+        user_defined_macros=listener_macros or None,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID)

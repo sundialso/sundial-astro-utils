@@ -20,5 +20,8 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/sundial-astro-sdk/sundial-astro-utils"
 
+[project.entry-points."airflow.plugins"]
+sundial_dbt_completions = "sundial_airflow.listeners:SundialDbtCompletionsPlugin"
+
 [tool.setuptools.packages.find]
 include = ["sundial_airflow*"]
