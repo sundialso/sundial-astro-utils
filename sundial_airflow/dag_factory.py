@@ -37,7 +37,7 @@ from cosmos.operators.local import DbtTestLocalOperator
 
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
-    skip_tests_if_disabled,
+    make_source_test_skip_hook,
     skip_unselected,
 )
 from sundial_airflow.params import build_standard_params
@@ -354,6 +354,7 @@ def make_dbt_dag(
             if not source_tables:
                 EmptyOperator(task_id="no_source_tests")
             for source_name, table_name in source_tables:
+                dependents = source_to_models.get((source_name, table_name), ())
                 source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
                     task_id=f"test_{source_name}_{table_name}",
                     profile_config=profile_config,
@@ -366,7 +367,7 @@ def make_dbt_dag(
                         + "')['vars'] }}"
                     ),
                     install_deps=True,
-                    pre_execute=skip_tests_if_disabled,
+                    pre_execute=make_source_test_skip_hook(dependents),
                 )
 
         manifest_path = Path(project_path_str) / "target" / "manifest.json"

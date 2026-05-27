@@ -79,7 +79,8 @@ _TARGET_PROJECT_MACRO_KEY = "_dbt_completions_project"
 
 
 def _get_target_project(dag_run: Any) -> str | None:
-    macros = getattr(getattr(dag_run, "dag", None), "user_defined_macros", None) or {}
+    dag = _load_dag(dag_run)
+    macros = getattr(dag, "user_defined_macros", None) or {}
     return macros.get(_TARGET_PROJECT_MACRO_KEY)
 
 
@@ -102,8 +103,33 @@ def _is_natural_completion(previous_state: Any) -> bool:
 # ---------------------------------------------------------------------------
 # Identification & target discovery
 # ---------------------------------------------------------------------------
+def _load_dag(dag_run: Any) -> Any | None:
+    """Fetch the full deserialized DAG via DagBag.
+
+    Accessing ``dag_run.dag`` directly inside an Airflow 3.x listener returns
+    a partially-populated DAG — ``tags`` and ``user_defined_macros`` may be
+    empty even when the serialized DAG in the metadata DB has them. DagBag
+    reads the serialized DAG fresh from the DB and returns the full object,
+    matching what ``airflow dags details`` / ``DagBag().get_dag(...)`` show.
+    """
+    try:
+        from airflow.models import DagBag
+        dag = DagBag(read_dags_from_db=True, include_examples=False).get_dag(dag_run.dag_id)
+        if dag is not None:
+            return dag
+    except Exception as exc:
+        log.debug("DagBag.get_dag(%s) failed: %s", dag_run.dag_id, exc)
+    # Fallback in case DagBag is unavailable for some reason.
+    try:
+        return getattr(dag_run, "dag", None)
+    except Exception as exc:
+        log.debug("dag_run.dag fallback access failed: %s", exc)
+        return None
+
+
 def _is_dbt_dag(dag_run: Any) -> bool:
-    tags = getattr(getattr(dag_run, "dag", None), "tags", None) or []
+    dag = _load_dag(dag_run)
+    tags = getattr(dag, "tags", None) or []
     return "dbt" in tags
 
 
