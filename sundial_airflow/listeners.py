@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import lru_cache
 from typing import Any
 
 from airflow.listeners import hookimpl
@@ -121,6 +122,28 @@ def _autodiscover_bq_conn() -> str | None:
 # does NOT survive serialization, which is why we don't use it.)
 _TARGET_PROJECT_TAG_PREFIX = "dbt_completions_project:"
 
+# Listener enablement, in precedence order:
+#   1. ``SUNDIAL_DBT_LISTENER_DAG_IDS`` env var: comma-separated allowlist.
+#      If set (even to ""), it is the *only* check — tag is ignored.
+#   2. ``listener_enabled`` tag on the DAG (added automatically by
+#      ``make_dbt_dag``).
+_LISTENER_ALLOWLIST_ENV = "SUNDIAL_DBT_LISTENER_DAG_IDS"
+_LISTENER_ENABLED_TAG = "listener_enabled"
+
+
+def _is_listener_enabled(dag_run: Any) -> bool:
+    """Return True iff this DAG opted in to listener reconciliation.
+
+    Env var allowlist (if set) is the hard override; otherwise fall back to
+    the ``listener_enabled`` tag. Env-var path avoids any DB load — a
+    non-matching ``dag_id`` short-circuits before ``_load_dag``.
+    """
+    allowlist = os.environ.get(_LISTENER_ALLOWLIST_ENV)
+    if allowlist is not None:
+        ids = {x.strip() for x in allowlist.split(",") if x.strip()}
+        return dag_run.dag_id in ids
+    return _LISTENER_ENABLED_TAG in _tag_strings(_load_dag(dag_run))
+
 
 def _tag_strings(dag: Any) -> list[str]:
     """Normalise tags to a list of strings — they can come back as a set or
@@ -160,45 +183,64 @@ _AIRFLOW_FAILED_STATES = {"failed", "upstream_failed"}
 _AIRFLOW_SUCCESS_STATES = {"success"}
 
 
-def _is_natural_completion(previous_state: Any) -> bool:
-    """True only if the task transitioned from ``running`` — i.e. the Airflow
-    executor actually ran it. False for manual UI/API state changes AND for
-    ``None`` (we'd rather over-write idempotent rows than miss a real
-    manual intervention; the MERGE is safe to repeat).
+_RECONCILABLE_PREVIOUS_STATES = {"success", "failed"}
+
+
+def _should_reconcile(previous_state: Any, new_state_value: str) -> bool:
+    """Decide whether to reconcile on this transition.
+
+    Fire **only** when the user flips a previously-terminal verdict, i.e.
+    ``previous_state in {'success', 'failed'}`` AND it differs from the new
+    state. That means the dbt macros already wrote a row to ``dbt_completions``
+    during a real dbt attempt, and the user is now overriding that verdict.
+
+    Skipped:
+      - ``previous == new`` → no-op transition (e.g. bulk "Mark DAG Success"
+        re-flipping already-success tasks).
+      - ``previous == 'running'`` → natural completion; dbt macros handle it.
+      - ``previous in {None, 'skipped', 'upstream_failed', 'queued', ...}``
+        → dbt never ran this model, so there's no row to update.
     """
     if previous_state is None:
         return False
-    value = getattr(previous_state, "value", previous_state)
-    return value == "running"
+    prev = getattr(previous_state, "value", previous_state)
+    if prev == new_state_value:
+        return False
+    return prev in _RECONCILABLE_PREVIOUS_STATES
 
 
 # ---------------------------------------------------------------------------
 # Identification & target discovery
 # ---------------------------------------------------------------------------
-def _load_dag(dag_run: Any) -> Any | None:
-    """Fetch the full deserialized DAG via ``SerializedDagModel`` — the
-    canonical Airflow 3.x way to read a DAG from the metadata DB without
-    parsing files. ``dag_run.dag`` inside the listener context returns a
-    partially-populated DAG (``tags`` / ``user_defined_macros`` may be
-    empty), so we go to the serialized table directly."""
+@lru_cache(maxsize=128)
+def _load_dag_by_id(dag_id: str) -> Any | None:
+    """Cached SerializedDagModel.get_dag lookup. Each ``reconcile_model``
+    call hits this 3× (for the tag check, project lookup, and conn lookup),
+    so the cache turns ~3 DB queries into 1. DAG structure doesn't change
+    within a process; restart Airflow to invalidate if a DAG is modified.
+    """
     try:
         from airflow.models.serialized_dag import SerializedDagModel
-        dag = SerializedDagModel.get_dag(dag_run.dag_id)
-        if dag is not None:
-            return dag
+        return SerializedDagModel.get_dag(dag_id)
     except Exception as exc:
-        log.debug("SerializedDagModel.get_dag(%s) failed: %s", dag_run.dag_id, exc)
+        log.debug("SerializedDagModel.get_dag(%s) failed: %s", dag_id, exc)
+        return None
+
+
+def _load_dag(dag_run: Any) -> Any | None:
+    """Fetch the full deserialized DAG. Canonical Airflow 3.x path is
+    ``SerializedDagModel`` via the metadata DB (``dag_run.dag`` is partial
+    in the listener context — ``tags`` may not be populated).
+    """
+    dag = _load_dag_by_id(dag_run.dag_id)
+    if dag is not None:
+        return dag
     # Fallback: ``dag_run.dag``. Tags may be missing but it's better than nothing.
     try:
         return getattr(dag_run, "dag", None)
     except Exception as exc:
         log.debug("dag_run.dag fallback access failed: %s", exc)
         return None
-
-
-def _is_dbt_dag(dag_run: Any) -> bool:
-    dag = _load_dag(dag_run)
-    return "dbt" in _tag_strings(dag)
 
 
 def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
@@ -408,8 +450,8 @@ def reconcile_model(task_instance: Any) -> None:
     if dag_run is None:
         log.info("DbtCompletionsListener: could not resolve dag_run for %s, skipping", task_instance.task_id)
         return
-    if not _is_dbt_dag(dag_run):
-        log.info("DbtCompletionsListener: dag %s is not tagged 'dbt', skipping", dag_run.dag_id)
+    if not _is_listener_enabled(dag_run):
+        log.info("DbtCompletionsListener: dag %s not enabled for listener, skipping", dag_run.dag_id)
         return
 
     target = _get_completions_target(dag_run)
@@ -468,28 +510,34 @@ class DbtCompletionsListener:
 
     @hookimpl
     def on_task_instance_success(self, previous_state, task_instance, **kwargs):
+        if not _should_reconcile(previous_state, "success"):
+            log.debug(
+                "DbtCompletionsListener: skipping success on task=%s previous=%r",
+                getattr(task_instance, "task_id", "?"),
+                previous_state,
+            )
+            return
         log.info(
-            "DbtCompletionsListener: on_task_instance_success fired "
-            "(task=%s, previous_state=%r)",
+            "DbtCompletionsListener: reconciling success on task=%s previous=%r",
             getattr(task_instance, "task_id", "?"),
             previous_state,
         )
-        if _is_natural_completion(previous_state):
-            log.info("DbtCompletionsListener: skipping (natural completion)")
-            return
         reconcile_model(task_instance)
 
     @hookimpl
     def on_task_instance_failed(self, previous_state, task_instance, **kwargs):
+        if not _should_reconcile(previous_state, "failed"):
+            log.debug(
+                "DbtCompletionsListener: skipping failed on task=%s previous=%r",
+                getattr(task_instance, "task_id", "?"),
+                previous_state,
+            )
+            return
         log.info(
-            "DbtCompletionsListener: on_task_instance_failed fired "
-            "(task=%s, previous_state=%r)",
+            "DbtCompletionsListener: reconciling failed on task=%s previous=%r",
             getattr(task_instance, "task_id", "?"),
             previous_state,
         )
-        if _is_natural_completion(previous_state):
-            log.info("DbtCompletionsListener: skipping (natural completion)")
-            return
         reconcile_model(task_instance)
 
 

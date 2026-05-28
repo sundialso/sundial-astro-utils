@@ -197,7 +197,7 @@ def make_dbt_dag(
         **(default_args or {}),
     }
 
-    tags = ["dbt", f"tenant:{tenant}", *(extra_tags or [])]
+    tags = ["dbt", "listener_enabled", f"tenant:{tenant}", *(extra_tags or [])]
     if completions_project:
         # Tag-encoded metadata for the DbtCompletionsListener. Tags survive
         # Airflow's DAG serialization (SerializedDAG carries them through);
