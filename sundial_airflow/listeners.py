@@ -511,7 +511,7 @@ class DbtCompletionsListener:
     @hookimpl
     def on_task_instance_success(self, previous_state, task_instance, **kwargs):
         if not _should_reconcile(previous_state, "success"):
-            log.debug(
+            log.info(
                 "DbtCompletionsListener: skipping success on task=%s previous=%r",
                 getattr(task_instance, "task_id", "?"),
                 previous_state,
@@ -527,7 +527,7 @@ class DbtCompletionsListener:
     @hookimpl
     def on_task_instance_failed(self, previous_state, task_instance, **kwargs):
         if not _should_reconcile(previous_state, "failed"):
-            log.debug(
+            log.info(
                 "DbtCompletionsListener: skipping failed on task=%s previous=%r",
                 getattr(task_instance, "task_id", "?"),
                 previous_state,
