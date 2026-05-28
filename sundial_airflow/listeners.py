@@ -183,30 +183,34 @@ _AIRFLOW_FAILED_STATES = {"failed", "upstream_failed"}
 _AIRFLOW_SUCCESS_STATES = {"success"}
 
 
-_RECONCILABLE_PREVIOUS_STATES = {"success", "failed"}
+_NATURAL_COMPLETION_STATES = {"running"}
 
 
 def _should_reconcile(previous_state: Any, new_state_value: str) -> bool:
     """Decide whether to reconcile on this transition.
 
-    Fire **only** when the user flips a previously-terminal verdict, i.e.
-    ``previous_state in {'success', 'failed'}`` AND it differs from the new
-    state. That means the dbt macros already wrote a row to ``dbt_completions``
-    during a real dbt attempt, and the user is now overriding that verdict.
+    Skip only the two cases that are *definitely* not manual interventions;
+    reconcile everything else. The ``dbt_completions`` MERGE is idempotent
+    (model_name + execution_ts + status is the match key), so any extra
+    write on a borderline case is safe.
 
     Skipped:
+      - ``previous == 'running'`` → natural completion; the dbt macros'
+        ``on-run-end`` hook already wrote the row.
       - ``previous == new`` → no-op transition (e.g. bulk "Mark DAG Success"
-        re-flipping already-success tasks).
-      - ``previous == 'running'`` → natural completion; dbt macros handle it.
-      - ``previous in {None, 'skipped', 'upstream_failed', 'queued', ...}``
-        → dbt never ran this model, so there's no row to update.
+        touching tasks already in the target state).
+
+    Reconciled (everything else, including ``previous_state=None``):
+      Airflow 3.x passes ``previous_state=None`` for UI / API "Mark Success
+      / Mark Failed" actions, so ``None`` is exactly the manual case we
+      want to catch.
     """
-    if previous_state is None:
+    prev = getattr(previous_state, "value", previous_state) if previous_state is not None else None
+    if prev in _NATURAL_COMPLETION_STATES:
         return False
-    prev = getattr(previous_state, "value", previous_state)
     if prev == new_state_value:
         return False
-    return prev in _RECONCILABLE_PREVIOUS_STATES
+    return True
 
 
 # ---------------------------------------------------------------------------
