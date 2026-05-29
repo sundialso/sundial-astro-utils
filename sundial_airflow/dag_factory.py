@@ -319,6 +319,8 @@ def make_dbt_dag(
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
+                # Selects the warehouse adapter in the dbt_completions listener.
+                "warehouse": warehouse,
                 "full_refresh": backfill_mode == "full",
                 "selected_models": selected_models,
                 "run_context": run_context,

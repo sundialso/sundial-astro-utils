@@ -1,6 +1,13 @@
 """Airflow listener that reconciles ``dbt_completions`` after a **manual**
 state change (UI "Mark Success" / "Mark Failed", or an API call).
 
+The listener itself is warehouse-agnostic: which transitions to reconcile and
+how a model's terminal status is derived are the same everywhere. All
+warehouse-specific behaviour (connection discovery, table naming, the MERGE)
+lives in ``warehouses.py`` behind the :class:`~sundial_airflow.warehouses.WarehouseAdapter`
+interface. The DAG's warehouse is plumbed through the ``prepare_dbt_args``
+XCom by ``make_dbt_dag``; the listener picks the matching adapter per run.
+
 Division of labour
 ------------------
 - **Natural runs** (scheduled, manual-trigger, backfill): the dbt macros in
@@ -47,11 +54,14 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
 from airflow.listeners import hookimpl
 from airflow.plugins_manager import AirflowPlugin
+
+from sundial_airflow.warehouses import WarehouseAdapter, get_adapter
 
 log = logging.getLogger(__name__)
 
@@ -59,57 +69,12 @@ log = logging.getLogger(__name__)
 PREPARE_TASK_ID = "prepare_dbt_args"
 
 # Table name is a Sundial-wide convention; the table always sits in the same
-# dataset the tenant's dbt models write to, so we hardcode it here instead of
-# plumbing it through every DAG.
+# dataset/schema the tenant's dbt models write to, so we hardcode it here
+# instead of plumbing it through every DAG.
 COMPLETIONS_TABLE = "dbt_completions"
 
-# BQ connection lookup, in precedence order:
-#   1. The env var ``SUNDIAL_DBT_CONN_ID`` (deployment-level override).
-#   2. Auto-discover the single BQ-typed connection in Airflow's metadata DB.
-#   3. Hardcoded Airflow convention ``google_cloud_default`` (last resort).
-_BQ_CONN_TYPES = ("google_cloud_platform", "gcpbigquery")
-
-_AUTO_BQ_CONN_CACHE: str | None = None
-_AUTO_BQ_CONN_LOOKED_UP: bool = False
-
-
-def _autodiscover_bq_conn() -> str | None:
-    """Find the single BQ-typed connection in Airflow's connection list.
-
-    Returns the ``conn_id`` if exactly one BQ connection is configured,
-    ``None`` if zero (no BQ conn at all) or multiple (ambiguous — user
-    must disambiguate via tag or env var). Cached per process; restart
-    Airflow if connections change.
-    """
-    global _AUTO_BQ_CONN_CACHE, _AUTO_BQ_CONN_LOOKED_UP
-    if _AUTO_BQ_CONN_LOOKED_UP:
-        return _AUTO_BQ_CONN_CACHE
-    _AUTO_BQ_CONN_LOOKED_UP = True
-    try:
-        from airflow.models import Connection
-        from airflow.utils.session import create_session
-
-        with create_session() as session:
-            conns = (
-                session.query(Connection)
-                .filter(Connection.conn_type.in_(_BQ_CONN_TYPES))
-                .all()
-            )
-        names = [c.conn_id for c in conns]
-        if len(names) == 1:
-            log.info("DbtCompletionsListener: auto-discovered BQ conn=%s", names[0])
-            _AUTO_BQ_CONN_CACHE = names[0]
-        elif len(names) > 1:
-            log.warning(
-                "DbtCompletionsListener: multiple BQ connections (%s); "
-                "set SUNDIAL_DBT_CONN_ID to disambiguate",
-                names,
-            )
-        else:
-            log.info("DbtCompletionsListener: no BQ-typed connection found")
-    except Exception as exc:
-        log.debug("BQ conn auto-discovery failed: %s", exc)
-    return _AUTO_BQ_CONN_CACHE
+# Default warehouse for runs whose XCom predates warehouse plumbing.
+_DEFAULT_WAREHOUSE = "bigquery"
 
 # Listener enablement, in precedence order:
 #   1. ``SUNDIAL_DBT_LISTENER_DAG_IDS`` env var: comma-separated allowlist.
@@ -143,17 +108,6 @@ def _tag_strings(dag: Any) -> list[str]:
         if isinstance(name, str):
             out.append(name)
     return out
-
-
-def _get_bq_conn_id(dag_run: Any) -> str:
-    """Resolve BQ conn_id: env var → auto-discovery → hardcoded default."""
-    explicit_env = os.environ.get("SUNDIAL_DBT_CONN_ID")
-    if explicit_env:
-        return explicit_env
-    auto = _autodiscover_bq_conn()
-    if auto:
-        return auto
-    return "google_cloud_default"
 
 
 _AIRFLOW_FAILED_STATES = {"failed", "upstream_failed"}
@@ -224,17 +178,27 @@ def _load_dag(dag_run: Any) -> Any | None:
         return None
 
 
-def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
-    """Return ``(project, dataset, execution_ts)`` for the row to write.
+@dataclass
+class _CompletionsTarget:
+    """Everything needed to write the reconciliation row, warehouse-resolved."""
 
-    All three are pulled from the same place: the ``prepare_dbt_args``
-    XCom return, under ``payload["vars"]`` — the same dbt_vars blob dbt
-    itself receives. ``target_project`` comes from the ``default_project``
-    arg to ``make_dbt_dag``; ``target_dataset`` from the DAG param /
-    ``default_dataset_or_schema``; ``execution_ts`` from the param / today.
+    adapter: WarehouseAdapter
+    table_fqn: str
+    execution_ts: str
 
-    Returns ``None`` if any field is missing (e.g. tenant didn't pass
-    ``default_project``, non-dbt DAGs, or DagRuns whose XCom was pruned).
+
+def _get_completions_target(dag_run: Any) -> _CompletionsTarget | None:
+    """Resolve where (and how) to write the reconciliation row.
+
+    Reads the ``prepare_dbt_args`` XCom return: ``payload["warehouse"]`` selects
+    the adapter, and ``payload["vars"]`` (the same dbt_vars blob dbt itself
+    receives) carries the identifiers each adapter needs to build its table
+    name — ``target_project``/``target_dataset`` for BigQuery,
+    ``target_schema`` (+ optional database) for Snowflake — plus
+    ``execution_ts``.
+
+    Returns ``None`` if the warehouse is unknown, identifiers are missing, or
+    the XCom is absent (non-dbt DAGs, pruned DagRuns).
     """
     try:
         ti = dag_run.get_task_instance(PREPARE_TASK_ID)
@@ -250,13 +214,25 @@ def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
         return None
     if not isinstance(payload, dict):
         return None
+
     dbt_vars = payload.get("vars") or {}
-    project = dbt_vars.get("target_project")
-    dataset = dbt_vars.get("target_dataset")
-    execution_ts = dbt_vars.get("execution_ts")
-    if not (project and dataset and execution_ts):
+    warehouse = payload.get("warehouse") or _DEFAULT_WAREHOUSE
+    adapter = get_adapter(warehouse)
+    if adapter is None:
+        log.warning(
+            "DbtCompletionsListener: no warehouse adapter for %r (dag=%s)",
+            warehouse,
+            dag_run.dag_id,
+        )
         return None
-    return project, dataset, execution_ts
+
+    execution_ts = dbt_vars.get("execution_ts")
+    if not execution_ts:
+        return None
+    table_fqn = adapter.build_table_fqn(dbt_vars, COMPLETIONS_TABLE)
+    if not table_fqn:
+        return None
+    return _CompletionsTarget(adapter, table_fqn, execution_ts)
 
 
 def _parse_model_task(task_id: str) -> tuple[str, str] | None:
@@ -327,57 +303,6 @@ def _states_for_model(
 
 
 # ---------------------------------------------------------------------------
-# BigQuery MERGE
-# ---------------------------------------------------------------------------
-def _upsert(
-    table_fqn: str,
-    execution_ts: str,
-    rows: list[dict[str, str]],
-    bq_conn_id: str,
-) -> None:
-    if not rows:
-        return
-
-    try:
-        from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-        from google.cloud.bigquery import QueryJobConfig, ScalarQueryParameter
-    except ImportError:
-        log.warning(
-            "apache-airflow-providers-google not installed; dbt_completions "
-            "reconciliation skipped for %s",
-            table_fqn,
-        )
-        return
-
-    using_clauses: list[str] = []
-    params: list[Any] = [ScalarQueryParameter("e", "STRING", execution_ts)]
-    for i, row in enumerate(rows):
-        using_clauses.append(
-            f"SELECT @m{i} AS model_name, @e AS execution_ts, "
-            f"@s{i} AS status, CURRENT_TIMESTAMP() AS updated_at"
-        )
-        params.append(ScalarQueryParameter(f"m{i}", "STRING", row["model_name"]))
-        params.append(ScalarQueryParameter(f"s{i}", "STRING", row["status"]))
-
-    sql = f"""
-    MERGE `{table_fqn}` T
-    USING (
-        {" UNION ALL ".join(using_clauses)}
-    ) S
-    ON T.model_name = S.model_name
-       AND T.execution_ts = S.execution_ts
-       AND T.status = S.status
-    WHEN MATCHED THEN UPDATE SET updated_at = S.updated_at
-    WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
-      VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
-    """
-
-    hook = BigQueryHook(gcp_conn_id=bq_conn_id, use_legacy_sql=False)
-    client = hook.get_client()
-    client.query(sql, job_config=QueryJobConfig(query_parameters=params)).result()
-
-
-# ---------------------------------------------------------------------------
 # Reconciliation entry points
 # ---------------------------------------------------------------------------
 def _get_dag_run(task_instance: Any) -> Any | None:
@@ -435,11 +360,11 @@ def reconcile_model(task_instance: Any) -> None:
     if not target:
         log.info(
             "DbtCompletionsListener: no completions target resolved for dag=%s "
-            "(missing target_project/target_dataset/execution_ts in prepare_dbt_args XCom)",
+            "(unknown warehouse, or missing identifiers/execution_ts in "
+            "prepare_dbt_args XCom)",
             dag_run.dag_id,
         )
         return
-    project, dataset, execution_ts = target
 
     states = _states_for_model(dag_run, model_name, just_changed=task_instance)
     status = _derive_status(states)
@@ -452,21 +377,21 @@ def reconcile_model(task_instance: Any) -> None:
         )
         return
 
-    table_fqn = f"{project}.{dataset}.{COMPLETIONS_TABLE}"
     log.info(
-        "%s/%s: writing status=%s into %s (states=%s)",
+        "%s/%s: writing status=%s into %s (warehouse=%s, states=%s)",
         dag_run.dag_id,
         model_name,
         status,
-        table_fqn,
+        target.table_fqn,
+        target.adapter.name,
         states,
     )
     try:
-        _upsert(
-            table_fqn,
-            execution_ts,
+        target.adapter.upsert(
+            target.adapter.resolve_conn_id(),
+            target.table_fqn,
+            target.execution_ts,
             [{"model_name": model_name, "status": status}],
-            _get_bq_conn_id(dag_run),
         )
     except Exception:
         log.exception("%s/%s: dbt_completions upsert failed", dag_run.dag_id, model_name)

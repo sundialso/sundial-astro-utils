@@ -17,6 +17,13 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
+# Warehouse providers are soft imports (the listener no-ops with a warning if
+# the matching provider is absent), so they're optional extras. Install the
+# one(s) your deployment uses, e.g. ``pip install sundial-airflow-utils[snowflake]``.
+[project.optional-dependencies]
+bigquery = ["apache-airflow-providers-google"]
+snowflake = ["apache-airflow-providers-snowflake"]
+
 [project.urls]
 Homepage = "https://github.com/sundial-astro-sdk/sundial-astro-utils"
 

@@ -1,13 +1,31 @@
 {# ------------------------------------------------------------------ #}
-{#  Tracks per-model, per-run completion status in BigQuery.          #}
+{#  Tracks per-model, per-run completion status in the warehouse.      #}
+{#                                                                    #}
+{#  Warehouse support                                                 #}
+{#  -----------------                                                 #}
+{#  The orchestration macros below (create / log_model_status /       #}
+{#  log_run_results) are warehouse-agnostic. The three pieces that    #}
+{#  actually differ per warehouse are isolated behind dispatched      #}
+{#  primitives, implemented once per adapter under                    #}
+{#  ``macros/adapters/<warehouse>.sql``:                              #}
+{#                                                                    #}
+{#    - dbt_completions_table()      table FQN + identifier quoting   #}
+{#    - execution_ts_as_datestr()    date-string cast of the run ts   #}
+{#    - completions_col_type(kind)   DDL column types                 #}
+{#                                                                    #}
+{#  Adding a warehouse = add ``macros/adapters/<warehouse>.sql`` with  #}
+{#  the ``<warehouse>__*`` implementations of those three. Nothing in  #}
+{#  this file changes. (Mirrors the Python ``WarehouseAdapter``.)      #}
 {#                                                                    #}
 {#  Tenant requirements:                                              #}
-{#    - vars `target_project` and `target_dataset` must be set in     #}
-{#      the tenant's dbt_project.yml.                                 #}
-{#    - The tenant must define an `execution_ts()` macro that returns #}
-{#      a BigQuery DATETIME expression (used as the run's logical     #}
-{#      timestamp). Unqualified calls below resolve to the tenant's   #}
-{#      definition via dbt's macro lookup.                            #}
+{#    - BigQuery: vars `target_project` and `target_dataset` must be  #}
+{#      set. Snowflake: var `target_schema` (and optionally           #}
+{#      `target_database`; otherwise `target.database` is used).      #}
+{#    - The tenant must define an `execution_ts()` macro returning a  #}
+{#      timestamp/date expression VALID FOR THEIR OWN WAREHOUSE (each  #}
+{#      tenant targets a single warehouse). Sundial only wraps it     #}
+{#      with the per-warehouse date-string cast. Unqualified calls    #}
+{#      below resolve to the tenant's definition via dbt's lookup.    #}
 {#                                                                    #}
 {#  Wire-up in tenant dbt_project.yml:                                #}
 {#    on-run-start:                                                   #}
@@ -20,16 +38,28 @@
 {#        +post-hook: ["{{ sundial_dbt_shared.log_model_status('succeeded') }}"] #}
 {# ------------------------------------------------------------------ #}
 
+{# ------------------------------------------------------------------ #}
+{#  Dispatched primitives — resolve to ``<adapter>__<name>`` in        #}
+{#  ``macros/adapters/`` based on ``target.type`` (bigquery/snowflake).#}
+{# ------------------------------------------------------------------ #}
 {% macro dbt_completions_table() %}
-  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions`
+  {{ return(adapter.dispatch('dbt_completions_table', 'sundial_dbt_shared')()) }}
+{% endmacro %}
+
+{% macro execution_ts_as_datestr() %}
+  {{ return(adapter.dispatch('execution_ts_as_datestr', 'sundial_dbt_shared')()) }}
+{% endmacro %}
+
+{% macro completions_col_type(kind) %}
+  {{ return(adapter.dispatch('completions_col_type', 'sundial_dbt_shared')(kind)) }}
 {% endmacro %}
 
 {% macro create_dbt_completions_table() %}
   CREATE TABLE IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_table() }} (
-    model_name STRING,
-    execution_ts string,
-    status STRING,
-    updated_at TIMESTAMP
+    model_name   {{ sundial_dbt_shared.completions_col_type('string') }},
+    execution_ts {{ sundial_dbt_shared.completions_col_type('string') }},
+    status       {{ sundial_dbt_shared.completions_col_type('string') }},
+    updated_at   {{ sundial_dbt_shared.completions_col_type('timestamp') }}
   )
 {% endmacro %}
 
@@ -48,11 +78,11 @@
   {% if status == 'succeeded' and sundial_dbt_shared.model_has_tests(model.unique_id) %}
     SELECT 1 AS deferred_to_on_run_end
   {% else %}
-    MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+    MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
     USING (
       SELECT
         '{{ this.name }}' AS model_name,
-        cast(cast(({{ execution_ts() }})  as date) as string) AS execution_ts,
+        {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
         '{{ status }}' AS status,
         CURRENT_TIMESTAMP() AS updated_at
     ) S
@@ -138,12 +168,12 @@
     {% endfor %}
 
     {% if rows | length > 0 %}
-      MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+      MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
       USING (
         {% for row in rows %}
           SELECT
             '{{ row.name }}' AS model_name,
-            cast(cast(({{ execution_ts() }}) as date) as string) AS execution_ts,
+            {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
             '{{ row.status }}' AS status,
             CURRENT_TIMESTAMP() AS updated_at
           {% if not loop.last %}UNION ALL{% endif %}
