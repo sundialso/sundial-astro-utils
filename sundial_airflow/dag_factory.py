@@ -26,8 +26,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-import yaml
-
 from airflow.decorators import dag, task
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
@@ -114,6 +112,7 @@ def make_dbt_dag(
     venv_execution_config: Any,
     profile_config_factory: Callable[[str, str | None], Any],
     default_dataset_or_schema: str,
+    default_project: str | None = None,
     default_args: dict[str, Any] | None = None,
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
@@ -122,7 +121,6 @@ def make_dbt_dag(
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
-    completions_bq_conn_id: str | None = None,
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -154,6 +152,11 @@ def make_dbt_dag(
     default_dataset_or_schema:
         The default dataset (BigQuery) or schema (Snowflake) that gets used
         when no value is supplied via the DAG params.
+    default_project:
+        BigQuery project where dbt writes (same value dbt uses for
+        ``var('target_project')``). Passed through ``dbt_vars`` in XCom so the
+        DbtCompletionsListener can locate the ``dbt_completions`` table on a
+        manual UI state change. Optional; the listener no-ops without it.
     default_args:
         Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory wires
         ``dag_failure_alert`` as the DAG-level ``on_failure_callback`` so it
@@ -175,36 +178,12 @@ def make_dbt_dag(
     vars_field = _vars_field_name(warehouse)
     param_field = _param_field_name(warehouse)
 
-    # Parse ``vars.target_project`` out of dbt_project.yml so we can stash it
-    # on the DAG as a ``dbt_completions_project:<project>`` tag. Tags survive
-    # Airflow 3.x serialization (the API server gets them via SerializedDAG);
-    # ``user_defined_macros`` does not, so it can't carry this metadata.
-    # Snowflake tenants with no ``target_project`` declared get a no-op listener.
-    completions_project: str | None = None
-    try:
-        with open(Path(project_path_str) / "dbt_project.yml") as f:
-            dbt_proj_cfg = yaml.safe_load(f) or {}
-        completions_project = (dbt_proj_cfg.get("vars") or {}).get("target_project")
-    except Exception as exc:  # pragma: no cover
-        logger.warning(
-            "Could not parse %s/dbt_project.yml for dbt_completions discovery: %s",
-            project_path_str,
-            exc,
-        )
-
     merged_default_args = {
         **DEFAULT_DEFAULT_ARGS,
         **(default_args or {}),
     }
 
     tags = ["dbt", "listener_enabled", f"tenant:{tenant}", *(extra_tags or [])]
-    if completions_project:
-        # Tag-encoded metadata for the DbtCompletionsListener. Tags survive
-        # Airflow's DAG serialization (SerializedDAG carries them through);
-        # ``user_defined_macros`` does NOT, so we can't stash this there.
-        tags.append(f"dbt_completions_project:{completions_project}")
-    if completions_bq_conn_id:
-        tags.append(f"dbt_completions_bq_conn_id:{completions_bq_conn_id}")
 
     params = build_standard_params(
         warehouse=warehouse,
@@ -239,6 +218,9 @@ def make_dbt_dag(
 
             target_value = params.get(param_field) or default_dataset_or_schema
             dbt_vars[vars_field] = target_value
+
+            if default_project:
+                dbt_vars["target_project"] = default_project
 
             dbt_vars["execution_ts"] = (
                 params.get("execution_ts")

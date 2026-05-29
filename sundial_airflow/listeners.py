@@ -64,12 +64,9 @@ PREPARE_TASK_ID = "prepare_dbt_args"
 COMPLETIONS_TABLE = "dbt_completions"
 
 # BQ connection lookup, in precedence order:
-#   1. ``dbt_completions_bq_conn_id:<value>`` tag on the DAG (set per-DAG via
-#      ``make_dbt_dag(..., completions_bq_conn_id=...)``).
-#   2. The env var ``SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID`` (deployment-level).
-#   3. Auto-discover the single BQ-typed connection in Airflow's metadata DB.
-#   4. Hardcoded Airflow convention ``google_cloud_default`` (last resort).
-_BQ_CONN_ID_TAG_PREFIX = "dbt_completions_bq_conn_id:"
+#   1. The env var ``SUNDIAL_DBT_CONN_ID`` (deployment-level override).
+#   2. Auto-discover the single BQ-typed connection in Airflow's metadata DB.
+#   3. Hardcoded Airflow convention ``google_cloud_default`` (last resort).
 _BQ_CONN_TYPES = ("google_cloud_platform", "gcpbigquery")
 
 _AUTO_BQ_CONN_CACHE: str | None = None
@@ -104,9 +101,8 @@ def _autodiscover_bq_conn() -> str | None:
             _AUTO_BQ_CONN_CACHE = names[0]
         elif len(names) > 1:
             log.warning(
-                "DbtCompletionsListener: multiple BQ connections (%s); set "
-                "make_dbt_dag(completions_bq_conn_id=...) or "
-                "SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID to disambiguate",
+                "DbtCompletionsListener: multiple BQ connections (%s); "
+                "set SUNDIAL_DBT_CONN_ID to disambiguate",
                 names,
             )
         else:
@@ -114,13 +110,6 @@ def _autodiscover_bq_conn() -> str | None:
     except Exception as exc:
         log.debug("BQ conn auto-discovery failed: %s", exc)
     return _AUTO_BQ_CONN_CACHE
-
-# ``make_dbt_dag`` parses ``vars.target_project`` from dbt_project.yml at
-# build time and stashes it on the DAG as a ``dbt_completions_project:<value>``
-# tag. Tags survive Airflow 3.x serialization — the API server sees them in
-# the SerializedDAG it loads from the metadata DB. (``user_defined_macros``
-# does NOT survive serialization, which is why we don't use it.)
-_TARGET_PROJECT_TAG_PREFIX = "dbt_completions_project:"
 
 # Listener enablement, in precedence order:
 #   1. ``SUNDIAL_DBT_LISTENER_DAG_IDS`` env var: comma-separated allowlist.
@@ -156,21 +145,9 @@ def _tag_strings(dag: Any) -> list[str]:
     return out
 
 
-def _get_target_project(dag_run: Any) -> str | None:
-    dag = _load_dag(dag_run)
-    for tag in _tag_strings(dag):
-        if tag.startswith(_TARGET_PROJECT_TAG_PREFIX):
-            return tag[len(_TARGET_PROJECT_TAG_PREFIX):]
-    return None
-
-
 def _get_bq_conn_id(dag_run: Any) -> str:
-    """Resolve BQ conn_id: tag → env var → auto-discovery → hardcoded default."""
-    dag = _load_dag(dag_run)
-    for tag in _tag_strings(dag):
-        if tag.startswith(_BQ_CONN_ID_TAG_PREFIX):
-            return tag[len(_BQ_CONN_ID_TAG_PREFIX):]
-    explicit_env = os.environ.get("SUNDIAL_DBT_COMPLETIONS_BQ_CONN_ID")
+    """Resolve BQ conn_id: env var → auto-discovery → hardcoded default."""
+    explicit_env = os.environ.get("SUNDIAL_DBT_CONN_ID")
     if explicit_env:
         return explicit_env
     auto = _autodiscover_bq_conn()
@@ -250,20 +227,15 @@ def _load_dag(dag_run: Any) -> Any | None:
 def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
     """Return ``(project, dataset, execution_ts)`` for the row to write.
 
-    - ``project`` comes from the DAG's ``user_defined_macros`` (the value
-      ``make_dbt_dag`` stashed there from ``dbt_project.yml`` at build
-      time). Static per tenant.
-    - ``dataset`` and ``execution_ts`` come from the ``prepare_dbt_args``
-      XCom return (per-run values, possibly overridden via DAG params).
+    All three are pulled from the same place: the ``prepare_dbt_args``
+    XCom return, under ``payload["vars"]`` — the same dbt_vars blob dbt
+    itself receives. ``target_project`` comes from the ``default_project``
+    arg to ``make_dbt_dag``; ``target_dataset`` from the DAG param /
+    ``default_dataset_or_schema``; ``execution_ts`` from the param / today.
 
-    Returns ``None`` if any required field is missing (Snowflake tenants
-    with no ``target_project``, non-dbt DAGs, or DagRuns whose XCom has
-    been pruned).
+    Returns ``None`` if any field is missing (e.g. tenant didn't pass
+    ``default_project``, non-dbt DAGs, or DagRuns whose XCom was pruned).
     """
-    project = _get_target_project(dag_run)
-    if not project:
-        return None
-
     try:
         ti = dag_run.get_task_instance(PREPARE_TASK_ID)
     except Exception as exc:
@@ -279,9 +251,10 @@ def _get_completions_target(dag_run: Any) -> tuple[str, str, str] | None:
     if not isinstance(payload, dict):
         return None
     dbt_vars = payload.get("vars") or {}
+    project = dbt_vars.get("target_project")
     dataset = dbt_vars.get("target_dataset")
     execution_ts = dbt_vars.get("execution_ts")
-    if not (dataset and execution_ts):
+    if not (project and dataset and execution_ts):
         return None
     return project, dataset, execution_ts
 
@@ -462,7 +435,7 @@ def reconcile_model(task_instance: Any) -> None:
     if not target:
         log.info(
             "DbtCompletionsListener: no completions target resolved for dag=%s "
-            "(missing user_defined_macros._dbt_completions_project or XCom from prepare_dbt_args)",
+            "(missing target_project/target_dataset/execution_ts in prepare_dbt_args XCom)",
             dag_run.dag_id,
         )
         return
