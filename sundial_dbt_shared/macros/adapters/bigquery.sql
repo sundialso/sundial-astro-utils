@@ -5,6 +5,10 @@
 {# ------------------------------------------------------------------ #}
 
 {% macro bigquery__dbt_completions_table() %}
+  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions_raw`
+{% endmacro %}
+
+{% macro bigquery__dbt_completions_view() %}
   `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions`
 {% endmacro %}
 
