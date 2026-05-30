@@ -7,6 +7,10 @@
 {# database.schema.table. ``target_database`` var wins; otherwise the
    database from the active connection/profile (``target.database``). #}
 {% macro snowflake__dbt_completions_table() %}
+  {{ var('target_database', target.database) }}.{{ var('target_schema') }}.dbt_completions_raw
+{% endmacro %}
+
+{% macro snowflake__dbt_completions_view() %}
   {{ var('target_database', target.database) }}.{{ var('target_schema') }}.dbt_completions
 {% endmacro %}
 

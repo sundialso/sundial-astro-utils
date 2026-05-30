@@ -12,8 +12,8 @@ Division of labour
 ------------------
 - **Natural runs** (scheduled, manual-trigger, backfill): the dbt macros in
   ``sundial_dbt_shared`` (``pre-hook`` / ``post-hook`` / ``on-run-end``)
-  write every row to ``dbt_completions`` from *inside* the dbt invocation.
-  The listener stays out of the way.
+  write every row to ``dbt_completions_raw`` from *inside* the dbt
+  invocation. The listener stays out of the way.
 
 - **Manual UI/API state changes**: dbt isn't re-invoked, so the macros
   can't help — the table would go stale. The listener catches this exact
@@ -70,8 +70,11 @@ PREPARE_TASK_ID = "prepare_dbt_args"
 
 # Table name is a Sundial-wide convention; the table always sits in the same
 # dataset/schema the tenant's dbt models write to, so we hardcode it here
-# instead of plumbing it through every DAG.
-COMPLETIONS_TABLE = "dbt_completions"
+# instead of plumbing it through every DAG. This is the raw, append/MERGE
+# target (one row per status transition); the dbt_completions *view* collapses
+# it to each run's final state. The listener writes here, not to the view, and
+# its later updated_at makes the reconciliation row win in the view.
+COMPLETIONS_TABLE = "dbt_completions_raw"
 
 # Default warehouse for runs whose XCom predates warehouse plumbing.
 _DEFAULT_WAREHOUSE = "bigquery"

@@ -27,9 +27,16 @@
 {#      with the per-warehouse date-string cast. Unqualified calls    #}
 {#      below resolve to the tenant's definition via dbt's lookup.    #}
 {#                                                                    #}
+{#  Storage layout:                                                   #}
+{#    - dbt_completions_raw : table the hooks MERGE into; holds every  #}
+{#      status transition (several rows per model per run).            #}
+{#    - dbt_completions     : view created on-run-start; one row per   #}
+{#      (model, execution_ts) showing that run's FINAL status.         #}
+{#                                                                    #}
 {#  Wire-up in tenant dbt_project.yml:                                #}
 {#    on-run-start:                                                   #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_table() }}"   #}
+{#      - "{{ sundial_dbt_shared.create_dbt_completions_view() }}"    #}
 {#    on-run-end:                                                     #}
 {#      - "{{ sundial_dbt_shared.log_run_results() }}"                #}
 {#    models:                                                         #}
@@ -44,6 +51,10 @@
 {# ------------------------------------------------------------------ #}
 {% macro dbt_completions_table() %}
   {{ return(adapter.dispatch('dbt_completions_table', 'sundial_dbt_shared')()) }}
+{% endmacro %}
+
+{% macro dbt_completions_view() %}
+  {{ return(adapter.dispatch('dbt_completions_view', 'sundial_dbt_shared')()) }}
 {% endmacro %}
 
 {% macro execution_ts_as_datestr() %}
@@ -71,6 +82,42 @@
     status       {{ sundial_dbt_shared.completions_col_type('string') }},
     updated_at   {{ sundial_dbt_shared.completions_col_type('timestamp') }}
   )
+{% endmacro %}
+
+{#
+  create_dbt_completions_view — on-run-start companion to the raw table.
+
+  The hooks MERGE every status transition (started -> succeeded/failed) into
+  dbt_completions_raw, so that table holds several rows per model per run. This
+  view collapses each run to its FINAL state: one row per (model_name,
+  execution_ts), picking the most-recently-written status (the terminal row, as
+  on-run-end always writes last). Run history is preserved across execution_ts;
+  query the latest run by ordering on execution_ts.
+
+  Standard SQL — the ROW_NUMBER subquery runs unchanged on BigQuery and
+  Snowflake; only the object names come from the dispatched FQN primitives.
+
+  Created with IF NOT EXISTS (not OR REPLACE) so the parallel on-run-start
+  invocations don't issue conflicting concurrent DDL on the same view —
+  mirroring create_dbt_completions_table. A change to the view definition
+  therefore requires dropping the view once so the next run recreates it.
+#}
+{% macro create_dbt_completions_view() %}
+  CREATE VIEW IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_view() }} AS
+  SELECT model_name, execution_ts, status, updated_at
+  FROM (
+    SELECT
+      model_name,
+      execution_ts,
+      status,
+      updated_at,
+      ROW_NUMBER() OVER (
+        PARTITION BY model_name, execution_ts
+        ORDER BY updated_at DESC
+      ) AS _rn
+    FROM {{ sundial_dbt_shared.dbt_completions_table() }}
+  )
+  WHERE _rn = 1
 {% endmacro %}
 
 {% macro model_has_tests(model_unique_id) %}
