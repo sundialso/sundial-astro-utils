@@ -22,3 +22,9 @@
   {%- else -%}{{ exceptions.raise_compiler_error("unknown completions col type: " ~ kind) }}
   {%- endif -%}
 {% endmacro %}
+
+{# Snowflake serialises concurrent DML via row/table locks (statements queue
+   and block rather than aborting), so the MERGE needs no retry wrapper. #}
+{% macro snowflake__with_merge_retry(merge_sql) %}
+{{ merge_sql }}
+{% endmacro %}

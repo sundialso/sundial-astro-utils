@@ -54,6 +54,16 @@
   {{ return(adapter.dispatch('completions_col_type', 'sundial_dbt_shared')(kind)) }}
 {% endmacro %}
 
+{# Wraps a MERGE statement in warehouse-specific retry logic. BigQuery uses
+   snapshot isolation: concurrent MERGEs into the shared dbt_completions table
+   abort with "Could not serialize access ... due to concurrent update" once
+   parallelism exceeds what it will queue. The BigQuery impl re-runs the MERGE
+   (a fresh snapshot each attempt) on that error; Snowflake serialises DML via
+   locks, so its impl emits the MERGE unchanged. #}
+{% macro with_merge_retry(merge_sql) %}
+  {{ return(adapter.dispatch('with_merge_retry', 'sundial_dbt_shared')(merge_sql)) }}
+{% endmacro %}
+
 {% macro create_dbt_completions_table() %}
   CREATE TABLE IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_table() }} (
     model_name   {{ sundial_dbt_shared.completions_col_type('string') }},
@@ -78,6 +88,7 @@
   {% if status == 'succeeded' and sundial_dbt_shared.model_has_tests(model.unique_id) %}
     SELECT 1 AS deferred_to_on_run_end
   {% else %}
+    {%- set merge_sql -%}
     MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
     USING (
       SELECT
@@ -91,6 +102,8 @@
       updated_at = S.updated_at
     WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
       VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
+    {%- endset -%}
+    {{ sundial_dbt_shared.with_merge_retry(merge_sql) }}
   {% endif %}
 {% endmacro %}
 
@@ -168,6 +181,7 @@
     {% endfor %}
 
     {% if rows | length > 0 %}
+      {%- set merge_sql -%}
       MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
       USING (
         {% for row in rows %}
@@ -184,6 +198,8 @@
         updated_at = S.updated_at
       WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
         VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
+      {%- endset -%}
+      {{ sundial_dbt_shared.with_merge_retry(merge_sql) }}
     {% else %}
       SELECT 1 AS no_results_to_log
     {% endif %}
