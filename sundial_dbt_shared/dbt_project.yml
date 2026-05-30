@@ -1,0 +1,7 @@
+name: sundial_dbt_shared
+version: '0.1.0'
+config-version: 2
+
+macro-paths: ["macros"]
+
+require-dbt-version: ">=1.5.0"

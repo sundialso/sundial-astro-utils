@@ -6,6 +6,9 @@ for honouring the run-time DAG params (``skip_tests``, ``empty``, ``select``,
 """
 from __future__ import annotations
 
+from functools import partial
+from typing import Iterable
+
 from airflow.exceptions import AirflowSkipException
 
 PREPARE_TASK_ID = "prepare_dbt_args"
@@ -20,6 +23,33 @@ def skip_tests_if_disabled(context) -> None:
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Tests skipped (skip_tests or empty mode)")
+
+
+def _skip_source_test(dependent_models: frozenset[str], context) -> None:
+    params = context.get("params", {})
+    if params.get("skip_tests") or params.get("empty"):
+        raise AirflowSkipException("Tests skipped (skip_tests or empty mode)")
+
+    args = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID)
+    if args is None:
+        return
+    selected_models = args.get("selected_models")
+    if selected_models is None:
+        return
+
+    if not (dependent_models & set(selected_models)):
+        raise AirflowSkipException(
+            "No selected models depend on this source"
+        )
+
+
+def make_source_test_skip_hook(dependent_models: Iterable[str]):
+    """Build a ``pre_execute`` hook for a source-test task.
+
+    Skips when ``skip_tests`` / ``empty`` is set, or when a model selection
+    is active and none of ``dependent_models`` were selected.
+    """
+    return partial(_skip_source_test, frozenset(dependent_models))
 
 
 def skip_unselected(context) -> None:
@@ -55,10 +85,12 @@ def skip_unselected(context) -> None:
     if selected_models is None:
         return
 
-    if task_leaf == "run":
+    if task_leaf in ("run", "test"):
         model_name = ti.task_id.split(".")[-2]
     elif task_leaf.endswith("_run"):
         model_name = task_leaf.removesuffix("_run")
+    elif task_leaf.endswith("_test"):
+        model_name = task_leaf.removesuffix("_test")
     else:
         return
 

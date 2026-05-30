@@ -35,7 +35,7 @@ from cosmos.operators.local import DbtTestLocalOperator
 
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
-    skip_tests_if_disabled,
+    make_source_test_skip_hook,
     skip_unselected,
 )
 from sundial_airflow.params import build_standard_params
@@ -112,6 +112,7 @@ def make_dbt_dag(
     venv_execution_config: Any,
     profile_config_factory: Callable[[str, str | None], Any],
     default_dataset_or_schema: str,
+    default_project: str | None = None,
     default_args: dict[str, Any] | None = None,
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
@@ -151,6 +152,11 @@ def make_dbt_dag(
     default_dataset_or_schema:
         The default dataset (BigQuery) or schema (Snowflake) that gets used
         when no value is supplied via the DAG params.
+    default_project:
+        BigQuery project where dbt writes (same value dbt uses for
+        ``var('target_project')``). Passed through ``dbt_vars`` in XCom so the
+        DbtCompletionsListener can locate the ``dbt_completions`` table on a
+        manual UI state change. Optional; the listener no-ops without it.
     default_args:
         Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory wires
         ``dag_failure_alert`` as the DAG-level ``on_failure_callback`` so it
@@ -177,7 +183,7 @@ def make_dbt_dag(
         **(default_args or {}),
     }
 
-    tags = ["dbt", f"tenant:{tenant}", *(extra_tags or [])]
+    tags = ["dbt", "listener_enabled", f"tenant:{tenant}", *(extra_tags or [])]
 
     params = build_standard_params(
         warehouse=warehouse,
@@ -212,6 +218,9 @@ def make_dbt_dag(
 
             target_value = params.get(param_field) or default_dataset_or_schema
             dbt_vars[vars_field] = target_value
+
+            if default_project:
+                dbt_vars["target_project"] = default_project
 
             dbt_vars["execution_ts"] = (
                 params.get("execution_ts")
@@ -310,6 +319,8 @@ def make_dbt_dag(
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
+                # Selects the warehouse adapter in the dbt_completions listener.
+                "warehouse": warehouse,
                 "full_refresh": backfill_mode == "full",
                 "selected_models": selected_models,
                 "run_context": run_context,
@@ -325,6 +336,7 @@ def make_dbt_dag(
             if not source_tables:
                 EmptyOperator(task_id="no_source_tests")
             for source_name, table_name in source_tables:
+                dependents = source_to_models.get((source_name, table_name), ())
                 source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
                     task_id=f"test_{source_name}_{table_name}",
                     profile_config=profile_config,
@@ -337,7 +349,7 @@ def make_dbt_dag(
                         + "')['vars'] }}"
                     ),
                     install_deps=True,
-                    pre_execute=skip_tests_if_disabled,
+                    pre_execute=make_source_test_skip_hook(dependents),
                 )
 
         manifest_path = Path(project_path_str) / "target" / "manifest.json"
