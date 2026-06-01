@@ -11,6 +11,7 @@ its own connection IDs, schedule, and dbt project files.
 | Module | Purpose |
 | --- | --- |
 | `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG. |
+| `sundial_airflow.backfill.make_backfill_dag` | Lineage-preserving chunked backfill DAG factory (Snowflake-first). Mirrors dbt lineage one-for-one; per-model chunking via a tenant-side `chunking_config.json`. See [Backfill framework](#backfill-framework) below. |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -83,6 +84,93 @@ pip install -e ~/Documents/sundial-airflow-utils
 
 That overrides the `git+https://...` URL from `requirements.txt` until you run
 `pip install -r requirements.txt --force-reinstall` again.
+
+## Backfill framework
+
+A separate factory builds **manually-triggered, lineage-preserving
+chunked backfill DAGs** for tenants on Snowflake. The factory reads
+`target/manifest.json`, classifies every eligible model as
+**chunked** (per the tenant's `chunking_config.json`) or **full-refresh**
+(everything else), and emits a DAG whose graph mirrors the dbt lineage
+one-for-one — each model becomes a `TaskGroup` whose shape depends on
+its kind.
+
+```python
+from pendulum import datetime
+
+from sundial_airflow import dag_failure_alert
+from sundial_airflow.backfill import make_backfill_dag
+
+from include.constants import (
+    AIRFLOW_HOME,
+    DBT_SNOWFLAKE_BACKFILL_WAREHOUSE,
+    DBT_SNOWFLAKE_CONN_ID,
+    dbt_project_path,
+    get_backfill_profile_config,
+    venv_execution_config,
+)
+
+dag = make_backfill_dag(
+    dag_id="backfill_example_tenant",
+    tenant="example_tenant",
+    start_date=datetime(2026, 1, 1),
+    dbt_project_path=dbt_project_path,
+    dbt_profile_name="example_tenant_dbt",
+    venv_execution_config=venv_execution_config,
+    backfill_profile_config=get_backfill_profile_config(),
+    chunking_config_path=AIRFLOW_HOME / "include" / "chunking_config.json",
+    snowflake_conn_id=DBT_SNOWFLAKE_CONN_ID,
+    audit_schema="DBT_BACKFILLS",
+    base_vars={"target_schema": "DBT_BACKFILLS"},
+    backfill_warehouse=DBT_SNOWFLAKE_BACKFILL_WAREHOUSE,
+    max_active_tasks=44,
+    on_failure_callback=dag_failure_alert,
+)
+```
+
+### How it works
+
+- **Lineage-preserving graph.** Every inter-model edge from
+  `manifest.depends_on` is wired into the DAG; the graph view matches
+  the daily Cosmos DAG, just with each chunked model expanded into a
+  TaskGroup of static `chunk_<YYYY-MM>` tasks.
+- **Two task shapes.**
+  - *Full-refresh* (default): one `dbt run --select <name>` per model.
+  - *Chunked* (opt-in): N static chunk tasks computed at DAG parse
+    time from the model's `start_ts(<col>, <lookback>, '<first_ts>')`
+    anchor up to today, divided by the `chunk_size` (months) declared
+    in `chunking_config.json`.
+- **Strict allowlist.** A model becomes chunked iff (1) it has an
+  enabled entry in `chunking_config.json` with a positive `chunk_size`
+  AND (2) its SQL contains a `start_ts(...)` call. Anything else runs
+  full-refresh.
+- **`select` Param.** Operators can scope a run to a dbt-style selector
+  (`model+`, `+model+`, etc.) at trigger time; unselected models skip
+  via `trigger_rule="none_failed"` without breaking downstream tasks.
+- **Audit + reports.** Each successful task writes one row to
+  `<audit_schema>.BACKFILL_AUDIT` (auto-created). After every model
+  TaskGroup completes, two reporting tasks (`backfill_report`,
+  `backfill_warehouse_report`) run with `trigger_rule="all_done"`.
+- **Manual only.** `schedule=None`, `max_active_runs=1`.
+
+### Tenant-side artifacts
+
+Each tenant repo also needs:
+
+| Path | Purpose |
+| --- | --- |
+| `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
+| `macros/start_ts.sql` + `macros/end_ts.sql` | Temporal window macros. The factory injects `backfill_start_ts` / `backfill_end_ts` dbt vars that these macros consume. |
+| `macros/backfill_coverage.sql` | `dbt run-operation` for previewing chunk eligibility. |
+| `macros/backfill_report.sql` + `macros/backfill_warehouse_report.sql` | Macros invoked by the final reporting tasks. |
+| `dags/backfill_<tenant>.py` | ~30-line file that calls `make_backfill_dag`. |
+| A dedicated Snowflake warehouse | Sized for the backfill workload; **never reuse the production warehouse**. |
+
+The macros are currently copy-pasted across tenant repos. A planned
+follow-up is to ship them as a dbt package (`sundial-dbt-utils`) so
+tenants get them via `packages.yml`.
+
+See `opendoor-dbt/BACKFILL.md` for the operator-side runbook.
 
 ## Releasing
 
