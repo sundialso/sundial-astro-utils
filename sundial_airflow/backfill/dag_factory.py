@@ -69,35 +69,8 @@ def make_backfill_dag(
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
     max_active_tasks: int = 16,
 ) -> Any:
-    """Build and register a lineage-preserving chunked backfill DAG.
-
-    Parameters
-    ----------
-    dag_id, tenant, start_date:
-        DAG identity. ``schedule=None`` is hard-set — backfills are manually triggered.
-    dbt_project_path, dbt_profile_name:
-        dbt project root + profile name in ``profiles.yml``.
-    venv_execution_config:
-        Cosmos ``ExecutionConfig`` carrying the dbt executable path.
-    backfill_profile_config:
-        Cosmos ``ProfileConfig`` for the **dedicated backfill warehouse** —
-        never reuse the production warehouse.
-    chunking_config_path:
-        Path to the tenant's ``chunking_config.json``. Source of truth for
-        which models get chunked; ``None``/missing/empty = none.
-    snowflake_conn_id:
-        Snowflake connection ID for audit writes. ``None`` disables auditing.
-    audit_schema:
-        Schema for ``BACKFILL_AUDIT`` (auto-created).
-    base_vars:
-        dbt vars merged into every invocation (typically ``target_schema``).
-    default_args, extra_tags, on_failure_callback:
-        Merged over factory defaults / appended to standard tags / wired into the DAG.
-    chunk_var_keys:
-        ``(start, end)`` dbt var names injected per chunk. Override only when the
-        tenant's ``start_ts()`` / ``end_ts()`` macros read non-default var names.
-    max_active_tasks:
-        DAG-level concurrent task cap. Size for your backfill warehouse capacity.
+    """
+    Build and register a lineage-preserving chunked backfill DAG.
     """
     start_var, end_var = chunk_var_keys
     project_path_str = str(dbt_project_path)
