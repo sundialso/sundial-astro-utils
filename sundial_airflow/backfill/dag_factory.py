@@ -204,8 +204,8 @@ def make_backfill_dag(
         deps_task = _install_deps()
 
         # ── Central planning: resolve `select` Param + broadcast plan ────
-        @task(task_id="process_chunking_config")
-        def _process_chunking_config(**context: Any) -> dict[str, Any]:
+        @task(task_id="plan")
+        def _plan(**context: Any) -> dict[str, Any]:
             """Resolve the ``select`` Param and broadcast the run plan via XCom.
 
             Returns ``{selected, kind, chunk_counts}``; ``selected=None`` means run-all.
@@ -270,8 +270,8 @@ def make_backfill_dag(
                 "chunk_counts": chunk_counts,
             }
 
-        chunking_task = _process_chunking_config()
-        deps_task >> chunking_task  # type: ignore[operator]
+        plan_task = _plan()
+        deps_task >> plan_task  # type: ignore[operator]
 
         # ── Worker: one task per (model, chunk window) ───────────────────
         # trigger_rule="none_failed" lets selected models still run when
@@ -287,7 +287,7 @@ def make_backfill_dag(
             **context: Any,
         ) -> dict[str, Any]:
             """Run one chunk window for ``model_name`` and audit it."""
-            plan = context["ti"].xcom_pull(task_ids="process_chunking_config") or {}
+            plan = context["ti"].xcom_pull(task_ids="plan") or {}
             selected = plan.get("selected")
             if selected is not None and model_name not in selected:
                 raise AirflowSkipException(
@@ -329,7 +329,7 @@ def make_backfill_dag(
         @task(trigger_rule="none_failed")
         def _run_full_refresh(model_name: str, **context: Any) -> dict[str, Any]:
             """Run ``dbt run --select <model>`` once and audit it."""
-            plan = context["ti"].xcom_pull(task_ids="process_chunking_config") or {}
+            plan = context["ti"].xcom_pull(task_ids="plan") or {}
             selected = plan.get("selected")
             if selected is not None and model_name not in selected:
                 raise AirflowSkipException(
@@ -394,7 +394,7 @@ def make_backfill_dag(
                 for up in upstreams:
                     model_groups[up] >> tg
             else:
-                chunking_task >> tg  # root → planning task
+                plan_task >> tg  # root → planning task
 
             model_groups[model.name] = tg
 
