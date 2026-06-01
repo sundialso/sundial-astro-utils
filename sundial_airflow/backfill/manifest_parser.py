@@ -1,15 +1,9 @@
 """Parse dbt ``manifest.json`` + tenant chunking config into a backfill graph.
 
-Two-pass classification:
-
-1. Discover every eligible model from ``manifest.json`` and mark it
-   ``FULL_REFRESH`` (extracting any ``start_ts()`` anchor along the way).
-2. Apply the tenant's ``chunking_config.json``. A model is promoted to
-   ``CHUNKED`` iff the entry is enabled, has a positive ``chunk_size``,
-   AND the model's SQL contains a ``start_ts()`` call.
-
-Eligible = ``resource_type == "model"`` AND not ephemeral AND not opted
-out via ``config.meta.backfill_disabled: true``.
+Models default to ``FULL_REFRESH``; a model is promoted to ``CHUNKED``
+only if ``chunking_config.json`` opts it in with a positive
+``chunk_size`` AND its SQL contains a parseable ``start_ts()`` call.
+``config.meta.backfill_disabled: true`` opts a model out entirely.
 """
 from __future__ import annotations
 
@@ -45,12 +39,7 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 @dataclass
 class BackfillModel:
-    """A dbt model included in the backfill DAG.
-
-    ``CHUNKED`` models are guaranteed to have both ``first_timestamp``
-    and ``chunk_months`` set; ``FULL_REFRESH`` models may have either
-    or neither (``first_timestamp`` is informational in that case).
-    """
+    """A dbt model in the backfill DAG. ``chunk_months`` is set iff ``kind == CHUNKED``."""
 
     node_key: str
     name: str
@@ -74,13 +63,10 @@ class ChunkingConfigEntry:
 def load_chunking_config(
     config_path: str | Path | None,
 ) -> dict[str, ChunkingConfigEntry]:
-    """Load and validate ``chunking_config.json``.
+    """Load and validate ``chunking_config.json`` → ``{model_name -> entry}``.
 
-    Fail-soft: a missing file, bad JSON, or malformed entries produce
-    log warnings rather than exceptions, so a typo in the config can
-    never break DAG parsing.
-
-    Returns ``{model_name -> entry}``; duplicates resolve last-wins.
+    Fail-soft: missing file, bad JSON, or malformed entries log a
+    warning and are dropped — never raised. Duplicates: last wins.
     """
     if config_path is None:
         return {}
@@ -123,14 +109,8 @@ def load_backfill_models(
 ) -> dict[str, BackfillModel]:
     """Discover eligible models from ``manifest.json`` and apply chunking config.
 
-    Strict allowlist: chunking is opt-in. A model becomes ``CHUNKED``
-    iff (1) it has an enabled config entry with a positive
-    ``chunk_size`` AND (2) its SQL contains a ``start_ts()`` call from
-    which a ``first_timestamp`` anchor can be parsed. Everything else
-    is ``FULL_REFRESH``.
-
-    Returns a dict keyed by full dbt node key
-    (``"model.<project>.<name>"``).
+    Returns ``{node_key -> BackfillModel}`` where ``node_key`` is the
+    full dbt key ``"model.<project>.<name>"``.
     """
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     models: dict[str, BackfillModel] = {}
@@ -139,7 +119,8 @@ def load_backfill_models(
     for node_key, node in manifest.get("nodes", {}).items():
         if not _is_eligible(node):
             continue
-        if (node.get("config") or {}).get("meta", {}).get("backfill_disabled") is True:
+        meta = (node.get("config") or {}).get("meta") or {}
+        if meta.get("backfill_disabled") is True:
             opted_out += 1
             continue
         raw_sql = node.get("raw_code") or node.get("raw_sql") or ""
@@ -169,15 +150,9 @@ def load_backfill_models(
 def topological_order(
     models: dict[str, BackfillModel],
 ) -> list[BackfillModel]:
-    """Return models in upstream-first topological order.
+    """Return models in upstream-first topological order (name-sorted within layers).
 
-    Within each topological layer, models are name-sorted for
-    deterministic DAG re-parses.
-
-    Raises
-    ------
-    ValueError
-        If the dependency graph contains a cycle.
+    Raises ``ValueError`` on cycles.
     """
     remaining = set(models.keys())
     completed: set[str] = set()
@@ -211,11 +186,9 @@ def compute_static_chunks(
     models: dict[str, BackfillModel],
     today: date,
 ) -> dict[str, list[tuple[date, date, str]]]:
-    """Build the static chunk list for every ``CHUNKED`` model.
+    """Static ``(start, end, "YYYY-MM")`` chunk list per ``CHUNKED`` model.
 
-    Called once at DAG parse time. Each ``(start, end, chunk_id)`` tuple
-    becomes one static Airflow task (``chunk_<chunk_id>``); ``chunk_id``
-    is the ``YYYY-MM`` form of ``start``.
+    Called once at DAG parse time; each tuple becomes one ``chunk_<YYYY-MM>`` task.
     """
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
@@ -237,12 +210,10 @@ def _is_eligible(node: dict) -> bool:
 
 
 def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
-    """Earliest ``first_timestamp`` from any ``start_ts()`` call in the SQL.
+    """Earliest ``first_timestamp`` from any ``start_ts()`` call in ``raw_sql``.
 
-    Comments are stripped first so commented-out calls don't trigger
-    opt-in. When a model joins multiple temporally-scoped sources, the
-    earliest anchor wins — the conservative choice that guarantees the
-    backfill window covers every required range.
+    Comments are stripped first; when multiple calls are present the earliest wins
+    so the backfill window covers every required range.
     """
     sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
     sql = _LINE_COMMENT_RE.sub("", sql)

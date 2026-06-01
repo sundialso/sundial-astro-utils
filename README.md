@@ -103,7 +103,6 @@ from sundial_airflow.backfill import make_backfill_dag
 
 from include.constants import (
     AIRFLOW_HOME,
-    DBT_SNOWFLAKE_BACKFILL_WAREHOUSE,
     DBT_SNOWFLAKE_CONN_ID,
     dbt_project_path,
     get_backfill_profile_config,
@@ -122,7 +121,6 @@ dag = make_backfill_dag(
     snowflake_conn_id=DBT_SNOWFLAKE_CONN_ID,
     audit_schema="DBT_BACKFILLS",
     base_vars={"target_schema": "DBT_BACKFILLS"},
-    backfill_warehouse=DBT_SNOWFLAKE_BACKFILL_WAREHOUSE,
     max_active_tasks=44,
     on_failure_callback=dag_failure_alert,
 )
@@ -147,10 +145,11 @@ dag = make_backfill_dag(
 - **`select` Param.** Operators can scope a run to a dbt-style selector
   (`model+`, `+model+`, etc.) at trigger time; unselected models skip
   via `trigger_rule="none_failed"` without breaking downstream tasks.
-- **Audit + reports.** Each successful task writes one row to
-  `<audit_schema>.BACKFILL_AUDIT` (auto-created). After every model
-  TaskGroup completes, two reporting tasks (`backfill_report`,
-  `backfill_warehouse_report`) run with `trigger_rule="all_done"`.
+- **Audit trail.** Each successful task writes one row to
+  `<audit_schema>.BACKFILL_AUDIT` (auto-created). Reporting is
+  ad-hoc — operators run `dbt run-operation backfill_report` (or
+  `backfill_warehouse_report`) against the audit table after the run
+  completes.
 - **Manual only.** `schedule=None`, `max_active_runs=1`.
 
 ### Tenant-side artifacts
@@ -162,7 +161,7 @@ Each tenant repo also needs:
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Temporal window macros. The factory injects `backfill_start_ts` / `backfill_end_ts` dbt vars that these macros consume. |
 | `macros/backfill_coverage.sql` | `dbt run-operation` for previewing chunk eligibility. |
-| `macros/backfill_report.sql` + `macros/backfill_warehouse_report.sql` | Macros invoked by the final reporting tasks. |
+| `macros/backfill_report.sql` + `macros/backfill_warehouse_report.sql` | *Optional* — ad-hoc reporting macros run manually against `BACKFILL_AUDIT`. Not invoked by the DAG. |
 | `dags/backfill_<tenant>.py` | ~30-line file that calls `make_backfill_dag`. |
 | A dedicated Snowflake warehouse | Sized for the backfill workload; **never reuse the production warehouse**. |
 
@@ -170,7 +169,7 @@ The macros are currently copy-pasted across tenant repos. A planned
 follow-up is to ship them as a dbt package (`sundial-dbt-utils`) so
 tenants get them via `packages.yml`.
 
-See `opendoor-dbt/BACKFILL.md` for the operator-side runbook.
+See `<tenant>_dbt/BACKFILL.md` in your tenant repo for the operator-side runbook.
 
 ## Releasing
 

@@ -1,8 +1,7 @@
 """Snowflake ``BACKFILL_AUDIT`` table — DDL + per-task row inserts.
 
-Internal module. Callers pass in a ready-to-use ``SnowflakeHook``; this
-module never imports Airflow providers itself so it stays testable with
-a plain ``MagicMock``.
+Internal. Callers pass a ready-to-use ``SnowflakeHook`` so this module
+stays Airflow-free and unit-testable with ``MagicMock``.
 """
 from __future__ import annotations
 
@@ -13,12 +12,7 @@ AUDIT_TABLE = "BACKFILL_AUDIT"
 
 
 def ensure_audit_table(hook: Any, audit_schema: str) -> None:
-    """Idempotently create the audit schema + table.
-
-    Cheap on every call (Snowflake's ``IF NOT EXISTS`` is a metadata
-    no-op when the table already exists), so worker tasks can call it
-    unconditionally before inserting a row.
-    """
+    """Idempotently create the audit schema + table; safe to call before every insert."""
     hook.run(f"CREATE SCHEMA IF NOT EXISTS {audit_schema}")
     hook.run(
         f"""

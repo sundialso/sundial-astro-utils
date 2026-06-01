@@ -1,30 +1,23 @@
 """``make_backfill_dag`` — lineage-preserving chunked backfill DAG factory.
 
-Each tenant creates one thin DAG file that calls
-:func:`make_backfill_dag`. The factory reads ``target/manifest.json``,
-classifies every eligible model as ``CHUNKED`` (per the tenant's
-``chunking_config.json``) or ``FULL_REFRESH``, topologically sorts
-them, and emits a DAG whose graph mirrors the dbt lineage one-for-one
-— each model becomes a TaskGroup whose shape depends on its kind:
+Reads ``target/manifest.json``, classifies each eligible model as
+``CHUNKED`` (per ``chunking_config.json``) or ``FULL_REFRESH``,
+topologically sorts them, and emits a DAG that mirrors the dbt lineage
+one TaskGroup per model. ``CHUNKED`` groups expand into static
+``chunk_<YYYY-MM>`` tasks; ``FULL_REFRESH`` groups are a single ``run``
+task. Every successful task writes to ``<audit_schema>.BACKFILL_AUDIT``;
+reports are ad-hoc (``dbt run-operation backfill_report``).
 
-- ``FULL_REFRESH`` → single ``run`` task (``dbt run --select <name>``).
-- ``CHUNKED`` → N static ``chunk_<YYYY-MM>`` tasks, one per time window,
-  computed from ``first_timestamp`` (from the model's ``start_ts()``
-  call) up to today at ``chunk_size``-month strides.
-
-After every model TaskGroup reaches a terminal state, two reporting
-tasks run (``trigger_rule="all_done"``): ``backfill_report`` (audit
-table summary) and, if a backfill warehouse name is provided,
-``backfill_warehouse_report`` (audit ⨝ ``QUERY_HISTORY``).
-
-See ``opendoor-dbt/BACKFILL.md`` for the operator-side runbook.
+See ``<tenant>_dbt/BACKFILL.md`` for the operator runbook.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import json
 import logging
+import os
 import re
+import subprocess
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -35,7 +28,7 @@ from airflow.models.param import Param
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 
-from . import _audit, _dbt_runner
+from . import _audit
 from .manifest_parser import (
     CHUNKED,
     FULL_REFRESH,
@@ -48,6 +41,7 @@ from .manifest_parser import (
 logger = logging.getLogger(__name__)
 
 _DBT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 _DEFAULT_ARGS: dict[str, Any] = {
     "retries": 2,
@@ -74,67 +68,36 @@ def make_backfill_dag(
     on_failure_callback: Any | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
     max_active_tasks: int = 16,
-    backfill_warehouse: str | None = None,
-    enable_final_reports: bool = True,
 ) -> Any:
     """Build and register a lineage-preserving chunked backfill DAG.
 
     Parameters
     ----------
     dag_id, tenant, start_date:
-        Standard DAG identity. ``schedule=None`` is hard-set — backfills
-        are always manually triggered.
-    dbt_project_path:
-        Absolute path to the dbt project root.
-    dbt_profile_name:
-        Profile name in ``profiles.yml``.
+        DAG identity. ``schedule=None`` is hard-set — backfills are manually triggered.
+    dbt_project_path, dbt_profile_name:
+        dbt project root + profile name in ``profiles.yml``.
     venv_execution_config:
         Cosmos ``ExecutionConfig`` carrying the dbt executable path.
     backfill_profile_config:
-        Cosmos ``ProfileConfig`` for the **dedicated backfill warehouse**.
-        Never reuse the production warehouse.
+        Cosmos ``ProfileConfig`` for the **dedicated backfill warehouse** —
+        never reuse the production warehouse.
     chunking_config_path:
-        Path to the tenant's ``chunking_config.json``. **Source of truth**
-        for which models get chunked: a model becomes ``CHUNKED`` iff it
-        has an enabled entry here with a positive ``chunk_size`` AND its
-        SQL contains ``start_ts()``. Everything else is full-refresh.
-        ``None``/missing/empty = no models get chunked.
+        Path to the tenant's ``chunking_config.json``. Source of truth for
+        which models get chunked; ``None``/missing/empty = none.
     snowflake_conn_id:
-        Airflow Snowflake connection ID for audit writes. ``None``
-        disables auditing (useful for local dev).
+        Snowflake connection ID for audit writes. ``None`` disables auditing.
     audit_schema:
-        Snowflake schema for ``BACKFILL_AUDIT``. Created if missing
-        (requires ``CREATE SCHEMA`` privilege).
+        Schema for ``BACKFILL_AUDIT`` (auto-created).
     base_vars:
-        dbt vars merged into every model invocation (typically just
-        ``target_schema``).
+        dbt vars merged into every invocation (typically ``target_schema``).
     default_args, extra_tags, on_failure_callback:
-        Merged on top of factory defaults / appended to standard tags /
-        wired into the DAG. Pass ``sundial_airflow.dag_failure_alert``
-        as ``on_failure_callback`` for Slack notifications.
+        Merged over factory defaults / appended to standard tags / wired into the DAG.
     chunk_var_keys:
-        ``(start_var, end_var)`` injected as dbt vars for each chunk.
-        Defaults match the standard ``start_ts()`` / ``end_ts()`` macros.
-        Override only if the tenant uses non-standard macro names.
+        ``(start, end)`` dbt var names injected per chunk. Override only when the
+        tenant's ``start_ts()`` / ``end_ts()`` macros read non-default var names.
     max_active_tasks:
-        DAG-level concurrent task cap. Bounds total chunk + run tasks
-        the scheduler will launch simultaneously. Size for your backfill
-        warehouse (e.g. ``LARGE`` w/ ``MAX_CLUSTER_COUNT=2`` handles
-        ~40-50 small-window concurrent dbt queries comfortably).
-    backfill_warehouse:
-        Warehouse name passed to ``backfill_warehouse_report`` so it
-        knows what to scope ``QUERY_HISTORY_BY_WAREHOUSE`` to. When
-        ``None``, the warehouse report is skipped (audit report still
-        runs).
-    enable_final_reports:
-        When ``True`` (default), the two reporting tasks fire with
-        ``trigger_rule="all_done"`` after every model TaskGroup
-        completes. Non-zero exit codes are logged as warnings — reports
-        never fail the DAG.
-
-    Returns
-    -------
-    The registered Airflow ``DAG`` object.
+        DAG-level concurrent task cap. Size for your backfill warehouse capacity.
     """
     start_var, end_var = chunk_var_keys
     project_path_str = str(dbt_project_path)
@@ -211,24 +174,35 @@ def make_backfill_dag(
             EmptyOperator(task_id="no_backfill_models_configured")
             return
 
-        # ── Closure shim around the extracted dbt_invoke runner ──────────
+        # ``--no-write-json`` is hard-prepended so concurrent dbt runs
+        # don't race on ``target/manifest.json``.
         def _invoke(
             subcommand_args: list[str],
             log_label: str,
             *,
             extra_global_flags: list[str] | None = None,
-            stream_output: bool = False,
-        ):
-            return _dbt_runner.dbt_invoke(
-                profile_config=backfill_profile_config,
-                dbt_executable=dbt_executable,
-                project_dir=project_path_str,
-                profile_name=dbt_profile_name,
-                subcommand_args=subcommand_args,
-                log_label=log_label,
-                extra_global_flags=extra_global_flags,
-                stream_output=stream_output,
-            )
+        ) -> subprocess.CompletedProcess[str]:
+            with backfill_profile_config.ensure_profile() as (profile_path, profile_env):
+                cmd = [
+                    dbt_executable,
+                    "--no-write-json",
+                    *(extra_global_flags or []),
+                    *subcommand_args,
+                    "--project-dir", project_path_str,
+                    "--profiles-dir", str(Path(profile_path).parent),
+                    "--profile", dbt_profile_name,
+                    "--target", backfill_profile_config.target_name,
+                ]
+                env = {**os.environ, **profile_env}
+                logger.info("%s cmd: %s", log_label, " ".join(cmd))
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, env=env, check=False,
+                )
+
+            logger.info("%s stdout:\n%s", log_label, result.stdout)
+            if result.stderr:
+                logger.warning("%s stderr:\n%s", log_label, result.stderr)
+            return result
 
         def _dbt_run(model_name: str, extra_vars: dict[str, Any] | None = None) -> None:
             result = _invoke(
@@ -241,21 +215,8 @@ def make_backfill_dag(
                     f"dbt run failed for {model_name} (exit={result.returncode})"
                 )
 
-        def _dbt_run_operation(
-            macro_name: str,
-            macro_args: dict[str, Any] | None = None,
-            *,
-            stream_output: bool = False,
-        ):
-            args = ["run-operation", macro_name]
-            if macro_args:
-                args += ["--args", json.dumps(macro_args)]
-            return _invoke(
-                args, f"dbt run-operation [{macro_name}]", stream_output=stream_output,
-            )
-
         def _audit_hook():
-            """Lazy SnowflakeHook — imported inside the task to keep DAG parse light."""
+            # Imported lazily so DAG parse doesn't require the Snowflake provider.
             from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
             return SnowflakeHook(snowflake_conn_id=snowflake_conn_id)
 
@@ -272,10 +233,9 @@ def make_backfill_dag(
         # ── Central planning: resolve `select` Param + broadcast plan ────
         @task(task_id="process_chunking_config")
         def _process_chunking_config(**context: Any) -> dict[str, Any]:
-            """Resolve the operator's ``select`` Param and broadcast the run plan.
+            """Resolve the ``select`` Param and broadcast the run plan via XCom.
 
-            Returns ``{"selected": [...] | None, "kind": {...}, "chunk_counts": {...}}``.
-            ``selected=None`` means "run every model".
+            Returns ``{selected, kind, chunk_counts}``; ``selected=None`` means run-all.
             """
             select_expr = (context["params"].get("select") or "").strip()
             if not select_expr:
@@ -298,7 +258,7 @@ def make_backfill_dag(
                     )
                 selected, rejected = [], []
                 for raw in result.stdout.splitlines():
-                    clean = _dbt_runner.strip_ansi(raw).strip()
+                    clean = _ANSI_RE.sub("", raw).strip()
                     if not clean:
                         continue
                     (selected if _DBT_NAME_RE.match(clean) else rejected).append(clean)
@@ -424,46 +384,6 @@ def make_backfill_dag(
                 )
             return {"model": model_name, "kind": "full_refresh"}
 
-        # ── Final reports (trigger_rule="all_done" — always run) ─────────
-        @task(trigger_rule="all_done")
-        def _audit_report(**context: Any) -> dict[str, Any]:
-            """Stream ``dbt run-operation backfill_report`` into the task log."""
-            result = _dbt_run_operation(
-                "backfill_report",
-                macro_args={
-                    "airflow_run_id": context["dag_run"].run_id,
-                    "audit_schema": audit_schema,
-                },
-                stream_output=True,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "backfill_report exited non-zero (%d) — see streamed output. "
-                    "Report is informational; not failing the task.",
-                    result.returncode,
-                )
-            return {"macro": "backfill_report", "exit_code": result.returncode}
-
-        @task(trigger_rule="all_done")
-        def _warehouse_report(**context: Any) -> dict[str, Any]:
-            """Stream ``dbt run-operation backfill_warehouse_report`` into the task log."""
-            result = _dbt_run_operation(
-                "backfill_warehouse_report",
-                macro_args={
-                    "airflow_run_id": context["dag_run"].run_id,
-                    "warehouse_name": backfill_warehouse,
-                    "audit_schema": audit_schema,
-                },
-                stream_output=True,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "backfill_warehouse_report exited non-zero (%d) — see streamed "
-                    "output. Report is informational; not failing the task.",
-                    result.returncode,
-                )
-            return {"macro": "backfill_warehouse_report", "exit_code": result.returncode}
-
         # ── Build per-model TaskGroups in topological order ──────────────
         models_by_node_key = {m.node_key: m for m in _order}
         model_groups: dict[str, TaskGroup] = {}
@@ -504,25 +424,5 @@ def make_backfill_dag(
                 chunking_task >> tg  # root → planning task
 
             model_groups[model.name] = tg
-
-        # ── Final reports fire after every model TaskGroup completes ─────
-        if enable_final_reports:
-            with TaskGroup(group_id="final_reports"):
-                final_sentinel = EmptyOperator(
-                    task_id="ready", trigger_rule="all_done",
-                )
-                for tg in model_groups.values():
-                    tg >> final_sentinel
-
-                final_sentinel >> _audit_report.override(task_id="audit_report")()
-
-                if backfill_warehouse:
-                    final_sentinel >> _warehouse_report.override(
-                        task_id="warehouse_report",
-                    )()
-                else:
-                    logger.info(
-                        "`backfill_warehouse` not set — skipping warehouse_report task.",
-                    )
 
     return _build()

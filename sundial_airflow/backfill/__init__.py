@@ -1,12 +1,5 @@
-"""Lineage-aware chunked backfill DAG framework for Sundial dbt tenants.
-
-Tenant DAGs import only :func:`make_backfill_dag`; the other names are
-exposed for introspection (tests, ad-hoc tooling, custom DAGs).
-
-See :mod:`sundial_airflow.backfill.dag_factory` for the factory's
-docstring, and the tenant's ``BACKFILL.md`` for the operator-side
-runbook.
-"""
+"""Lineage-aware chunked backfill DAG framework. Tenant DAGs call
+:func:`make_backfill_dag`; other names are exported for tests and tooling."""
 from sundial_airflow.backfill.dag_factory import make_backfill_dag
 from sundial_airflow.backfill.manifest_parser import (
     CHUNKED,
