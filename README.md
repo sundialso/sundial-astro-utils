@@ -11,7 +11,7 @@ its own connection IDs, schedule, and dbt project files.
 | Module | Purpose |
 | --- | --- |
 | `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG. |
-| `sundial_airflow.backfill.make_backfill_dag` | Lineage-preserving chunked backfill DAG factory (Snowflake-first). Mirrors dbt lineage one-for-one; per-model chunking via a tenant-side `chunking_config.json`. See [Backfill framework](#backfill-framework) below. |
+| `sundial_airflow.backfill.make_backfill_dag` | Lineage-preserving chunked backfill DAG factory (Snowflake + BigQuery). Mirrors dbt lineage one-for-one; per-model chunking via a tenant-side `chunking_config.json`. See [Backfill framework](#backfill-framework) below. |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -88,12 +88,18 @@ That overrides the `git+https://...` URL from `requirements.txt` until you run
 ## Backfill framework
 
 A separate factory builds **manually-triggered, lineage-preserving
-chunked backfill DAGs** for tenants on Snowflake. The factory reads
+chunked backfill DAGs**. The factory reads
 `target/manifest.json`, classifies every eligible model as
 **chunked** (per the tenant's `chunking_config.json`) or **full-refresh**
 (everything else), and emits a DAG whose graph mirrors the dbt lineage
 one-for-one — each model becomes a `TaskGroup` whose shape depends on
 its kind.
+
+dbt runs target whatever warehouse `backfill_profile_config` points at,
+so the framework works for both **Snowflake** and **BigQuery** tenants.
+Only the optional audit-table writer is warehouse-specific; pass
+`warehouse="snowflake"` (default) or `warehouse="bigquery"` to pick the
+matching `BACKFILL_AUDIT` dialect.
 
 ```python
 from pendulum import datetime
@@ -118,13 +124,32 @@ dag = make_backfill_dag(
     venv_execution_config=venv_execution_config,
     backfill_profile_config=get_backfill_profile_config(),
     chunking_config_path=AIRFLOW_HOME / "include" / "chunking_config.json",
-    snowflake_conn_id=DBT_SNOWFLAKE_CONN_ID,
+    warehouse="snowflake",
+    warehouse_conn_id=DBT_SNOWFLAKE_CONN_ID,
     audit_schema="DBT_BACKFILLS",
     base_vars={"target_schema": "DBT_BACKFILLS"},
     max_active_tasks=44,
     on_failure_callback=dag_failure_alert,
 )
 ```
+
+For a **BigQuery** tenant, swap the warehouse, warehouse connection, and the
+`base_vars` key dbt expects (`target_dataset` instead of `target_schema`);
+`audit_schema` then names the BigQuery **dataset** for `BACKFILL_AUDIT`:
+
+```python
+dag = make_backfill_dag(
+    ...,
+    warehouse="bigquery",
+    warehouse_conn_id=DBT_BIGQUERY_CONN_ID,   # a GCP connection
+    audit_schema="dbt_backfills",
+    base_vars={"target_dataset": "dbt_backfills"},
+)
+```
+
+Install the matching provider extra: `pip install sundial-airflow-utils[snowflake]`
+or `pip install sundial-airflow-utils[bigquery]`. `warehouse_conn_id=None` disables
+auditing entirely.
 
 ### How it works
 
@@ -163,7 +188,7 @@ Each tenant repo also needs:
 | `macros/backfill_coverage.sql` | `dbt run-operation` for previewing chunk eligibility. |
 | `macros/backfill_report.sql` + `macros/backfill_warehouse_report.sql` | *Optional* — ad-hoc reporting macros run manually against `BACKFILL_AUDIT`. Not invoked by the DAG. |
 | `dags/backfill_<tenant>.py` | ~30-line file that calls `make_backfill_dag`. |
-| A dedicated Snowflake warehouse | Sized for the backfill workload; **never reuse the production warehouse**. |
+| A dedicated compute resource (Snowflake warehouse / BigQuery reservation or project) | Sized for the backfill workload; **never reuse production compute**. |
 
 The macros are currently copy-pasted across tenant repos. A planned
 follow-up is to ship them as a dbt package (`sundial-dbt-utils`) so

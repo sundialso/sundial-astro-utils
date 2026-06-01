@@ -60,7 +60,8 @@ def make_backfill_dag(
     venv_execution_config: Any,
     backfill_profile_config: Any,
     chunking_config_path: str | Path | None,
-    snowflake_conn_id: str | None = None,
+    warehouse: str,
+    warehouse_conn_id: str | None = None,
     audit_schema: str = "DBT_BACKFILLS",
     base_vars: dict[str, Any] | None = None,
     default_args: dict[str, Any] | None = None,
@@ -69,9 +70,13 @@ def make_backfill_dag(
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
     max_active_tasks: int = 16,
 ) -> Any:
+    """Build and register a lineage-preserving chunked backfill DAG.
     """
-    Build and register a lineage-preserving chunked backfill DAG.
-    """
+    warehouse = warehouse.lower()
+    if warehouse not in ("snowflake", "bigquery"):
+        raise ValueError(
+            f"Unsupported warehouse {warehouse!r}: expected 'snowflake' or 'bigquery'."
+        )
     start_var, end_var = chunk_var_keys
     project_path_str = str(dbt_project_path)
     dbt_executable = str(venv_execution_config.dbt_executable_path)
@@ -188,10 +193,16 @@ def make_backfill_dag(
                     f"dbt run failed for {model_name} (exit={result.returncode})"
                 )
 
-        def _audit_hook():
-            # Imported lazily so DAG parse doesn't require the Snowflake provider.
+        def _audit_writer() -> _audit.AuditWriter:
+            if warehouse == "bigquery":
+                from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+                return _audit.BigQueryAuditWriter(
+                    BigQueryHook(gcp_conn_id=warehouse_conn_id)
+                )
             from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-            return SnowflakeHook(snowflake_conn_id=snowflake_conn_id)
+            return _audit.SnowflakeAuditWriter(
+                SnowflakeHook(snowflake_conn_id=warehouse_conn_id)
+            )
 
         # ── One-time `dbt deps` install before any model task ────────────
         @task(task_id="install_deps")
@@ -304,18 +315,15 @@ def make_backfill_dag(
                     "run_context_tag": f"{tenant}_chunked_backfill",
                 },
             )
-            if snowflake_conn_id:
-                hook = _audit_hook()
-                _audit.ensure_audit_table(hook, audit_schema)
-                _audit.insert_chunk_row(
-                    hook,
+            if warehouse_conn_id:
+                writer = _audit_writer()
+                writer.ensure_audit_table(audit_schema)
+                writer.insert_chunk_row(
                     audit_schema=audit_schema,
-                    run_id=context["run_id"],
                     model_name=model_name,
-                    chunk_start=chunk_start_str,
-                    chunk_end=chunk_end_str,
-                    chunk_months=chunk_months,
-                    airflow_run_id=context["dag_run"].run_id,
+                    start_ts=chunk_start_str,
+                    end_ts=chunk_end_str,
+                    run_id=context["dag_run"].run_id,
                     started_at=started_at,
                 )
             return {
@@ -344,15 +352,13 @@ def make_backfill_dag(
                     "run_context_tag": f"{tenant}_backfill_upstream",
                 },
             )
-            if snowflake_conn_id:
-                hook = _audit_hook()
-                _audit.ensure_audit_table(hook, audit_schema)
-                _audit.insert_full_refresh_row(
-                    hook,
+            if warehouse_conn_id:
+                writer = _audit_writer()
+                writer.ensure_audit_table(audit_schema)
+                writer.insert_full_refresh_row(
                     audit_schema=audit_schema,
-                    run_id=context["run_id"],
                     model_name=model_name,
-                    airflow_run_id=context["dag_run"].run_id,
+                    run_id=context["dag_run"].run_id,
                     started_at=started_at,
                 )
             return {"model": model_name, "kind": "full_refresh"}
