@@ -6,13 +6,26 @@ stays Airflow-free and unit-testable with ``MagicMock``.
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from typing import Any
 
 AUDIT_TABLE = "BACKFILL_AUDIT"
 
 
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_schema(audit_schema: str) -> None:
+    if not isinstance(audit_schema, str) or not _IDENT_RE.match(audit_schema):
+        raise ValueError(
+            f"Invalid audit_schema {audit_schema!r}: "
+            f"must match {_IDENT_RE.pattern!r}."
+        )
+
+
 def ensure_audit_table(hook: Any, audit_schema: str) -> None:
     """Idempotently create the audit schema + table; safe to call before every insert."""
+    _validate_schema(audit_schema)
     hook.run(f"CREATE SCHEMA IF NOT EXISTS {audit_schema}")
     hook.run(
         f"""
@@ -45,6 +58,7 @@ def insert_chunk_row(
     started_at: _dt.datetime,
 ) -> None:
     """Record a successful chunk run."""
+    _validate_schema(audit_schema)
     hook.run(
         f"""
         INSERT INTO {audit_schema}.{AUDIT_TABLE}
@@ -78,6 +92,7 @@ def insert_full_refresh_row(
     started_at: _dt.datetime,
 ) -> None:
     """Record a successful full-refresh run."""
+    _validate_schema(audit_schema)
     hook.run(
         f"""
         INSERT INTO {audit_schema}.{AUDIT_TABLE}
