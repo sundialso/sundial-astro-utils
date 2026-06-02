@@ -227,6 +227,16 @@ def make_dbt_dag(
                 or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
             )
 
+            # run_group_id ties every task/chunk of THIS DAG run together: the
+            # dbt run-lock treats them as one logical run (teammates), while a
+            # different run (or orchestrator) is a stranger that backs off. All
+            # model tasks share this single vars blob, so they share the id;
+            # per-chunk fan-out additionally overrides `chunk_key` per task.
+            dag_run = context.get("dag_run")
+            run_id = getattr(dag_run, "run_id", None) or context.get("run_id")
+            if run_id:
+                dbt_vars["run_group_id"] = run_id
+
             backfill_mode = params.get("backfill_mode", "none")
             if backfill_mode == "partial":
                 start = params.get("start_ts")

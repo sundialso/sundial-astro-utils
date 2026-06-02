@@ -14,6 +14,11 @@
   {{ var('target_database', target.database) }}.{{ var('target_schema') }}.dbt_completions
 {% endmacro %}
 
+{# Subtract ``minutes`` from a Snowflake timestamp expression (run-lock TTL). #}
+{% macro snowflake__lock_ts_sub(ts_expr, minutes) %}
+  DATEADD(minute, -{{ minutes }}, {{ ts_expr }})
+{% endmacro %}
+
 {# Wraps the tenant-defined ``execution_ts()`` (a Snowflake timestamp/date
    expression) as a YYYY-MM-DD string — the table's execution_ts key. #}
 {% macro snowflake__execution_ts_as_datestr() %}

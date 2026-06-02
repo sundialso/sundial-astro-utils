@@ -12,6 +12,11 @@
   `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions`
 {% endmacro %}
 
+{# Subtract ``minutes`` from a BigQuery TIMESTAMP expression (run-lock TTL). #}
+{% macro bigquery__lock_ts_sub(ts_expr, minutes) %}
+  TIMESTAMP_SUB({{ ts_expr }}, INTERVAL {{ minutes }} MINUTE)
+{% endmacro %}
+
 {# Wraps the tenant-defined ``execution_ts()`` (a BigQuery datetime/date
    expression) as a YYYY-MM-DD string — the table's execution_ts key. #}
 {% macro bigquery__execution_ts_as_datestr() %}
