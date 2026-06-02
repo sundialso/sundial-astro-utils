@@ -89,7 +89,6 @@
     updated_at   {{ sundial_dbt_shared.completions_col_type('timestamp') }},
     run_group_id {{ sundial_dbt_shared.completions_col_type('string') }},
     chunk_key    {{ sundial_dbt_shared.completions_col_type('string') }},
-    acquired_at  {{ sundial_dbt_shared.completions_col_type('timestamp') }},
     heartbeat_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
   )
 {% endmacro %}
@@ -101,7 +100,6 @@
   ALTER TABLE {{ sundial_dbt_shared.dbt_completions_table() }}
     ADD COLUMN IF NOT EXISTS run_group_id {{ sundial_dbt_shared.completions_col_type('string') }},
     ADD COLUMN IF NOT EXISTS chunk_key    {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS acquired_at  {{ sundial_dbt_shared.completions_col_type('timestamp') }},
     ADD COLUMN IF NOT EXISTS heartbeat_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
 {% endmacro %}
 
@@ -300,10 +298,11 @@
 {#  run_group is a stranger.                                            #}
 {#                                                                    #}
 {#    - acquire_run_lock() (pre-hook, REPLACES log_model_status('started')): #}
-{#      write/refresh this run's 'started' row (acquired_at set once →    #}
-{#      priority; heartbeat_at refreshed → liveness). Then look: if a     #}
+{#      write/refresh this run's 'started' row. updated_at is set at       #}
+{#      acquire and NOT bumped on re-merge → it's the stable priority key; #}
+{#      heartbeat_at is refreshed → liveness. Then look: if a             #}
 {#      LIVE foreign 'started' (heartbeat within dbt_run_lock_ttl_minutes, #}
-{#      default 240) has PRIORITY (earlier acquired_at, ties by           #}
+{#      default 240) has PRIORITY (earlier updated_at, ties by            #}
 {#      run_group_id), flip my row to 'locked_out', log the holder, and   #}
 {#      raise — the model FAILS, but its recorded status is 'locked_out'  #}
 {#      (filtered from the view; never marked 'failed' by log_run_results).#}
@@ -321,7 +320,8 @@
     {%- set ck = var('chunk_key', 'full') -%}
     {%- set ttl = var('dbt_run_lock_ttl_minutes', 240) | int -%}
 
-    {# 1) Write/refresh my 'started' row (the lock). acquired_at only on insert. #}
+    {# 1) Write/refresh my 'started' row (the lock). updated_at is set only on
+       insert (stable → priority); re-merge refreshes heartbeat_at only. #}
     {%- set merge_sql -%}
       MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
       USING (
@@ -332,9 +332,9 @@
       ) S
       ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
          AND T.chunk_key = S.chunk_key AND T.status = 'started'
-      WHEN MATCHED THEN UPDATE SET heartbeat_at = S.now_ts, updated_at = S.now_ts
-      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, acquired_at, heartbeat_at, updated_at)
-        VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.now_ts, S.now_ts, S.now_ts)
+      WHEN MATCHED THEN UPDATE SET heartbeat_at = S.now_ts
+      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, heartbeat_at, updated_at)
+        VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.now_ts, S.now_ts)
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(merge_sql)) %}
 
@@ -348,19 +348,19 @@
         AND f.heartbeat_at IS NOT NULL
         AND f.heartbeat_at > {{ sundial_dbt_shared.lock_ts_sub('CURRENT_TIMESTAMP()', ttl) }}
         AND (
-          f.acquired_at < (
-            SELECT MIN(m.acquired_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
+          f.updated_at < (
+            SELECT MIN(m.updated_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
             WHERE m.model_name = '{{ this.name }}' AND m.run_group_id = '{{ rg }}' AND m.status = 'started'
           )
           OR (
-            f.acquired_at = (
-              SELECT MIN(m.acquired_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
+            f.updated_at = (
+              SELECT MIN(m.updated_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
               WHERE m.model_name = '{{ this.name }}' AND m.run_group_id = '{{ rg }}' AND m.status = 'started'
             )
             AND f.run_group_id < '{{ rg }}'
           )
         )
-      ORDER BY f.acquired_at, f.run_group_id
+      ORDER BY f.updated_at, f.run_group_id
       LIMIT 1
     {%- endset -%}
     {%- set res = run_query(verify_sql) -%}
