@@ -96,20 +96,6 @@
   )
 {% endmacro %}
 
-{# Additive column add for tables created before run grouping / the lock /
-   the incremental watermark. Wire into on-run-start AFTER
-   create_dbt_completions_table(). BigQuery and Snowflake both support
-   ADD COLUMN IF NOT EXISTS. #}
-{% macro ensure_completions_columns() %}
-  ALTER TABLE {{ sundial_dbt_shared.dbt_completions_table() }}
-    ADD COLUMN IF NOT EXISTS run_group_id        {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS chunk_key           {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS heartbeat_at        {{ sundial_dbt_shared.completions_col_type('timestamp') }},
-    ADD COLUMN IF NOT EXISTS window_start_ts     {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    ADD COLUMN IF NOT EXISTS window_end_ts       {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    ADD COLUMN IF NOT EXISTS window_committed_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
-{% endmacro %}
-
 {#
   create_dbt_completions_view — on-run-start companion to the raw table.
 
