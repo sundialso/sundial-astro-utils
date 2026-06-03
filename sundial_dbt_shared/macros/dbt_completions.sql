@@ -90,9 +90,8 @@
     run_group_id        {{ sundial_dbt_shared.completions_col_type('string') }},
     chunk_key           {{ sundial_dbt_shared.completions_col_type('string') }},
     heartbeat_at        {{ sundial_dbt_shared.completions_col_type('timestamp') }},
-    window_start_ts     {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    window_end_ts       {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    window_committed_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
+    window_start_ts {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    window_end_ts   {{ sundial_dbt_shared.completions_col_type('datetime') }}
   )
 {% endmacro %}
 
@@ -442,15 +441,21 @@
 {#  Tenant wiring (warehouse-specific start_ts/end_ts call these):        #}
 {#    where {{ start_ts(...) }} <= ts and ts <= {{ end_ts(...) }}         #}
 {#  with start_ts() using read_watermark(this.name) for its lower bound   #}
-{#  and calling record_window_start()/record_window_end() as it renders;  #}
-{#  commit_window() wired as a post-hook.                                 #}
+{#  and calling record_window_start()/record_window_end() as it renders.  #}
+{#  The watermark advances via the 'succeeded' terminal (build + blocking  #}
+{#  tests) that log_model_status / log_run_results already write — there   #}
+{#  is no separate commit step.                                           #}
 {#                                                                    #}
 {#  read_watermark mirrors sundial's last_processed_timestamp:            #}
 {#  MAX(window_end_ts) over this model's COMPLETE runs — run_groups whose  #}
-{#  every 'started' chunk has committed (build succeeded). A run with any  #}
-{#  uncommitted chunk (in-flight / failed) contributes NOTHING, so the     #}
-{#  watermark holds at the previous complete run (gap-safe). MAX gives     #}
-{#  no-regress (a partial backfill's historical window_end is ignored).    #}
+{#  every 'started' chunk reached a 'succeeded' terminal. Because          #}
+{#  log_run_results only writes 'succeeded' when the build AND its         #}
+{#  blocking (error-severity) tests pass, a failing table test holds the   #}
+{#  watermark — matching sundial, where a pipeline-blocking table-test     #}
+{#  failure fails materialization and last_processed never advances.       #}
+{#  Any chunk that is in-flight / failed / locked_out / crashed lacks a    #}
+{#  'succeeded' sibling, so its whole run contributes NOTHING (gap-safe);  #}
+{#  MAX gives no-regress (a partial backfill's historical end is ignored). #}
 {# ------------------------------------------------------------------ #}
 {% macro read_watermark(model_name) %}
   SELECT MAX(w.window_end_ts)
@@ -459,11 +464,17 @@
     AND w.status = 'started'
     AND w.window_end_ts IS NOT NULL
     AND w.run_group_id NOT IN (
+      -- run_groups with any 'started' chunk that has NO 'succeeded' sibling
+      -- (still running, failed, blocking-test-failed, locked_out, crashed)
       SELECT u.run_group_id
       FROM {{ sundial_dbt_shared.dbt_completions_table() }} u
       WHERE u.model_name = '{{ model_name }}'
         AND u.status = 'started'
-        AND u.window_committed_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM {{ sundial_dbt_shared.dbt_completions_table() }} s
+          WHERE s.model_name = u.model_name AND s.run_group_id = u.run_group_id
+            AND s.chunk_key = u.chunk_key AND s.status = 'succeeded'
+        )
     )
 {% endmacro %}
 
@@ -527,20 +538,3 @@
   {% endif %}
 {% endmacro %}
 
-{# POST-HOOK: stamp this run's chunk as committed on BUILD success (before dbt
-   tests run as separate nodes) — matching sundial advancing last_processed
-   before its data-quality checks. Only a committed chunk counts toward the
-   watermark; a run is complete once all its chunks are committed. #}
-{% macro commit_window() %}
-  {% if sundial_dbt_shared._should_record_window() %}
-    UPDATE {{ sundial_dbt_shared.dbt_completions_table() }}
-    SET window_committed_at = CURRENT_TIMESTAMP()
-    WHERE model_name = '{{ this.name }}'
-      AND run_group_id = '{{ var('run_group_id', invocation_id) }}'
-      AND chunk_key = '{{ var('chunk_key', 'full') }}'
-      AND status = 'started'
-      AND window_end_ts IS NOT NULL
-  {% else %}
-    SELECT 1 AS no_window_to_commit
-  {% endif %}
-{% endmacro %}
