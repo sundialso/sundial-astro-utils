@@ -135,10 +135,10 @@
         ORDER BY updated_at DESC
       ) AS _rn
     FROM {{ sundial_dbt_shared.dbt_completions_table() }}
-    -- 'locked_out' = a run that backed off behind another run's lock; it never
-    -- ran, so it must not surface as this (model, execution_ts)'s status (the
-    -- concurrent winner's terminal row is what sundial should read).
-    WHERE status != 'locked_out'
+    -- 'locked_out' (a run that backed off) and 'crashed' (a dead run reclaimed
+    -- after TTL) are "this run didn't produce data" markers — exclude them so
+    -- the concurrent data-producing run's terminal row is what sundial reads.
+    WHERE status NOT IN ('locked_out', 'crashed')
   )
   WHERE _rn = 1
 {% endmacro %}
@@ -158,6 +158,8 @@
   {% if status == 'succeeded' and sundial_dbt_shared.model_has_tests(model.unique_id) %}
     SELECT 1 AS deferred_to_on_run_end
   {% else %}
+    {%- set rg = var('run_group_id', invocation_id) -%}
+    {%- set ck = var('chunk_key', 'full') -%}
     {%- set merge_sql -%}
     MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
     USING (
@@ -165,13 +167,16 @@
         '{{ this.name }}' AS model_name,
         {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
         '{{ status }}' AS status,
+        '{{ rg }}' AS run_group_id,
+        '{{ ck }}' AS chunk_key,
         CURRENT_TIMESTAMP() AS updated_at
     ) S
     ON T.model_name = S.model_name AND T.execution_ts = S.execution_ts AND T.status = S.status
+       AND T.run_group_id = S.run_group_id AND T.chunk_key = S.chunk_key
     WHEN MATCHED THEN UPDATE SET
       updated_at = S.updated_at
-    WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
-      VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
+    WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, updated_at)
+      VALUES (S.model_name, S.execution_ts, S.status, S.run_group_id, S.chunk_key, S.updated_at)
     {%- endset -%}
     {{ sundial_dbt_shared.with_merge_retry(merge_sql) }}
   {% endif %}
@@ -269,15 +274,18 @@
             '{{ row.name }}' AS model_name,
             {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
             '{{ row.status }}' AS status,
+            '{{ _rg }}' AS run_group_id,
+            '{{ var('chunk_key', 'full') }}' AS chunk_key,
             CURRENT_TIMESTAMP() AS updated_at
           {% if not loop.last %}UNION ALL{% endif %}
         {% endfor %}
       ) S
       ON T.model_name = S.model_name AND T.execution_ts = S.execution_ts AND T.status = S.status
+         AND T.run_group_id = S.run_group_id AND T.chunk_key = S.chunk_key
       WHEN MATCHED THEN UPDATE SET
         updated_at = S.updated_at
-      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
-        VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
+      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, updated_at)
+        VALUES (S.model_name, S.execution_ts, S.status, S.run_group_id, S.chunk_key, S.updated_at)
       {%- endset -%}
       {{ sundial_dbt_shared.with_merge_retry(merge_sql) }}
     {% else %}
@@ -289,41 +297,77 @@
 {% endmacro %}
 
 {# ------------------------------------------------------------------ #}
-{#  Cross-orchestrator run lock — realized on the 'started' status.     #}
+{#  Cross-orchestrator run lock — realized purely on 'started' + terminal.#}
 {#                                                                    #}
-{#  The lock is NOT a separate table or status; it IS the per-model     #}
-{#  'started' row, made run-aware. The holder is ``run_group_id`` (the   #}
-{#  Airflow dag run_id via var, else this invocation_id), so every       #}
-{#  chunk/task of ONE run shares the lock (teammates) while a different   #}
-{#  run_group is a stranger.                                            #}
+{#  The lock is NOT a separate table or status; it IS the per-model      #}
+{#  'started' row, made run-aware. Holder = ``run_group_id`` (Airflow dag  #}
+{#  run_id via var, else invocation_id), so every chunk/task of ONE run    #}
+{#  shares the lock (teammates) while a different run_group is a stranger. #}
 {#                                                                    #}
-{#    - acquire_run_lock() (pre-hook, REPLACES log_model_status('started')): #}
-{#      write/refresh this run's 'started' row. updated_at is set at       #}
-{#      acquire and NOT bumped on re-merge → it's the stable priority key; #}
-{#      heartbeat_at is refreshed → liveness. Then look: if a             #}
-{#      LIVE foreign 'started' (heartbeat within dbt_run_lock_ttl_minutes, #}
-{#      default 240) has PRIORITY (earlier updated_at, ties by            #}
-{#      run_group_id), flip my row to 'locked_out', log the holder, and   #}
-{#      raise — the model FAILS, but its recorded status is 'locked_out'  #}
-{#      (filtered from the view; never marked 'failed' by log_run_results).#}
-{#    - release_run_lock() (post-hook): null my heartbeat → lock freed.   #}
-{#      A build that never reaches post-hook is reclaimed by the TTL.     #}
+{#  A run_group G HOLDS model M iff it has a 'started' row for M with NO    #}
+{#  terminal row (succeeded/failed/locked_out/crashed) for the same        #}
+{#  (model, run_group, chunk). Release is simply the terminal row that      #}
+{#  log_model_status / log_run_results already write — there is no          #}
+{#  separate release step.                                                 #}
 {#                                                                    #}
-{#  Write-first-then-look + single warehouse clock ⇒ at least one run     #}
-{#  always sees the other and exactly the earliest proceeds (no double    #}
-{#  run, no mutual lockout). Heartbeat is refreshed once per pre-hook;    #}
-{#  set the TTL above the longest single-model build.                    #}
+{#  ROLE OF heartbeat_at — crash recovery ONLY. It plays NO part in the     #}
+{#  lock judgement. Its sole job: a 'started' whose heartbeat is older      #}
+{#  than ``dbt_run_lock_ttl_minutes`` (default 240) — i.e. the process      #}
+{#  died (OOM/eviction) and never wrote a terminal — is swept to a          #}
+{#  'crashed' terminal row, which then frees the lock via the normal        #}
+{#  started/terminal logic. (Set the TTL above the longest single-model     #}
+{#  build; heartbeat is stamped at acquire and not beaten mid-build.)       #}
+{#                                                                    #}
+{#  acquire_run_lock() (pre-hook, REPLACES log_model_status('started')):    #}
+{#    1) reclaim: sweep stale 'started' rows for M to 'crashed';            #}
+{#    2) write my 'started' (updated_at on insert → stable priority key);   #}
+{#    3) look (started/terminal only): if a foreign run_group HOLDS M with   #}
+{#       PRIORITY (earlier updated_at, ties by run_group_id), flip my row    #}
+{#       to 'locked_out', log the holder, and raise — the model FAILS, but   #}
+{#       its status is 'locked_out' (filtered from the view; never rewritten #}
+{#       to 'failed' by log_run_results).                                   #}
+{#                                                                    #}
+{#  Write-first-then-look + single warehouse clock ⇒ at least one run        #}
+{#  always sees the other and exactly the earliest proceeds (no double run,  #}
+{#  no mutual lockout).                                                     #}
 {# ------------------------------------------------------------------ #}
 {% macro acquire_run_lock() %}
   {%- if execute -%}
     {%- set rg = var('run_group_id', invocation_id) -%}
     {%- set ck = var('chunk_key', 'full') -%}
     {%- set ttl = var('dbt_run_lock_ttl_minutes', 240) | int -%}
+    {%- set tbl = sundial_dbt_shared.dbt_completions_table() -%}
+    {%- set terminal = "('succeeded','failed','locked_out','crashed')" -%}
 
-    {# 1) Write/refresh my 'started' row (the lock). updated_at is set only on
-       insert (stable → priority); re-merge refreshes heartbeat_at only. #}
+    {# 1) CRASH RECLAIM (the only use of heartbeat_at): any 'started' for this
+       model whose heartbeat is older than the TTL and which never reached a
+       terminal is swept to 'crashed', so the lock logic below sees it freed. #}
+    {%- set reclaim_sql -%}
+      MERGE {{ tbl }} T
+      USING (
+        SELECT s.model_name, s.execution_ts, s.run_group_id, s.chunk_key
+        FROM {{ tbl }} s
+        WHERE s.model_name = '{{ this.name }}'
+          AND s.status = 'started'
+          AND s.heartbeat_at IS NOT NULL
+          AND s.heartbeat_at < {{ sundial_dbt_shared.lock_ts_sub('CURRENT_TIMESTAMP()', ttl) }}
+          AND NOT EXISTS (
+            SELECT 1 FROM {{ tbl }} t
+            WHERE t.model_name = s.model_name AND t.run_group_id = s.run_group_id
+              AND t.chunk_key = s.chunk_key AND t.status IN {{ terminal }}
+          )
+      ) S
+      ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
+         AND T.chunk_key = S.chunk_key AND T.status = 'crashed'
+      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, updated_at)
+        VALUES (S.model_name, S.execution_ts, 'crashed', S.run_group_id, S.chunk_key, CURRENT_TIMESTAMP())
+    {%- endset -%}
+    {% do run_query(sundial_dbt_shared.with_merge_retry(reclaim_sql)) %}
+
+    {# 2) Write my 'started' row. updated_at set on insert only (stable →
+       priority); re-merge just refreshes heartbeat_at (crash-recovery liveness). #}
     {%- set merge_sql -%}
-      MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+      MERGE {{ tbl }} T
       USING (
         SELECT '{{ this.name }}' AS model_name,
                {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
@@ -338,23 +382,27 @@
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(merge_sql)) %}
 
-    {# 2) Look: any LIVE foreign 'started' with priority over my run_group? #}
+    {# 3) Look — started/terminal ONLY (no heartbeat): a foreign run_group that
+       HOLDS M (a 'started' chunk with no terminal) and has priority over me. #}
     {%- set verify_sql -%}
       SELECT f.run_group_id
-      FROM {{ sundial_dbt_shared.dbt_completions_table() }} f
+      FROM {{ tbl }} f
       WHERE f.model_name = '{{ this.name }}'
         AND f.status = 'started'
         AND f.run_group_id != '{{ rg }}'
-        AND f.heartbeat_at IS NOT NULL
-        AND f.heartbeat_at > {{ sundial_dbt_shared.lock_ts_sub('CURRENT_TIMESTAMP()', ttl) }}
+        AND NOT EXISTS (
+          SELECT 1 FROM {{ tbl }} t
+          WHERE t.model_name = f.model_name AND t.run_group_id = f.run_group_id
+            AND t.chunk_key = f.chunk_key AND t.status IN {{ terminal }}
+        )
         AND (
           f.updated_at < (
-            SELECT MIN(m.updated_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
+            SELECT MIN(m.updated_at) FROM {{ tbl }} m
             WHERE m.model_name = '{{ this.name }}' AND m.run_group_id = '{{ rg }}' AND m.status = 'started'
           )
           OR (
             f.updated_at = (
-              SELECT MIN(m.updated_at) FROM {{ sundial_dbt_shared.dbt_completions_table() }} m
+              SELECT MIN(m.updated_at) FROM {{ tbl }} m
               WHERE m.model_name = '{{ this.name }}' AND m.run_group_id = '{{ rg }}' AND m.status = 'started'
             )
             AND f.run_group_id < '{{ rg }}'
@@ -368,16 +416,16 @@
 
     {%- if rows | length > 0 -%}
       {%- set winner = rows[0][0] -%}
-      {# Lost the race: record 'locked_out' (NOT failed) and free my heartbeat. #}
+      {# Lost the race: flip my 'started' to the 'locked_out' terminal (NOT failed). #}
       {%- set lockout_sql -%}
-        MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+        MERGE {{ tbl }} T
         USING (
           SELECT '{{ this.name }}' AS model_name, '{{ rg }}' AS run_group_id,
                  '{{ ck }}' AS chunk_key, CURRENT_TIMESTAMP() AS now_ts
         ) S
         ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
            AND T.chunk_key = S.chunk_key AND T.status = 'started'
-        WHEN MATCHED THEN UPDATE SET status = 'locked_out', heartbeat_at = NULL, updated_at = S.now_ts
+        WHEN MATCHED THEN UPDATE SET status = 'locked_out', updated_at = S.now_ts
       {%- endset -%}
       {% do run_query(sundial_dbt_shared.with_merge_retry(lockout_sql)) %}
       {{ log("dbt_run_lock: model '" ~ this.name ~ "' locked out — run_group '" ~ winner ~ "' is currently running; this run will not build it.", info=True) }}
@@ -387,18 +435,4 @@
     {%- endif -%}
   {%- endif -%}
   SELECT 1 AS lock_acquired
-{% endmacro %}
-
-{# Free this run's lock for the model by nulling the heartbeat (post-hook). #}
-{% macro release_run_lock() %}
-  {%- if execute -%}
-    UPDATE {{ sundial_dbt_shared.dbt_completions_table() }}
-    SET heartbeat_at = NULL
-    WHERE model_name = '{{ this.name }}'
-      AND run_group_id = '{{ var('run_group_id', invocation_id) }}'
-      AND chunk_key = '{{ var('chunk_key', 'full') }}'
-      AND status = 'started'
-  {%- else -%}
-    SELECT 1 AS no_lock_to_release
-  {%- endif -%}
 {% endmacro %}
