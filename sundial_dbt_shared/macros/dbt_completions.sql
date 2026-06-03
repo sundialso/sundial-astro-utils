@@ -113,26 +113,60 @@
   mirroring create_dbt_completions_table. A change to the view definition
   therefore requires dropping the view once so the next run recreates it.
 #}
+{#
+  create_dbt_completions_view — chunk-aware rollup, one row per (model, execution_ts).
+
+  For each (model, execution_ts) it takes the LATEST run_group (so a later
+  re-run supersedes an earlier one on the same date) and rolls its chunks up
+  to a single status:
+    - failed    if ANY chunk failed
+    - succeeded only if EVERY started chunk reached succeeded (whole run done)
+    - started   otherwise (some chunk still in flight)
+  'locked_out' / 'crashed' rows are excluded — they mean "this run produced no
+  data", so they never mask the real data-producing run.
+
+  This is what makes a partially-failed chunked run read as 'failed' (and
+  therefore NOT 'succeeded' to sundial's source-marker check), instead of the
+  old "latest updated_at wins", which could surface a sibling succeeded chunk.
+  Standard SQL (CTEs + window) — runs on BigQuery and Snowflake.
+#}
 {% macro create_dbt_completions_view() %}
   CREATE VIEW IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_view() }} AS
-  SELECT model_name, execution_ts, status, updated_at
-  FROM (
-    SELECT
-      model_name,
-      execution_ts,
-      status,
-      updated_at,
-      ROW_NUMBER() OVER (
-        PARTITION BY model_name, execution_ts
-        ORDER BY updated_at DESC
-      ) AS _rn
+  WITH live AS (
+    SELECT model_name, execution_ts, run_group_id, chunk_key, status, updated_at
     FROM {{ sundial_dbt_shared.dbt_completions_table() }}
-    -- 'locked_out' (a run that backed off) and 'crashed' (a dead run reclaimed
-    -- after TTL) are "this run didn't produce data" markers — exclude them so
-    -- the concurrent data-producing run's terminal row is what sundial reads.
     WHERE status NOT IN ('locked_out', 'crashed')
+  ),
+  latest_run AS (
+    SELECT
+      model_name, execution_ts, run_group_id,
+      ROW_NUMBER() OVER (
+        PARTITION BY model_name, execution_ts ORDER BY MAX(updated_at) DESC
+      ) AS _rn
+    FROM live
+    GROUP BY model_name, execution_ts, run_group_id
+  ),
+  latest_rows AS (
+    SELECT l.model_name, l.execution_ts, l.chunk_key, l.status, l.updated_at
+    FROM live l
+    JOIN latest_run r
+      ON l.model_name = r.model_name
+     AND l.execution_ts = r.execution_ts
+     AND l.run_group_id = r.run_group_id
+    WHERE r._rn = 1
   )
-  WHERE _rn = 1
+  SELECT
+    model_name,
+    execution_ts,
+    CASE
+      WHEN SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
+      WHEN COUNT(DISTINCT CASE WHEN status = 'started'   THEN chunk_key END)
+         = COUNT(DISTINCT CASE WHEN status = 'succeeded' THEN chunk_key END) THEN 'succeeded'
+      ELSE 'started'
+    END AS status,
+    MAX(updated_at) AS updated_at
+  FROM latest_rows
+  GROUP BY model_name, execution_ts
 {% endmacro %}
 
 {% macro model_has_tests(model_unique_id) %}
