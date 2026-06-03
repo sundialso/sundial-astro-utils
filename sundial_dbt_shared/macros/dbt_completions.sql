@@ -538,3 +538,57 @@
   {% endif %}
 {% endmacro %}
 
+{# ------------------------------------------------------------------ #}
+{#  Partial-backfill bounds validation — mirrors sundial's              #}
+{#  _run_partial_backfill_state_validations. A partial backfill may only #}
+{#  reprocess history the table has ALREADY covered: its end_ts must not #}
+{#  exceed the table's processed watermark (read_watermark). Also        #}
+{#  start_ts <= end_ts and start_ts >= first_timestamp.                  #}
+{#                                                                    #}
+{#  Wire as the FIRST pre-hook (before acquire_run_lock) on incremental  #}
+{#  models, or call from the tenant's start_ts, passing the model's      #}
+{#  first_timestamp. No-op unless both backfill vars are set. Raises (the #}
+{#  run fails) on a violation — matching sundial rejecting the backfill   #}
+{#  state. Bounds are evaluated on the warehouse (CAST to the 'datetime' #}
+{#  type) so no Python date parsing is needed.                           #}
+{# ------------------------------------------------------------------ #}
+{% macro validate_partial_backfill(model_name, first_timestamp=none) %}
+  {%- if execute
+        and var('backfill_start_ts', none) is not none
+        and var('backfill_end_ts', none) is not none -%}
+    {%- set dt = sundial_dbt_shared.completions_col_type('datetime') -%}
+    {%- set bstart = "CAST('" ~ var('backfill_start_ts') ~ "' AS " ~ dt ~ ")" -%}
+    {%- set bend = "CAST('" ~ var('backfill_end_ts') ~ "' AS " ~ dt ~ ")" -%}
+    {%- set first_sql = ("CAST('" ~ first_timestamp ~ "' AS " ~ dt ~ ")") if first_timestamp is not none else "CAST(NULL AS " ~ dt ~ ")" -%}
+    {%- set q -%}
+      SELECT
+        ({{ bstart }} > {{ bend }})                                      AS start_after_end,
+        (wm IS NOT NULL AND {{ bend }} > wm)                             AS end_beyond_table,
+        ({{ first_sql }} IS NOT NULL AND {{ bstart }} < {{ first_sql }}) AS start_before_first,
+        wm                                                               AS wm
+      FROM (SELECT ({{ sundial_dbt_shared.read_watermark(model_name) }}) AS wm)
+    {%- endset -%}
+    {%- set r = run_query(q) -%}
+    {%- if r is not none and r.rows | length > 0 -%}
+      {%- set row = r.rows[0] -%}
+      {%- if row[0] -%}
+        {{ exceptions.raise_compiler_error(
+            "partial backfill: backfill_start_ts (" ~ var('backfill_start_ts')
+            ~ ") is after backfill_end_ts (" ~ var('backfill_end_ts') ~ ") for " ~ model_name) }}
+      {%- endif -%}
+      {%- if row[1] -%}
+        {{ exceptions.raise_compiler_error(
+            "partial backfill: backfill_end_ts (" ~ var('backfill_end_ts')
+            ~ ") is beyond " ~ model_name ~ "'s processed watermark (" ~ row[3]
+            ~ "). A partial backfill may only reprocess already-covered history.") }}
+      {%- endif -%}
+      {%- if row[2] -%}
+        {{ exceptions.raise_compiler_error(
+            "partial backfill: backfill_start_ts (" ~ var('backfill_start_ts')
+            ~ ") is before first_timestamp (" ~ first_timestamp ~ ") for " ~ model_name) }}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  SELECT 1 AS backfill_validated
+{% endmacro %}
+
