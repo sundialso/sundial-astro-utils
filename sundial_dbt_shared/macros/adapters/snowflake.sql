@@ -28,6 +28,7 @@
 {% macro snowflake__completions_col_type(kind) %}
   {%- if kind == 'string' -%}VARCHAR
   {%- elif kind == 'timestamp' -%}TIMESTAMP_NTZ
+  {%- elif kind == 'datetime' -%}TIMESTAMP_NTZ
   {%- else -%}{{ exceptions.raise_compiler_error("unknown completions col type: " ~ kind) }}
   {%- endif -%}
 {% endmacro %}

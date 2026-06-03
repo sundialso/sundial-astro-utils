@@ -83,24 +83,31 @@
 
 {% macro create_dbt_completions_table() %}
   CREATE TABLE IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_table() }} (
-    model_name   {{ sundial_dbt_shared.completions_col_type('string') }},
-    execution_ts {{ sundial_dbt_shared.completions_col_type('string') }},
-    status       {{ sundial_dbt_shared.completions_col_type('string') }},
-    updated_at   {{ sundial_dbt_shared.completions_col_type('timestamp') }},
-    run_group_id {{ sundial_dbt_shared.completions_col_type('string') }},
-    chunk_key    {{ sundial_dbt_shared.completions_col_type('string') }},
-    heartbeat_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
+    model_name          {{ sundial_dbt_shared.completions_col_type('string') }},
+    execution_ts        {{ sundial_dbt_shared.completions_col_type('string') }},
+    status              {{ sundial_dbt_shared.completions_col_type('string') }},
+    updated_at          {{ sundial_dbt_shared.completions_col_type('timestamp') }},
+    run_group_id        {{ sundial_dbt_shared.completions_col_type('string') }},
+    chunk_key           {{ sundial_dbt_shared.completions_col_type('string') }},
+    heartbeat_at        {{ sundial_dbt_shared.completions_col_type('timestamp') }},
+    window_start_ts     {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    window_end_ts       {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    window_committed_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
   )
 {% endmacro %}
 
-{# Additive column add for tables created before run grouping / the lock.
-   Wire into on-run-start AFTER create_dbt_completions_table(). BigQuery and
-   Snowflake both support ADD COLUMN IF NOT EXISTS. #}
-{% macro ensure_run_group_columns() %}
+{# Additive column add for tables created before run grouping / the lock /
+   the incremental watermark. Wire into on-run-start AFTER
+   create_dbt_completions_table(). BigQuery and Snowflake both support
+   ADD COLUMN IF NOT EXISTS. #}
+{% macro ensure_completions_columns() %}
   ALTER TABLE {{ sundial_dbt_shared.dbt_completions_table() }}
-    ADD COLUMN IF NOT EXISTS run_group_id {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS chunk_key    {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS heartbeat_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
+    ADD COLUMN IF NOT EXISTS run_group_id        {{ sundial_dbt_shared.completions_col_type('string') }},
+    ADD COLUMN IF NOT EXISTS chunk_key           {{ sundial_dbt_shared.completions_col_type('string') }},
+    ADD COLUMN IF NOT EXISTS heartbeat_at        {{ sundial_dbt_shared.completions_col_type('timestamp') }},
+    ADD COLUMN IF NOT EXISTS window_start_ts     {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    ADD COLUMN IF NOT EXISTS window_end_ts       {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    ADD COLUMN IF NOT EXISTS window_committed_at {{ sundial_dbt_shared.completions_col_type('timestamp') }}
 {% endmacro %}
 
 {#
@@ -435,4 +442,119 @@
     {%- endif -%}
   {%- endif -%}
   SELECT 1 AS lock_acquired
+{% endmacro %}
+
+{# ------------------------------------------------------------------ #}
+{#  Incremental watermark — "data present till", sourced from            #}
+{#  dbt_completions instead of MAX(timestamp_col) on the target.         #}
+{#                                                                    #}
+{#  These operate on the SAME per-run 'started' row acquire_run_lock      #}
+{#  writes (keyed model_name/run_group_id/chunk_key): the window columns  #}
+{#  live on that row, so status + lock + watermark are one row, not       #}
+{#  three.                                                               #}
+{#                                                                    #}
+{#  Tenant wiring (warehouse-specific start_ts/end_ts call these):        #}
+{#    where {{ start_ts(...) }} <= ts and ts <= {{ end_ts(...) }}         #}
+{#  with start_ts() using read_watermark(this.name) for its lower bound   #}
+{#  and calling record_window_start()/record_window_end() as it renders;  #}
+{#  commit_window() wired as a post-hook.                                 #}
+{#                                                                    #}
+{#  read_watermark mirrors sundial's last_processed_timestamp:            #}
+{#  MAX(window_end_ts) over this model's COMPLETE runs — run_groups whose  #}
+{#  every 'started' chunk has committed (build succeeded). A run with any  #}
+{#  uncommitted chunk (in-flight / failed) contributes NOTHING, so the     #}
+{#  watermark holds at the previous complete run (gap-safe). MAX gives     #}
+{#  no-regress (a partial backfill's historical window_end is ignored).    #}
+{# ------------------------------------------------------------------ #}
+{% macro read_watermark(model_name) %}
+  SELECT MAX(w.window_end_ts)
+  FROM {{ sundial_dbt_shared.dbt_completions_table() }} w
+  WHERE w.model_name = '{{ model_name }}'
+    AND w.status = 'started'
+    AND w.window_end_ts IS NOT NULL
+    AND w.run_group_id NOT IN (
+      SELECT u.run_group_id
+      FROM {{ sundial_dbt_shared.dbt_completions_table() }} u
+      WHERE u.model_name = '{{ model_name }}'
+        AND u.status = 'started'
+        AND u.window_committed_at IS NULL
+    )
+{% endmacro %}
+
+{% macro _should_record_window() %}
+  {{ return(execute
+            and model is not none
+            and model.config.get('materialized') == 'incremental'
+            and var('record_incremental_window', true)) }}
+{% endmacro %}
+
+{# Upsert window_end_ts onto this run's 'started' row (the watermark
+   contributor). end_sql is a self-contained DATETIME expression. #}
+{% macro record_window_end(end_sql) %}
+  {% if sundial_dbt_shared._should_record_window() %}
+    {%- set rg = var('run_group_id', invocation_id) -%}
+    {%- set ck = var('chunk_key', 'full') -%}
+    {%- set sql -%}
+      MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+      USING (
+        SELECT '{{ this.name }}' AS model_name,
+               {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
+               '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
+               ({{ end_sql }}) AS we
+      ) S
+      ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
+         AND T.chunk_key = S.chunk_key AND T.status = 'started'
+      WHEN MATCHED THEN UPDATE SET window_end_ts = S.we
+      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, window_end_ts, updated_at)
+        VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.we, CURRENT_TIMESTAMP())
+    {%- endset -%}
+    {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
+  {% endif %}
+{% endmacro %}
+
+{# Upsert window_start_ts onto the 'started' row. start_sql may reference
+   read_watermark (a scalar subquery over this table) — resolve it to a
+   literal FIRST so the MERGE source never reads the table it writes. #}
+{% macro record_window_start(start_sql) %}
+  {% if sundial_dbt_shared._should_record_window() %}
+    {%- set rg = var('run_group_id', invocation_id) -%}
+    {%- set ck = var('chunk_key', 'full') -%}
+    {%- set res = run_query("SELECT (" ~ start_sql ~ ") AS ws") -%}
+    {%- set ws = res.rows[0][0] if res is not none and res.rows | length > 0 else none -%}
+    {% if ws is not none %}
+      {%- set sql -%}
+        MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+        USING (
+          SELECT '{{ this.name }}' AS model_name,
+                 {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
+                 '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
+                 CAST('{{ ws }}' AS {{ sundial_dbt_shared.completions_col_type('datetime') }}) AS ws
+        ) S
+        ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
+           AND T.chunk_key = S.chunk_key AND T.status = 'started'
+        WHEN MATCHED THEN UPDATE SET window_start_ts = S.ws
+        WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, window_start_ts, updated_at)
+          VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.ws, CURRENT_TIMESTAMP())
+      {%- endset -%}
+      {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
+    {% endif %}
+  {% endif %}
+{% endmacro %}
+
+{# POST-HOOK: stamp this run's chunk as committed on BUILD success (before dbt
+   tests run as separate nodes) — matching sundial advancing last_processed
+   before its data-quality checks. Only a committed chunk counts toward the
+   watermark; a run is complete once all its chunks are committed. #}
+{% macro commit_window() %}
+  {% if sundial_dbt_shared._should_record_window() %}
+    UPDATE {{ sundial_dbt_shared.dbt_completions_table() }}
+    SET window_committed_at = CURRENT_TIMESTAMP()
+    WHERE model_name = '{{ this.name }}'
+      AND run_group_id = '{{ var('run_group_id', invocation_id) }}'
+      AND chunk_key = '{{ var('chunk_key', 'full') }}'
+      AND status = 'started'
+      AND window_end_ts IS NOT NULL
+  {% else %}
+    SELECT 1 AS no_window_to_commit
+  {% endif %}
 {% endmacro %}

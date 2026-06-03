@@ -26,6 +26,7 @@
 {% macro bigquery__completions_col_type(kind) %}
   {%- if kind == 'string' -%}STRING
   {%- elif kind == 'timestamp' -%}TIMESTAMP
+  {%- elif kind == 'datetime' -%}DATETIME
   {%- else -%}{{ exceptions.raise_compiler_error("unknown completions col type: " ~ kind) }}
   {%- endif -%}
 {% endmacro %}
