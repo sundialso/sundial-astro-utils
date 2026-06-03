@@ -19,8 +19,9 @@
 {#                                                                    #}
 {#  Tenant requirements:                                              #}
 {#    - BigQuery: vars `target_project` and `target_dataset` must be  #}
-{#      set. Snowflake: var `target_schema` (and optionally           #}
-{#      `target_database`; otherwise `target.database` is used).      #}
+{#      set. Snowflake: optionally vars `target_schema` /             #}
+{#      `target_database`; otherwise `target.schema` / `target.database`#}
+{#      from the active connection/profile are used.                  #}
 {#    - The tenant must define an `execution_ts()` macro returning a  #}
 {#      timestamp/date expression VALID FOR THEIR OWN WAREHOUSE (each  #}
 {#      tenant targets a single warehouse). Sundial only wraps it     #}

@@ -4,14 +4,15 @@
 {#  See ``../dbt_completions.sql`` for the dispatchers + orchestration. #}
 {# ------------------------------------------------------------------ #}
 
-{# database.schema.table. ``target_database`` var wins; otherwise the
-   database from the active connection/profile (``target.database``). #}
+{# database.schema.table. The ``target_database``/``target_schema`` vars win;
+   otherwise the database/schema from the active connection/profile
+   (``target.database`` / ``target.schema``). #}
 {% macro snowflake__dbt_completions_table() %}
-  {{ var('target_database', target.database) }}.{{ var('target_schema') }}.dbt_completions_raw
+  {{ var('target_database', target.database) }}.{{ var('target_schema', target.schema) }}.dbt_completions_raw
 {% endmacro %}
 
 {% macro snowflake__dbt_completions_view() %}
-  {{ var('target_database', target.database) }}.{{ var('target_schema') }}.dbt_completions
+  {{ var('target_database', target.database) }}.{{ var('target_schema', target.schema) }}.dbt_completions
 {% endmacro %}
 
 {# Wraps the tenant-defined ``execution_ts()`` (a Snowflake timestamp/date
