@@ -19,8 +19,9 @@
 {#                                                                    #}
 {#  Tenant requirements:                                              #}
 {#    - BigQuery: vars `target_project` and `target_dataset` must be  #}
-{#      set. Snowflake: var `target_schema` (and optionally           #}
-{#      `target_database`; otherwise `target.database` is used).      #}
+{#      set. Snowflake: var `target_schema` is REQUIRED (no           #}
+{#      `target.schema` fallback); `target_database` is optional       #}
+{#      (otherwise `target.database` is used).                         #}
 {#    - The tenant must define an `execution_ts()` macro returning a  #}
 {#      timestamp/date expression VALID FOR THEIR OWN WAREHOUSE (each  #}
 {#      tenant targets a single warehouse). Sundial only wraps it     #}
@@ -36,13 +37,33 @@
 {#  Wire-up in tenant dbt_project.yml:                                #}
 {#    on-run-start:                                                   #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_table() }}"   #}
+{#      # ensure_run_group_columns() MUST come right after the create #}
+{#      # so pre-existing tables gain run_group_id/chunk_key/         #}
+{#      # heartbeat_at before any hook MERGEs into those columns.     #}
+{#      - "{{ sundial_dbt_shared.ensure_run_group_columns() }}"       #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_view() }}"    #}
 {#    on-run-end:                                                     #}
 {#      - "{{ sundial_dbt_shared.log_run_results() }}"                #}
 {#    models:                                                         #}
 {#      <project>:                                                    #}
-{#        +pre-hook:  ["{{ sundial_dbt_shared.log_model_status('started') }}"]   #}
+{#        # acquire_run_lock() REPLACES log_model_status('started') as #}
+{#        # the pre-hook: it writes the same run-aware 'started' row    #}
+{#        # AND enforces the cross-run lock. Using log_model_status     #}
+{#        # here instead leaves the lock inert and writes 'started'     #}
+{#        # rows with a NULL heartbeat that crash-reclaim can't sweep.  #}
+{#        +pre-hook:  ["{{ sundial_dbt_shared.acquire_run_lock() }}"]            #}
 {#        +post-hook: ["{{ sundial_dbt_shared.log_model_status('succeeded') }}"] #}
+{#                                                                    #}
+{#  Migration (upgrading an existing tenant to run grouping + lock):  #}
+{#    1. ensure_run_group_columns() (wired above) back-fills the three #}
+{#       new columns on the existing dbt_completions_raw table.        #}
+{#    2. The dbt_completions VIEW is CREATE … IF NOT EXISTS, so the new #}
+{#       'locked_out'/'crashed' filter does NOT apply until the view is #}
+{#       DROPPED once; the next on-run-start recreates it with the      #}
+{#       filter. Until then those rows leak into what sundial reads.    #}
+{#    3. Snowflake: `target_schema` is now REQUIRED — the old           #}
+{#       `target.schema` profile fallback was removed. Tenants relying  #}
+{#       on it must set the `target_schema` var explicitly.             #}
 {# ------------------------------------------------------------------ #}
 
 {# ------------------------------------------------------------------ #}
@@ -331,7 +352,8 @@
 {#                                                                    #}
 {#  acquire_run_lock() (pre-hook, REPLACES log_model_status('started')):    #}
 {#    1) reclaim: sweep stale 'started' rows for M to 'crashed';            #}
-{#    2) write my 'started' (updated_at on insert → stable priority key);   #}
+{#    2) write my 'started' (updated_at on insert → stable priority key; a    #}
+{#       retry after lockout REVIVES my own 'locked_out' row, not a new one);  #}
 {#    3) look (started/terminal only): if a foreign run_group HOLDS M with   #}
 {#       PRIORITY (earlier updated_at, ties by run_group_id), flip my row    #}
 {#       to 'locked_out', log the holder, and raise — the model FAILS, but   #}
@@ -375,8 +397,21 @@
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(reclaim_sql)) %}
 
-    {# 2) Write my 'started' row. updated_at set on insert only (stable →
-       priority); re-merge just refreshes heartbeat_at (crash-recovery liveness). #}
+    {# 2) Write my 'started' row. Matched on the live lifecycle row for
+       (model, run_group, chunk) — there is at most one, either 'started' or
+       'locked_out' (the lockout in step 3 flips the SAME row rather than adding
+       one), so this MERGE can never match two:
+         - NOT MATCHED        → first acquire: INSERT 'started' with updated_at=now
+                                (my stable priority key).
+         - MATCHED 'started'  → same attempt re-running: just refresh heartbeat_at;
+                                updated_at stays put so my priority never drifts.
+         - MATCHED 'locked_out' → I lost a prior race and Airflow is RETRYING me
+                                under the same run_group. REVIVE that row to
+                                'started' with a FRESH priority (updated_at=now)
+                                instead of leaving it and inserting a parallel
+                                row. Keeping one lifecycle row means no stale
+                                'locked_out' survives to make log_run_results
+                                suppress this attempt's terminal. #}
     {%- set merge_sql -%}
       MERGE INTO {{ tbl }} T
       USING (
@@ -386,7 +421,9 @@
                CURRENT_TIMESTAMP() AS now_ts
       ) S
       ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
-         AND T.chunk_key = S.chunk_key AND T.status = 'started'
+         AND T.chunk_key = S.chunk_key AND T.status IN ('started', 'locked_out')
+      WHEN MATCHED AND T.status = 'locked_out' THEN
+        UPDATE SET status = 'started', updated_at = S.now_ts, heartbeat_at = S.now_ts
       WHEN MATCHED THEN UPDATE SET heartbeat_at = S.now_ts
       WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, heartbeat_at, updated_at)
         VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.now_ts, S.now_ts)
