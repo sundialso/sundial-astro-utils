@@ -157,14 +157,16 @@ auditing entirely.
 
 - **Lineage-preserving graph.** Every inter-model edge from
   `manifest.depends_on` is wired into the DAG; the graph view matches
-  the daily Cosmos DAG, just with each chunked model expanded into a
-  TaskGroup of static `chunk_<YYYY-MM>` tasks.
+  the daily Cosmos DAG, with one TaskGroup per model.
 - **Two task shapes.**
   - *Full-refresh* (default): one `dbt run --select <name>` per model.
-  - *Chunked* (opt-in): N static chunk tasks computed at DAG parse
-    time from the model's `start_ts(<col>, <lookback>, '<first_ts>')`
-    anchor up to today, divided by the `chunk_size` (months) declared
-    in `chunking_config.json`.
+  - *Chunked* (opt-in): one `run_chunks` task per model that loops N
+    date windows sequentially (computed at DAG parse time from the
+    model's `start_ts(<col>, <lookback>, '<first_ts>')` anchor up to
+    today, divided by `chunk_size` months in `chunking_config.json`).
+    Windows for the same model never run in parallel — this avoids
+    BigQuery `insert_overwrite` races on `<model>__dbt_tmp`. Different
+    models still run concurrently up to `max_active_tasks`.
 - **Strict allowlist.** A model becomes chunked iff (1) it has an
   enabled entry in `chunking_config.json` with a positive `chunk_size`
   AND (2) its SQL contains a `start_ts(...)` call. Anything else runs
@@ -172,7 +174,7 @@ auditing entirely.
 - **`select` Param.** Operators can scope a run to a dbt-style selector
   (`model+`, `+model+`, etc.) at trigger time; unselected models skip
   via `trigger_rule="none_failed"` without breaking downstream tasks.
-- **Audit trail.** Each successful task writes one row to
+- **Audit trail.** Each successful chunk writes one row to
   `<audit_schema>.BACKFILL_AUDIT` (auto-created). Reporting is
   ad-hoc — operators run `dbt run-operation backfill_report` (or
   `backfill_warehouse_report`) against the audit table after the run

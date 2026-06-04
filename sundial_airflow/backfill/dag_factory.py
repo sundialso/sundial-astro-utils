@@ -3,9 +3,10 @@
 Reads ``target/manifest.json``, classifies each eligible model as
 ``CHUNKED`` (per ``chunking_config.json``) or ``FULL_REFRESH``,
 topologically sorts them, and emits a DAG that mirrors the dbt lineage
-one TaskGroup per model. ``CHUNKED`` groups expand into static
-``chunk_<YYYY-MM>`` tasks; ``FULL_REFRESH`` groups are a single ``run``
-task. Every successful task writes to ``<audit_schema>.BACKFILL_AUDIT``;
+one TaskGroup per model. ``CHUNKED`` groups run a single ``run_chunks``
+task that loops all date windows sequentially (safe for ``insert_overwrite``
+incremental models sharing one ``__dbt_tmp``); ``FULL_REFRESH`` groups are a
+single ``run`` task. Every successful chunk writes to ``<audit_schema>.BACKFILL_AUDIT``;
 reports are ad-hoc (``dbt run-operation backfill_report``).
 
 See ``<tenant>_dbt/BACKFILL.md`` for the operator runbook.
@@ -107,8 +108,8 @@ def make_backfill_dag(
     if _order:
         chunk_total = sum(len(v) for v in _static_chunks.values())
         logger.info(
-            "Backfill DAG %r: %d models in topo order, %d chunked → "
-            "%d static chunk tasks.",
+            "Backfill DAG %r: %d models in topo order, %d chunked "
+            "(%d chunk windows, one sequential task per model).",
             dag_id, len(_order), len(_static_chunks), chunk_total,
         )
         if not _static_chunks:
@@ -183,11 +184,19 @@ def make_backfill_dag(
                 logger.warning("%s stderr:\n%s", log_label, result.stderr)
             return result
 
-        def _dbt_run(model_name: str, extra_vars: dict[str, Any] | None = None) -> None:
+        def _dbt_run(
+            model_name: str,
+            extra_vars: dict[str, Any] | None = None,
+            *,
+            log_suffix: str = "",
+        ) -> None:
+            label = f"dbt run [{model_name}]"
+            if log_suffix:
+                label = f"{label} {log_suffix}"
             result = _invoke(
                 ["run", "--select", model_name,
                  "--vars", json.dumps({**_base_vars, **(extra_vars or {})})],
-                f"dbt run [{model_name}]",
+                label,
             )
             if result.returncode != 0:
                 raise RuntimeError(
@@ -292,20 +301,18 @@ def make_backfill_dag(
         chunking_task = _process_chunking_config()
         deps_task >> chunking_task  # type: ignore[operator]
 
-        # ── Worker: one task per (model, chunk window) ───────────────────
-        # trigger_rule="none_failed" lets selected models still run when
-        # the operator's `select` excludes their upstreams (those tasks
-        # raise AirflowSkipException; real failures still propagate as
-        # upstream_failed and block the downstream).
+        # ── Worker: all chunk windows for one model (sequential dbt runs) ─
+        # One Airflow task per chunked model avoids concurrent ``dbt run`` calls
+        # racing on the same ``<model>__dbt_tmp`` table. Different models still
+        # run in parallel up to ``max_active_tasks``.
         @task(trigger_rule="none_failed")
-        def _run_chunk(
+        def _run_chunked_model(
             model_name: str,
-            chunk_start_str: str,
-            chunk_end_str: str,
+            chunk_windows: list[dict[str, str]],
             chunk_months: int,
             **context: Any,
         ) -> dict[str, Any]:
-            """Run one chunk window for ``model_name`` and audit it."""
+            """Run every chunk window for ``model_name`` in order and audit each."""
             plan = context["ti"].xcom_pull(task_ids="process_chunking_config") or {}
             selected = plan.get("selected")
             if selected is not None and model_name not in selected:
@@ -313,32 +320,56 @@ def make_backfill_dag(
                     f"Model {model_name!r} not in `select` ({context['params'].get('select')!r})."
                 )
 
-            started_at = _dt.datetime.now(_dt.timezone.utc)
-            _dbt_run(
-                model_name,
-                extra_vars={
-                    start_var: chunk_start_str,
-                    end_var: chunk_end_str,
-                    "run_context": "chunked_backfill",
-                    "run_context_tag": f"{tenant}_chunked_backfill",
-                },
-            )
-            if warehouse_conn_id:
-                writer = _audit_writer()
-                writer.ensure_audit_table(audit_schema)
-                writer.insert_chunk_row(
-                    audit_schema=audit_schema,
-                    model_name=model_name,
-                    start_ts=chunk_start_str,
-                    end_ts=chunk_end_str,
-                    run_id=context["dag_run"].run_id,
-                    started_at=started_at,
+            if not chunk_windows:
+                raise AirflowSkipException(
+                    f"Model {model_name!r} has no chunk windows in the backfill range."
                 )
+
+            writer = _audit_writer() if warehouse_conn_id else None
+            if writer is not None:
+                writer.ensure_audit_table(audit_schema)
+
+            completed: list[dict[str, str]] = []
+            for window in chunk_windows:
+                chunk_id = window["chunk_id"]
+                chunk_start_str = window["chunk_start"]
+                chunk_end_str = window["chunk_end"]
+                started_at = _dt.datetime.now(_dt.timezone.utc)
+                logger.info(
+                    "Backfill chunk %s for %s: %s → %s (%d of %d)",
+                    chunk_id,
+                    model_name,
+                    chunk_start_str,
+                    chunk_end_str,
+                    len(completed) + 1,
+                    len(chunk_windows),
+                )
+                _dbt_run(
+                    model_name,
+                    extra_vars={
+                        start_var: chunk_start_str,
+                        end_var: chunk_end_str,
+                        "run_context": "chunked_backfill",
+                        "run_context_tag": f"{tenant}_chunked_backfill",
+                    },
+                    log_suffix=f"chunk {chunk_id} ({chunk_start_str} → {chunk_end_str})",
+                )
+                if writer is not None:
+                    writer.insert_chunk_row(
+                        audit_schema=audit_schema,
+                        model_name=model_name,
+                        start_ts=chunk_start_str,
+                        end_ts=chunk_end_str,
+                        run_id=context["dag_run"].run_id,
+                        started_at=started_at,
+                    )
+                completed.append(window)
+
             return {
                 "model": model_name,
-                "chunk_start": chunk_start_str,
-                "chunk_end": chunk_end_str,
                 "chunk_months": chunk_months,
+                "chunks_completed": len(completed),
+                "chunks": completed,
             }
 
         # ── Worker: single dbt run per full-refresh model ────────────────
@@ -387,13 +418,23 @@ def make_backfill_dag(
                             trigger_rule="none_failed",
                         )
                     else:
-                        for start, end, chunk_id in windows:
-                            _run_chunk.override(task_id=f"chunk_{chunk_id}")(
-                                model_name=model.name,
-                                chunk_start_str=str(start),
-                                chunk_end_str=str(end),
-                                chunk_months=model.chunk_months,
-                            )
+                        _run_chunked_model.override(
+                            task_id="run_chunks",
+                            # All windows for this model run in one task; allow
+                            # enough time for every sequential dbt invocation.
+                            execution_timeout=timedelta(hours=24),
+                        )(
+                            model_name=model.name,
+                            chunk_windows=[
+                                {
+                                    "chunk_id": chunk_id,
+                                    "chunk_start": str(start),
+                                    "chunk_end": str(end),
+                                }
+                                for start, end, chunk_id in windows
+                            ],
+                            chunk_months=model.chunk_months or 0,
+                        )
                 else:  # FULL_REFRESH
                     _run_full_refresh.override(task_id="run")(model_name=model.name)
 
