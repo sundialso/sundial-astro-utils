@@ -62,6 +62,7 @@ def make_backfill_dag(
     chunking_config_path: str | Path | None,
     warehouse: str,
     warehouse_conn_id: str | None = None,
+    bq_location: str | None = None,
     audit_schema: str = "DBT_BACKFILLS",
     base_vars: dict[str, Any] | None = None,
     default_args: dict[str, Any] | None = None,
@@ -196,8 +197,15 @@ def make_backfill_dag(
         def _audit_writer() -> _audit.AuditWriter:
             if warehouse == "bigquery":
                 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+                # ``location`` must match the audit dataset's region; BigQuery
+                # query jobs default to US otherwise. dbt runs get their region
+                # from the tenant's ProfileConfig separately.
                 return _audit.BigQueryAuditWriter(
-                    BigQueryHook(gcp_conn_id=warehouse_conn_id)
+                    BigQueryHook(
+                        gcp_conn_id=warehouse_conn_id,
+                        location=bq_location,
+                        use_legacy_sql=False,
+                    )
                 )
             from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
             return _audit.SnowflakeAuditWriter(

@@ -135,7 +135,9 @@ dag = make_backfill_dag(
 
 For a **BigQuery** tenant, swap the warehouse, warehouse connection, and the
 `base_vars` key dbt expects (`target_dataset` instead of `target_schema`);
-`audit_schema` then names the BigQuery **dataset** for `BACKFILL_AUDIT`:
+`audit_schema` then names the BigQuery **dataset** for `BACKFILL_AUDIT`. Set
+`bq_location` to the dataset's region — audit query jobs default to `US`
+otherwise:
 
 ```python
 dag = make_backfill_dag(
