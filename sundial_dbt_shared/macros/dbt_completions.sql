@@ -191,14 +191,20 @@
 
   Status rules (match the goals stated in the macro's spec):
     - started   : written by pre-hook only.
-    - failed    : materialization failed (any non-'success' build status,
-                  including 'error' and 'skipped') OR a test reported
-                  'fail'/'error' (fatal severity).
+    - failed    : materialization failed (any non-'success', non-'skipped'
+                  build status, e.g. 'error') OR a test reported 'fail'/'error'
+                  (fatal severity).
     - succeeded : materialization succeeded this invocation, OR it's a
                   tests-only invocation and no test was fatal. A 'warn'
                   test result is non-fatal in dbt and is treated as success
                   (handles goal: "test fails but dbt Cloud / Astro marks
                   the run succeeded → succeeded").
+    - skipped   : dbt never ran the model this invocation (an upstream failed,
+                  or it was a locked-out model's descendant). A skipped model
+                  did NOT run, so NO row is written — we neither succeed nor
+                  fail it, and its pre-hooks never fired so there is no
+                  'started' row to reconcile. Skipped tests likewise don't
+                  count as "tests ran".
 
   Works the same way regardless of orchestrator:
     - dbt build (dbt Cloud, local): models + tests in one invocation.
@@ -244,11 +250,16 @@
       {% set build_status = model_build.get(name) %}
       {% set test_statuses = tests_by_model.get(name, []) %}
       {% set has_failing_test = ('fail' in test_statuses) or ('error' in test_statuses) %}
-      {% set tests_ran = test_statuses | length > 0 %}
-      {% set build_failed = build_status is not none and build_status != 'success' %}
+      {# Skipped tests didn't actually run — exclude them so a model whose tests
+         were all skipped isn't recorded 'succeeded' off the back of them. #}
+      {% set tests_ran = (test_statuses | reject('equalto', 'skipped') | list) | length > 0 %}
+      {% set build_skipped = build_status == 'skipped' %}
+      {% set build_failed = build_status is not none and build_status not in ('success', 'skipped') %}
       {% set build_ok = build_status == 'success' %}
 
-      {% if build_failed or has_failing_test %}
+      {% if build_skipped %}
+        {# dbt skipped this model — it never ran, so record nothing. #}
+      {% elif build_failed or has_failing_test %}
         {% do rows.append({'name': name, 'status': 'failed'}) %}
       {% elif build_ok or tests_ran %}
         {% do rows.append({'name': name, 'status': 'succeeded'}) %}
@@ -343,7 +354,7 @@
        model whose heartbeat is older than the TTL and which never reached a
        terminal is swept to 'crashed', so the lock logic below sees it freed. #}
     {%- set reclaim_sql -%}
-      MERGE {{ tbl }} T
+      MERGE INTO {{ tbl }} T
       USING (
         SELECT s.model_name, s.execution_ts, s.run_group_id, s.chunk_key
         FROM {{ tbl }} s
@@ -367,7 +378,7 @@
     {# 2) Write my 'started' row. updated_at set on insert only (stable →
        priority); re-merge just refreshes heartbeat_at (crash-recovery liveness). #}
     {%- set merge_sql -%}
-      MERGE {{ tbl }} T
+      MERGE INTO {{ tbl }} T
       USING (
         SELECT '{{ this.name }}' AS model_name,
                {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
@@ -418,7 +429,7 @@
       {%- set winner = rows[0][0] -%}
       {# Lost the race: flip my 'started' to the 'locked_out' terminal (NOT failed). #}
       {%- set lockout_sql -%}
-        MERGE {{ tbl }} T
+        MERGE INTO {{ tbl }} T
         USING (
           SELECT '{{ this.name }}' AS model_name, '{{ rg }}' AS run_group_id,
                  '{{ ck }}' AS chunk_key, CURRENT_TIMESTAMP() AS now_ts
