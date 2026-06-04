@@ -37,6 +37,10 @@
 {#  Wire-up in tenant dbt_project.yml:                                #}
 {#    on-run-start:                                                   #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_table() }}"   #}
+{#      # ensure_run_group_columns() MUST come right after the create #}
+{#      # so a pre-existing table gains the lock + watermark columns   #}
+{#      # before any hook MERGEs into them.                            #}
+{#      - "{{ sundial_dbt_shared.ensure_run_group_columns() }}"       #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_view() }}"    #}
 {#    on-run-end:                                                     #}
 {#      - "{{ sundial_dbt_shared.log_run_results() }}"                #}
@@ -55,10 +59,11 @@
 {#      # record_window_start / record_window_end below.                #}
 {#                                                                    #}
 {#  First-time setup / migration:                                     #}
-{#    - Greenfield: create_dbt_completions_table() defines the FULL    #}
-{#      schema (status + lock + watermark columns); there is no         #}
-{#      additive ALTER. A stale completions table from an earlier       #}
-{#      schema must be DROPPED once — on-run-start then recreates it.    #}
+{#    - create_dbt_completions_table() defines the FULL schema (status  #}
+{#      + lock + watermark columns) for fresh tables; for a table       #}
+{#      created under an earlier schema, ensure_run_group_columns()      #}
+{#      (wired above) additively back-fills the lock + watermark        #}
+{#      columns via ADD COLUMN IF NOT EXISTS — no drop/recreate needed.  #}
 {#    - The dbt_completions VIEW is CREATE … IF NOT EXISTS, so a view    #}
 {#      definition change (chunk-aware rollup / locked_out filter) does  #}
 {#      NOT apply until the view is DROPPED once; on-run-start recreates #}
@@ -115,6 +120,20 @@
     window_start_ts {{ sundial_dbt_shared.completions_col_type('datetime') }},
     window_end_ts   {{ sundial_dbt_shared.completions_col_type('datetime') }}
   )
+{% endmacro %}
+
+{# Additive column add for tables created before run grouping / the lock /
+   the watermark. Wire into on-run-start AFTER create_dbt_completions_table().
+   Covers the full set of columns added on top of the original
+   (model_name, execution_ts, status, updated_at) table. BigQuery and Snowflake
+   both support ADD COLUMN IF NOT EXISTS, so this is a safe no-op once applied. #}
+{% macro ensure_run_group_columns() %}
+  ALTER TABLE {{ sundial_dbt_shared.dbt_completions_table() }}
+    ADD COLUMN IF NOT EXISTS run_group_id    {{ sundial_dbt_shared.completions_col_type('string') }},
+    ADD COLUMN IF NOT EXISTS chunk_key       {{ sundial_dbt_shared.completions_col_type('string') }},
+    ADD COLUMN IF NOT EXISTS heartbeat_at    {{ sundial_dbt_shared.completions_col_type('timestamp') }},
+    ADD COLUMN IF NOT EXISTS window_start_ts {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    ADD COLUMN IF NOT EXISTS window_end_ts   {{ sundial_dbt_shared.completions_col_type('datetime') }}
 {% endmacro %}
 
 {#
