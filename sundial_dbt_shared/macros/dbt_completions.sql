@@ -19,8 +19,9 @@
 {#                                                                    #}
 {#  Tenant requirements:                                              #}
 {#    - BigQuery: vars `target_project` and `target_dataset` must be  #}
-{#      set. Snowflake: var `target_schema` (and optionally           #}
-{#      `target_database`; otherwise `target.database` is used).      #}
+{#      set. Snowflake: var `target_schema` is REQUIRED (no           #}
+{#      `target.schema` fallback); `target_database` is optional       #}
+{#      (otherwise `target.database` is used).                         #}
 {#    - The tenant must define an `execution_ts()` macro returning a  #}
 {#      timestamp/date expression VALID FOR THEIR OWN WAREHOUSE (each  #}
 {#      tenant targets a single warehouse). Sundial only wraps it     #}
@@ -41,8 +42,29 @@
 {#      - "{{ sundial_dbt_shared.log_run_results() }}"                #}
 {#    models:                                                         #}
 {#      <project>:                                                    #}
-{#        +pre-hook:  ["{{ sundial_dbt_shared.log_model_status('started') }}"]   #}
+{#        # acquire_run_lock() REPLACES log_model_status('started') as #}
+{#        # the pre-hook: it writes the same run-aware 'started' row    #}
+{#        # AND enforces the cross-run lock. Using log_model_status     #}
+{#        # here instead leaves the lock inert and writes 'started'     #}
+{#        # rows with a NULL heartbeat that crash-reclaim can't sweep.  #}
+{#        +pre-hook:  ["{{ sundial_dbt_shared.acquire_run_lock() }}"]            #}
 {#        +post-hook: ["{{ sundial_dbt_shared.log_model_status('succeeded') }}"] #}
+{#      # Incremental models additionally validate backfill bounds as   #}
+{#      # the FIRST pre-hook and record their watermark window from the  #}
+{#      # tenant's start_ts()/end_ts() — see validate_partial_backfill / #}
+{#      # record_window_start / record_window_end below.                #}
+{#                                                                    #}
+{#  First-time setup / migration:                                     #}
+{#    - Greenfield: create_dbt_completions_table() defines the FULL    #}
+{#      schema (status + lock + watermark columns); there is no         #}
+{#      additive ALTER. A stale completions table from an earlier       #}
+{#      schema must be DROPPED once — on-run-start then recreates it.    #}
+{#    - The dbt_completions VIEW is CREATE … IF NOT EXISTS, so a view    #}
+{#      definition change (chunk-aware rollup / locked_out filter) does  #}
+{#      NOT apply until the view is DROPPED once; on-run-start recreates #}
+{#      it. Until then stale rows leak into what sundial reads.          #}
+{#    - Snowflake: `target_schema` is REQUIRED (the `target.schema`      #}
+{#      profile fallback was removed); set the var explicitly.          #}
 {# ------------------------------------------------------------------ #}
 
 {# ------------------------------------------------------------------ #}
@@ -96,39 +118,27 @@
 {% endmacro %}
 
 {#
-  create_dbt_completions_view — on-run-start companion to the raw table.
+  create_dbt_completions_view — chunk-aware rollup, one row per (model, execution_ts).
 
-  The hooks MERGE every status transition (started -> succeeded/failed) into
-  dbt_completions_raw, so that table holds several rows per model per run. This
-  view collapses each run to its FINAL state: one row per (model_name,
-  execution_ts), picking the most-recently-written status (the terminal row, as
-  on-run-end always writes last). Run history is preserved across execution_ts;
-  query the latest run by ordering on execution_ts.
+  The hooks MERGE every status transition into dbt_completions_raw (several rows
+  per model per run). This view collapses each (model, execution_ts) to a single
+  status by taking the LATEST run_group (a later re-run supersedes an earlier one
+  on the same date) and rolling its chunks up:
+    - failed    if ANY chunk failed
+    - succeeded only if EVERY started chunk reached succeeded (whole run done)
+    - started   otherwise (some chunk still in flight)
+  'locked_out' / 'crashed' rows are excluded — they mean "this run produced no
+  data", so they never mask the real data-producing run. This is what makes a
+  partially-failed chunked run read as 'failed' (and therefore NOT 'succeeded' to
+  sundial's source-marker check), instead of the old "latest updated_at wins".
 
-  Standard SQL — the ROW_NUMBER subquery runs unchanged on BigQuery and
-  Snowflake; only the object names come from the dispatched FQN primitives.
+  Standard SQL (CTEs + window) — runs unchanged on BigQuery and Snowflake; only
+  the object names come from the dispatched FQN primitives.
 
   Created with IF NOT EXISTS (not OR REPLACE) so the parallel on-run-start
   invocations don't issue conflicting concurrent DDL on the same view —
   mirroring create_dbt_completions_table. A change to the view definition
   therefore requires dropping the view once so the next run recreates it.
-#}
-{#
-  create_dbt_completions_view — chunk-aware rollup, one row per (model, execution_ts).
-
-  For each (model, execution_ts) it takes the LATEST run_group (so a later
-  re-run supersedes an earlier one on the same date) and rolls its chunks up
-  to a single status:
-    - failed    if ANY chunk failed
-    - succeeded only if EVERY started chunk reached succeeded (whole run done)
-    - started   otherwise (some chunk still in flight)
-  'locked_out' / 'crashed' rows are excluded — they mean "this run produced no
-  data", so they never mask the real data-producing run.
-
-  This is what makes a partially-failed chunked run read as 'failed' (and
-  therefore NOT 'succeeded' to sundial's source-marker check), instead of the
-  old "latest updated_at wins", which could surface a sibling succeeded chunk.
-  Standard SQL (CTEs + window) — runs on BigQuery and Snowflake.
 #}
 {% macro create_dbt_completions_view() %}
   CREATE VIEW IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_view() }} AS
@@ -217,14 +227,20 @@
 
   Status rules (match the goals stated in the macro's spec):
     - started   : written by pre-hook only.
-    - failed    : materialization failed (any non-'success' build status,
-                  including 'error' and 'skipped') OR a test reported
-                  'fail'/'error' (fatal severity).
+    - failed    : materialization failed (any non-'success', non-'skipped'
+                  build status, e.g. 'error') OR a test reported 'fail'/'error'
+                  (fatal severity).
     - succeeded : materialization succeeded this invocation, OR it's a
                   tests-only invocation and no test was fatal. A 'warn'
                   test result is non-fatal in dbt and is treated as success
                   (handles goal: "test fails but dbt Cloud / Astro marks
                   the run succeeded → succeeded").
+    - skipped   : dbt never ran the model this invocation (an upstream failed,
+                  or it was a locked-out model's descendant). A skipped model
+                  did NOT run, so NO row is written — we neither succeed nor
+                  fail it, and its pre-hooks never fired so there is no
+                  'started' row to reconcile. Skipped tests likewise don't
+                  count as "tests ran".
 
   Works the same way regardless of orchestrator:
     - dbt build (dbt Cloud, local): models + tests in one invocation.
@@ -270,11 +286,16 @@
       {% set build_status = model_build.get(name) %}
       {% set test_statuses = tests_by_model.get(name, []) %}
       {% set has_failing_test = ('fail' in test_statuses) or ('error' in test_statuses) %}
-      {% set tests_ran = test_statuses | length > 0 %}
-      {% set build_failed = build_status is not none and build_status != 'success' %}
+      {# Skipped tests didn't actually run — exclude them so a model whose tests
+         were all skipped isn't recorded 'succeeded' off the back of them. #}
+      {% set tests_ran = (test_statuses | reject('equalto', 'skipped') | list) | length > 0 %}
+      {% set build_skipped = build_status == 'skipped' %}
+      {% set build_failed = build_status is not none and build_status not in ('success', 'skipped') %}
       {% set build_ok = build_status == 'success' %}
 
-      {% if build_failed or has_failing_test %}
+      {% if build_skipped %}
+        {# dbt skipped this model — it never ran, so record nothing. #}
+      {% elif build_failed or has_failing_test %}
         {% do rows.append({'name': name, 'status': 'failed'}) %}
       {% elif build_ok or tests_ran %}
         {% do rows.append({'name': name, 'status': 'succeeded'}) %}
@@ -346,7 +367,8 @@
 {#                                                                    #}
 {#  acquire_run_lock() (pre-hook, REPLACES log_model_status('started')):    #}
 {#    1) reclaim: sweep stale 'started' rows for M to 'crashed';            #}
-{#    2) write my 'started' (updated_at on insert → stable priority key);   #}
+{#    2) write my 'started' (updated_at on insert → stable priority key; a    #}
+{#       retry after lockout REVIVES my own 'locked_out' row, not a new one);  #}
 {#    3) look (started/terminal only): if a foreign run_group HOLDS M with   #}
 {#       PRIORITY (earlier updated_at, ties by run_group_id), flip my row    #}
 {#       to 'locked_out', log the holder, and raise — the model FAILS, but   #}
@@ -369,7 +391,7 @@
        model whose heartbeat is older than the TTL and which never reached a
        terminal is swept to 'crashed', so the lock logic below sees it freed. #}
     {%- set reclaim_sql -%}
-      MERGE {{ tbl }} T
+      MERGE INTO {{ tbl }} T
       USING (
         SELECT s.model_name, s.execution_ts, s.run_group_id, s.chunk_key
         FROM {{ tbl }} s
@@ -390,10 +412,23 @@
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(reclaim_sql)) %}
 
-    {# 2) Write my 'started' row. updated_at set on insert only (stable →
-       priority); re-merge just refreshes heartbeat_at (crash-recovery liveness). #}
+    {# 2) Write my 'started' row. Matched on the live lifecycle row for
+       (model, run_group, chunk) — there is at most one, either 'started' or
+       'locked_out' (the lockout in step 3 flips the SAME row rather than adding
+       one), so this MERGE can never match two:
+         - NOT MATCHED        → first acquire: INSERT 'started' with updated_at=now
+                                (my stable priority key).
+         - MATCHED 'started'  → same attempt re-running: just refresh heartbeat_at;
+                                updated_at stays put so my priority never drifts.
+         - MATCHED 'locked_out' → I lost a prior race and Airflow is RETRYING me
+                                under the same run_group. REVIVE that row to
+                                'started' with a FRESH priority (updated_at=now)
+                                instead of leaving it and inserting a parallel
+                                row. Keeping one lifecycle row means no stale
+                                'locked_out' survives to make log_run_results
+                                suppress this attempt's terminal. #}
     {%- set merge_sql -%}
-      MERGE {{ tbl }} T
+      MERGE INTO {{ tbl }} T
       USING (
         SELECT '{{ this.name }}' AS model_name,
                {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
@@ -401,7 +436,9 @@
                CURRENT_TIMESTAMP() AS now_ts
       ) S
       ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
-         AND T.chunk_key = S.chunk_key AND T.status = 'started'
+         AND T.chunk_key = S.chunk_key AND T.status IN ('started', 'locked_out')
+      WHEN MATCHED AND T.status = 'locked_out' THEN
+        UPDATE SET status = 'started', updated_at = S.now_ts, heartbeat_at = S.now_ts
       WHEN MATCHED THEN UPDATE SET heartbeat_at = S.now_ts
       WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, heartbeat_at, updated_at)
         VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.now_ts, S.now_ts)
@@ -444,7 +481,7 @@
       {%- set winner = rows[0][0] -%}
       {# Lost the race: flip my 'started' to the 'locked_out' terminal (NOT failed). #}
       {%- set lockout_sql -%}
-        MERGE {{ tbl }} T
+        MERGE INTO {{ tbl }} T
         USING (
           SELECT '{{ this.name }}' AS model_name, '{{ rg }}' AS run_group_id,
                  '{{ ck }}' AS chunk_key, CURRENT_TIMESTAMP() AS now_ts
@@ -526,7 +563,7 @@
     {%- set rg = var('run_group_id', invocation_id) -%}
     {%- set ck = var('chunk_key', 'full') -%}
     {%- set sql -%}
-      MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+      MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
       USING (
         SELECT '{{ this.name }}' AS model_name,
                {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
@@ -554,7 +591,7 @@
     {%- set ws = res.rows[0][0] if res is not none and res.rows | length > 0 else none -%}
     {% if ws is not none %}
       {%- set sql -%}
-        MERGE {{ sundial_dbt_shared.dbt_completions_table() }} T
+        MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
         USING (
           SELECT '{{ this.name }}' AS model_name,
                  {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
