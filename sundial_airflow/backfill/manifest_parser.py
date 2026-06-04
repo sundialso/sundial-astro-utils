@@ -188,8 +188,7 @@ def compute_static_chunks(
 ) -> dict[str, list[tuple[date, date, str]]]:
     """Static ``(start, end, "YYYY-MM")`` chunk list per ``CHUNKED`` model.
 
-    Called once at DAG parse time; each tuple becomes one sequential dbt run
-    inside the model's ``run_chunks`` task.
+    Called once at DAG parse time; each tuple becomes one ``chunk_<YYYY-MM>`` task.
     """
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
