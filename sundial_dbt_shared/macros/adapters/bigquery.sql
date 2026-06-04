@@ -4,12 +4,16 @@
 {#  See ``../dbt_completions.sql`` for the dispatchers + orchestration. #}
 {# ------------------------------------------------------------------ #}
 
+{# TEST BRANCH (feat/run-group-lock): names hardcoded to *_test so a tenant
+   pointed at this branch writes to dbt_completions_raw_test / dbt_completions_test
+   and never touches the prod completions table (the run-lock arbitrates on this
+   table, so sharing it with prod would lock prod out). DO NOT MERGE TO MAIN. #}
 {% macro bigquery__dbt_completions_table() %}
-  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions_raw`
+  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions_raw_test`
 {% endmacro %}
 
 {% macro bigquery__dbt_completions_view() %}
-  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions`
+  `{{ var('target_project') }}.{{ var('target_dataset') }}.dbt_completions_test`
 {% endmacro %}
 
 {# Subtract ``minutes`` from a BigQuery TIMESTAMP expression (run-lock TTL). #}

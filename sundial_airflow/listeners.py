@@ -74,7 +74,10 @@ PREPARE_TASK_ID = "prepare_dbt_args"
 # target (one row per status transition); the dbt_completions *view* collapses
 # it to each run's final state. The listener writes here, not to the view, and
 # its later updated_at makes the reconciliation row win in the view.
-COMPLETIONS_TABLE = "dbt_completions_raw"
+# TEST BRANCH (feat/run-group-lock): hardcoded to *_test so the manual-UI-mark
+# reconciliation writes to the isolated test table, matching the dbt macros on
+# this branch (see sundial_dbt_shared/macros/adapters/*). DO NOT MERGE TO MAIN.
+COMPLETIONS_TABLE = "dbt_completions_raw_test"
 
 # Default warehouse for runs whose XCom predates warehouse plumbing.
 _DEFAULT_WAREHOUSE = "bigquery"
