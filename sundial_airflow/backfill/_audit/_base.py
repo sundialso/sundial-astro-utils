@@ -42,6 +42,10 @@ class AuditWriter(ABC):
         """Translate ``:name`` placeholders into the warehouse's bind style."""
         return _BIND_RE.sub(self._bind_replacement, sql)
 
+    def _audit_table_ref(self, audit_schema: str) -> str:
+        """Warehouse-specific ``schema.table`` (or fully qualified) ref."""
+        return f"{audit_schema}.{AUDIT_TABLE}"
+
     def ensure_audit_table(self, audit_schema: str) -> None:
         """Create the audit schema/dataset + table if absent."""
         validate_schema(audit_schema)
@@ -62,7 +66,7 @@ class AuditWriter(ABC):
         validate_schema(audit_schema)
         self._execute(
             f"""
-            INSERT INTO {audit_schema}.{AUDIT_TABLE}
+            INSERT INTO {self._audit_table_ref(audit_schema)}
                 (model_name, kind, start_ts, end_ts,
                  status, run_id, started_at)
             VALUES
@@ -90,7 +94,7 @@ class AuditWriter(ABC):
         validate_schema(audit_schema)
         self._execute(
             f"""
-            INSERT INTO {audit_schema}.{AUDIT_TABLE}
+            INSERT INTO {self._audit_table_ref(audit_schema)}
                 (model_name, kind, status, run_id, started_at)
             VALUES
                 (:model, 'non_chunked', 'success', :run_id, :started_at)

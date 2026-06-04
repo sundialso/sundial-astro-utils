@@ -144,6 +144,9 @@ dag = make_backfill_dag(
     ...,
     warehouse="bigquery",
     warehouse_conn_id=DBT_BIGQUERY_CONN_ID,   # a GCP connection
+    bq_location="US",
+    bq_audit_project="your-gcp-project",      # where the backfill dataset lives
+    bq_audit_create_dataset=False,            # default; needs datasets.create if True
     audit_schema="dbt_backfills",
     base_vars={"target_dataset": "dbt_backfills"},
 )

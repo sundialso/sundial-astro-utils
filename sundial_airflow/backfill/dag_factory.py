@@ -64,6 +64,8 @@ def make_backfill_dag(
     warehouse: str,
     warehouse_conn_id: str | None = None,
     bq_location: str | None = None,
+    bq_audit_project: str | None = None,
+    bq_audit_create_dataset: bool = False,
     audit_schema: str = "DBT_BACKFILLS",
     base_vars: dict[str, Any] | None = None,
     default_args: dict[str, Any] | None = None,
@@ -109,7 +111,7 @@ def make_backfill_dag(
         chunk_total = sum(len(v) for v in _static_chunks.values())
         logger.info(
             "Backfill DAG %r: %d models in topo order, %d chunked "
-            "(%d chunk windows, one sequential task per model).",
+            "(%d chunk windows, one run_chunks task per model).",
             dag_id, len(_order), len(_static_chunks), chunk_total,
         )
         if not _static_chunks:
@@ -209,12 +211,15 @@ def make_backfill_dag(
                 # ``location`` must match the audit dataset's region; BigQuery
                 # query jobs default to US otherwise. dbt runs get their region
                 # from the tenant's ProfileConfig separately.
+                hook = BigQueryHook(
+                    gcp_conn_id=warehouse_conn_id,
+                    location=bq_location,
+                    use_legacy_sql=False,
+                )
                 return _audit.BigQueryAuditWriter(
-                    BigQueryHook(
-                        gcp_conn_id=warehouse_conn_id,
-                        location=bq_location,
-                        use_legacy_sql=False,
-                    )
+                    hook,
+                    project_id=bq_audit_project,
+                    create_dataset=bq_audit_create_dataset,
                 )
             from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
             return _audit.SnowflakeAuditWriter(
@@ -326,8 +331,7 @@ def make_backfill_dag(
                 )
 
             writer = _audit_writer() if warehouse_conn_id else None
-            if writer is not None:
-                writer.ensure_audit_table(audit_schema)
+            audit_ready = False
 
             completed: list[dict[str, str]] = []
             for window in chunk_windows:
@@ -355,6 +359,9 @@ def make_backfill_dag(
                     log_suffix=f"chunk {chunk_id} ({chunk_start_str} → {chunk_end_str})",
                 )
                 if writer is not None:
+                    if not audit_ready:
+                        writer.ensure_audit_table(audit_schema)
+                        audit_ready = True
                     writer.insert_chunk_row(
                         audit_schema=audit_schema,
                         model_name=model_name,
@@ -393,7 +400,7 @@ def make_backfill_dag(
             )
             if warehouse_conn_id:
                 writer = _audit_writer()
-                writer.ensure_audit_table(audit_schema)
+                writer.ensure_audit_table(audit_schema)  # after dbt; dataset may exist
                 writer.insert_full_refresh_row(
                     audit_schema=audit_schema,
                     model_name=model_name,
