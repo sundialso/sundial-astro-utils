@@ -31,12 +31,14 @@
   {%- endif -%}
 {% endmacro %}
 
-{# Retry the MERGE on BigQuery's serialization error. BigQuery scripting runs
-   the whole block as one statement; each attempt re-issues the MERGE against a
-   fresh snapshot, so by the time the conflicting txn's error surfaces it has
-   already committed and the retry succeeds. Non-serialization errors and the
+{# Retry the wrapped statement (MERGE, or the CREATE OR REPLACE VIEW DDL) on
+   BigQuery's serialization / concurrent-update error. BigQuery scripting runs
+   the whole block as one statement; each attempt re-issues the statement against
+   a fresh snapshot, so by the time the conflicting txn's error surfaces it has
+   already committed and the retry succeeds. Non-concurrency errors and the
    exhausted-attempts case re-raise the original error unchanged. BigQuery has
-   no SLEEP, so retries are immediate (no backoff). #}
+   no SLEEP, so retries are immediate (no backoff). The '%concurrent%' match
+   covers both "concurrent update" (MERGE) and concurrent-DDL view replaces. #}
 {% macro bigquery__with_merge_retry(merge_sql) %}
 BEGIN
   DECLARE _attempt INT64 DEFAULT 0;
@@ -45,7 +47,7 @@ BEGIN
       {{ merge_sql }};
       LEAVE retry_merge;
     EXCEPTION WHEN ERROR THEN
-      IF _attempt < 5 AND (@@error.message LIKE '%serialize%' OR @@error.message LIKE '%concurrent update%') THEN
+      IF _attempt < 5 AND (@@error.message LIKE '%serialize%' OR @@error.message LIKE '%concurrent%') THEN
         SET _attempt = _attempt + 1;
       ELSE
         RAISE;

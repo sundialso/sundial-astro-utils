@@ -64,10 +64,10 @@
 {#      created under an earlier schema, ensure_run_group_columns()      #}
 {#      (wired above) additively back-fills the lock + watermark        #}
 {#      columns via ADD COLUMN IF NOT EXISTS — no drop/recreate needed.  #}
-{#    - The dbt_completions VIEW is CREATE … IF NOT EXISTS, so a view    #}
-{#      definition change (chunk-aware rollup / locked_out filter) does  #}
-{#      NOT apply until the view is DROPPED once; on-run-start recreates #}
-{#      it. Until then stale rows leak into what sundial reads.          #}
+{#    - The dbt_completions VIEW is CREATE OR REPLACE, so a view         #}
+{#      definition change (chunk-aware rollup / locked_out filter)        #}
+{#      applies on the NEXT run automatically — no manual drop. The       #}
+{#      replace is atomic, so readers never see a missing view.          #}
 {#    - Snowflake: `target_schema` is REQUIRED (the `target.schema`      #}
 {#      profile fallback was removed); set the var explicitly.          #}
 {# ------------------------------------------------------------------ #}
@@ -92,12 +92,14 @@
   {{ return(adapter.dispatch('completions_col_type', 'sundial_dbt_shared')(kind)) }}
 {% endmacro %}
 
-{# Wraps a MERGE statement in warehouse-specific retry logic. BigQuery uses
-   snapshot isolation: concurrent MERGEs into the shared dbt_completions table
-   abort with "Could not serialize access ... due to concurrent update" once
-   parallelism exceeds what it will queue. The BigQuery impl re-runs the MERGE
-   (a fresh snapshot each attempt) on that error; Snowflake serialises DML via
-   locks, so its impl emits the MERGE unchanged. #}
+{# Wraps a MERGE statement — or the CREATE OR REPLACE VIEW DDL — in
+   warehouse-specific concurrency-retry logic. BigQuery uses snapshot isolation:
+   concurrent MERGEs into the shared dbt_completions table abort with "Could not
+   serialize access ... due to concurrent update", and concurrent CREATE OR
+   REPLACE VIEW on the same view aborts with a concurrent-update/DDL error, once
+   parallelism exceeds what it will queue. The BigQuery impl re-runs the
+   statement (a fresh snapshot each attempt) on that class of error; Snowflake
+   serialises DML/DDL via locks, so its impl emits the statement unchanged. #}
 {% macro with_merge_retry(merge_sql) %}
   {{ return(adapter.dispatch('with_merge_retry', 'sundial_dbt_shared')(merge_sql)) }}
 {% endmacro %}
@@ -154,13 +156,18 @@
   Standard SQL (CTEs + window) — runs unchanged on BigQuery and Snowflake; only
   the object names come from the dispatched FQN primitives.
 
-  Created with IF NOT EXISTS (not OR REPLACE) so the parallel on-run-start
-  invocations don't issue conflicting concurrent DDL on the same view —
-  mirroring create_dbt_completions_table. A change to the view definition
-  therefore requires dropping the view once so the next run recreates it.
+  Emitted as CREATE OR REPLACE VIEW so a change to the definition (chunk-aware
+  rollup / locked_out filter) applies on the very NEXT run with no manual drop.
+  The replace is atomic on both BigQuery and Snowflake, so the parallel
+  on-run-start invocations (chunked fan-out fires one per chunk) never expose a
+  missing view to sundial's readers; wrapping the DDL in with_merge_retry
+  additionally absorbs BigQuery's metadata-level concurrent-update error when
+  several invocations replace the view at once. All invocations write a
+  byte-identical definition, so whichever lands last is correct.
 #}
 {% macro create_dbt_completions_view() %}
-  CREATE VIEW IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_view() }} AS
+  {%- set view_sql -%}
+  CREATE OR REPLACE VIEW {{ sundial_dbt_shared.dbt_completions_view() }} AS
   WITH live AS (
     SELECT model_name, execution_ts, run_group_id, chunk_key, status, updated_at
     FROM {{ sundial_dbt_shared.dbt_completions_table() }}
@@ -196,6 +203,8 @@
     MAX(updated_at) AS updated_at
   FROM latest_rows
   GROUP BY model_name, execution_ts
+  {%- endset -%}
+  {{ sundial_dbt_shared.with_merge_retry(view_sql) }}
 {% endmacro %}
 
 {% macro model_has_tests(model_unique_id) %}
