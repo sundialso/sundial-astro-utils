@@ -30,12 +30,19 @@
   {%- endif -%}
 {% endmacro %}
 
-{# Retry the MERGE on BigQuery's serialization error. BigQuery scripting runs
-   the whole block as one statement; each attempt re-issues the MERGE against a
-   fresh snapshot, so by the time the conflicting txn's error surfaces it has
-   already committed and the retry succeeds. Non-serialization errors and the
-   exhausted-attempts case re-raise the original error unchanged. BigQuery has
-   no SLEEP, so retries are immediate (no backoff). #}
+{# Retry the MERGE on ANY error, up to a fixed cap, then re-raise the original.
+   BigQuery scripting runs the whole block as one statement; each attempt
+   re-issues the MERGE against a fresh snapshot, so a conflicting txn's error
+   surfaces only after it has committed and the retry then succeeds. The retry is
+   a blanket catch (no error-message filtering): transient failures (serialization
+   conflicts, the per-table mutation rate limit / 429, backend/internal errors)
+   all get retried. Deterministic errors (syntax, missing column, permission) are
+   also retried but simply fail the same way each time and re-raise once the cap
+   is hit. The MERGE is idempotent by key, so re-running it is safe.
+
+   CAVEAT: BigQuery scripting has no SLEEP, so retries are immediate (no backoff).
+   That is weak against the 10s rate-limit window — pair with reduced concurrency
+   (dbt threads / Airflow max_active_tasks) and/or Airflow task retry_delay. #}
 {% macro bigquery__with_merge_retry(merge_sql) %}
 BEGIN
   DECLARE _attempt INT64 DEFAULT 0;
@@ -44,7 +51,7 @@ BEGIN
       {{ merge_sql }};
       LEAVE retry_merge;
     EXCEPTION WHEN ERROR THEN
-      IF _attempt < 5 AND (@@error.message LIKE '%serialize%' OR @@error.message LIKE '%concurrent update%') THEN
+      IF _attempt < 5 THEN
         SET _attempt = _attempt + 1;
       ELSE
         RAISE;
