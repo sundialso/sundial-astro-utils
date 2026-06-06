@@ -781,6 +781,38 @@
   {% endif %}
 {% endmacro %}
 
+{# Upsert an ALREADY-RESOLVED start_ts literal onto the 'started' row. The shared
+   start_ts (incremental.sql) resolves the lower bound to a literal for partition
+   pruning; this records that same literal directly — no re-resolution query,
+   unlike record_window_start(start_sql). Memoised per value on the model node so
+   a model's repeated start_ts() calls write once (distinct values overwrite;
+   last wins, mirroring record_window_end). #}
+{% macro record_window_start_value(value) %}
+  {% if sundial_dbt_shared._should_record_window() and value is not none %}
+    {%- set memo_key = '__sundial_recorded_start__' ~ (value | string | trim) -%}
+    {%- if model is none or model.get(memo_key) is none -%}
+      {%- if model is not none -%}{%- do model.update({memo_key: true}) -%}{%- endif -%}
+      {%- set rg = var('run_group_id', invocation_id) -%}
+      {%- set ck = var('chunk_key', 'full') -%}
+      {%- set sql -%}
+        MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
+        USING (
+          SELECT '{{ this.name }}' AS model_name,
+                 {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
+                 '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
+                 CAST('{{ value }}' AS {{ sundial_dbt_shared.completions_col_type('datetime') }}) AS ws
+        ) S
+        ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
+           AND T.chunk_key = S.chunk_key AND T.status = 'started'
+        WHEN MATCHED THEN UPDATE SET start_ts = S.ws
+        WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, start_ts, updated_at)
+          VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.ws, CURRENT_TIMESTAMP())
+      {%- endset -%}
+      {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
+    {%- endif -%}
+  {% endif %}
+{% endmacro %}
+
 {# ------------------------------------------------------------------ #}
 {#  Partial-backfill bounds validation — mirrors sundial's              #}
 {#  _run_partial_backfill_state_validations. A partial backfill may only #}

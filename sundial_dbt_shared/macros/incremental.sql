@@ -108,6 +108,9 @@
     {%- set res = run_query(resolve_sql) -%}
     {%- set cached = (res.rows[0][0] | string) if (res is not none and res.rows | length > 0 and res.rows[0][0] is not none) else first_timestamp -%}
     {%- if model is not none -%}{%- do model.update({memo_key: cached}) -%}{%- endif -%}
+    {# Log the resolved lower bound into the start_ts column (one MERGE per model,
+       since this block runs once per (model, args) under the memo guard). #}
+    {%- do sundial_dbt_shared.record_window_start_value(cached) -%}
   {%- endif -%}
   {{- return(cached) -}}
 {% endmacro %}

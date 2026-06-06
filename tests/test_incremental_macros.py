@@ -58,6 +58,8 @@ def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
             rows = [[resolved]]
         return Res()
 
+    logged = {"start_values": []}
+
     g = {
         "return": lambda x: x,
         "var": lambda name, default=None: vars_.get(name, default),
@@ -65,6 +67,8 @@ def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
         "execute": vars_.get("__execute", True),
         "read_watermark": lambda m: "SELECT MAX(end_ts) FROM compl WHERE model_name='%s'" % m,
         "record_window_end": lambda expr: "",
+        # lives in dbt_completions.sql (not loaded here) — stub + capture the value
+        "record_window_start_value": lambda v: logged["start_values"].append(v),
         "run_query": run_query,
         "model": {},
         "this": "`proj.ds.m`" if prefix == "bigquery" else '"DB"."SC"."M"',
@@ -77,6 +81,7 @@ def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
     g["adapter"] = Adapter()
     mod = TMPL.make_module(g)
     mod._calls = calls
+    mod._logged = logged
     return mod
 
 
@@ -155,6 +160,14 @@ class IncrementalMacroTests(unittest.TestCase):
         mod.start_ts("event_ts", 7, "2021-01-01")
         mod.start_ts("event_ts", 7, "2021-01-01")
         self.assertEqual(mod._calls["n"], 1)
+
+    def test_start_ts_logs_resolved_value_once(self):
+        # start_ts logging: the resolved literal is recorded into start_ts exactly
+        # once per model (memoised), with the value the model actually uses.
+        mod = module("bigquery")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        self.assertEqual(mod._logged["start_values"], ["2026-06-05 23:59:59"])
 
     def test_start_ts_backfill_override(self):
         out = norm(module("snowflake", {"backfill_start_ts": "2026-02-01"}).start_ts("event_ts", 7, "2021-01-01"))
