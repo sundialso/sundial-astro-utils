@@ -117,6 +117,82 @@ class WatermarkTestCase(unittest.TestCase):
         self.add("succeeded", "R", "B")
         self.assertEqual(self.watermark(), dt(6, 6))  # R complete -> MAX advances
 
+    def test_test_failure_on_scheduled_run_does_not_advance_watermark(self):
+        # Normal scheduled run (single 'full' chunk), NOT chunked. The model
+        # MATERIALIZED fine — its 'started' row carries the recorded end_ts
+        # (record_window_end ran during the build) — but its dbt TEST FAILED, so
+        # log_run_results wrote status='failed' and NO 'succeeded' row.
+        # read_watermark must NOT pick this run's end_ts: with no 'succeeded'
+        # sibling the run is incomplete, so the watermark stays at the last
+        # TEST-PASSING run (gap-safe — next run re-processes this range).
+        self.complete_run("PREV", {"full": dt(6, 4)})            # last good = 06-04
+        self.add("started", "CUR", "full", we=dt(6, 5))          # built; end_ts recorded
+        self.add("failed", "CUR", "full")                        # test failed -> 'failed'
+        self.assertEqual(self.watermark(), dt(6, 4))             # NOT 06-05
+
+    def test_test_failure_then_later_passing_run_advances(self):
+        # The failure does not get STUCK: once a subsequent scheduled run passes
+        # its tests, that complete run_group's end_ts wins via MAX and the
+        # watermark advances past the failed run.
+        self.complete_run("PREV", {"full": dt(6, 4)})
+        self.add("started", "CUR", "full", we=dt(6, 5))
+        self.add("failed", "CUR", "full")                        # 06-05 run: test failed
+        self.complete_run("NEXT", {"full": dt(6, 6)})            # 06-06 run: test passed
+        self.assertEqual(self.watermark(), dt(6, 6))             # advances; failed run skipped
+
+    def test_failed_scheduled_run_then_successful_rerun_advances_for_today(self):
+        # Yesterday's scheduled run FAILED for the model, then it was re-run and
+        # SUCCEEDED. Today's scheduled run must read the re-run's watermark: it
+        # should NOT stay stuck at the prior baseline, and the leftover 'failed'
+        # row from the failed attempt must NOT poison the read.
+        self.complete_run("BASE", {"full": dt(6, 1)})        # last good baseline = 06-01
+
+        # Yesterday's run D1: model built (end_ts 06-02 recorded) but FAILED ->
+        # 'started' + 'failed', no 'succeeded'.
+        self.add("started", "D1", "full", we=dt(6, 2))
+        self.add("failed", "D1", "full")
+        self.assertEqual(self.watermark(), dt(6, 1))         # failed attempt ignored
+
+        # Re-run under the SAME run_group (Airflow retry) now SUCCEEDS: the
+        # 'started' chunk gains a 'succeeded' sibling alongside the stale 'failed'.
+        self.add("succeeded", "D1", "full")
+        # Today reads it correctly: D1 is complete despite the stale 'failed' row,
+        # so the watermark advances to the re-run's end_ts.
+        self.assertEqual(self.watermark(), dt(6, 2))
+
+    def test_failed_scheduled_run_then_rerun_in_different_run_group_advances(self):
+        # Same as above, but the re-run is a FRESH trigger under a DIFFERENT
+        # run_group (not an in-place Airflow retry). The failed run_group D1 stays
+        # forever-incomplete (started + failed, never gets a 'succeeded'), but that
+        # dangling run_group must NOT block the watermark: read_watermark's guard
+        # is scoped PER run_group, so D1 only excludes ITSELF. The fresh complete
+        # run_group D2 supplies today's watermark.
+        self.complete_run("BASE", {"full": dt(6, 1)})        # last good baseline = 06-01
+
+        # Yesterday's run D1 FAILED and is never retried in place.
+        self.add("started", "D1", "full", we=dt(6, 2))
+        self.add("failed", "D1", "full")
+        self.assertEqual(self.watermark(), dt(6, 1))         # D1 ignored
+
+        # Re-run today under a NEW run_group D2 SUCCEEDS.
+        self.complete_run("D2", {"full": dt(6, 2)})
+        # D1 is still incomplete but harmless; D2 is complete -> watermark = 06-02.
+        self.assertEqual(self.watermark(), dt(6, 2))
+
+    def test_today_normal_run_reads_yesterdays_successful_watermark(self):
+        # YESTERDAY: the scheduled run failed (D1), then was re-run successfully
+        # under a DIFFERENT run_group (D2, end_ts 06-02) — both yesterday.
+        # TODAY a normal run starts; at the moment it reads the watermark (in
+        # start_ts) it must pick yesterday's SUCCESSFUL end_ts (06-02), ignoring
+        # both D1's failed attempt AND today's OWN in-flight 'started' row.
+        self.complete_run("BASE", {"full": dt(6, 1)})
+        self.add("started", "D1", "full", we=dt(6, 2))          # yesterday: failed attempt
+        self.add("failed", "D1", "full")
+        self.complete_run("D2", {"full": dt(6, 2)})             # yesterday: successful rerun
+        self.add("started", "TODAY", "full", we=dt(6, 3))       # today's run, in-flight
+        # The latest SUCCESSFUL run for the model is D2 -> today reads 06-02.
+        self.assertEqual(self.watermark(), dt(6, 2))
+
     def test_no_regress_partial_backfill(self):
         # A normal run reached 06-10; a completed partial backfill only covered 06-03.
         self.complete_run("NORMAL", {"full": dt(6, 10)})

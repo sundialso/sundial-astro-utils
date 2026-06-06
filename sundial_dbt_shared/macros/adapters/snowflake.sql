@@ -65,3 +65,28 @@
 {% macro snowflake__with_merge_retry(merge_sql) %}
 {{ merge_sql }}
 {% endmacro %}
+
+{# ------------------------------------------------------------------ #}
+{#  Dialect primitives for the shared incremental-window macros         #}
+{#  (sundial_dbt_shared.start_ts / end_ts / execution_ts).              #}
+{# ------------------------------------------------------------------ #}
+
+{# UTC "now" truncated to the current date, as the incremental timestamp type. #}
+{% macro snowflake__incr_now_ts() %}
+  CAST(CAST(CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()) AS DATE) AS TIMESTAMP_NTZ)
+{%- endmacro %}
+
+{# Cast a 'YYYY-MM-DD[ HH:MM:SS]' string literal to the incremental ts type. #}
+{% macro snowflake__incr_cast_ts(literal) %}
+  CAST('{{ literal }}' AS TIMESTAMP_NTZ)
+{%- endmacro %}
+
+{# Shift a ts expression by a SIGNED number of days (negative = back). #}
+{% macro snowflake__incr_shift_days(ts_expr, days) %}
+  DATEADD(DAY, {{ days }}, {{ ts_expr }})
+{%- endmacro %}
+
+{# Shift a ts expression by a SIGNED number of seconds (negative = back). #}
+{% macro snowflake__incr_shift_seconds(ts_expr, seconds) %}
+  DATEADD(SECOND, {{ seconds }}, {{ ts_expr }})
+{%- endmacro %}

@@ -89,3 +89,28 @@ BEGIN
   END LOOP;
 END
 {% endmacro %}
+
+{# ------------------------------------------------------------------ #}
+{#  Dialect primitives for the shared incremental-window macros         #}
+{#  (sundial_dbt_shared.start_ts / end_ts / execution_ts).              #}
+{# ------------------------------------------------------------------ #}
+
+{# UTC "now" truncated to the current date, as the incremental timestamp type. #}
+{% macro bigquery__incr_now_ts() %}
+  CAST(CAST(CURRENT_TIMESTAMP() AS DATE) AS DATETIME)
+{%- endmacro %}
+
+{# Cast a 'YYYY-MM-DD[ HH:MM:SS]' string literal to the incremental ts type. #}
+{% macro bigquery__incr_cast_ts(literal) %}
+  CAST('{{ literal }}' AS DATETIME)
+{%- endmacro %}
+
+{# Shift a ts expression by a SIGNED number of days (negative = back). #}
+{% macro bigquery__incr_shift_days(ts_expr, days) %}
+  DATETIME_ADD({{ ts_expr }}, INTERVAL {{ days }} DAY)
+{%- endmacro %}
+
+{# Shift a ts expression by a SIGNED number of seconds (negative = back). #}
+{% macro bigquery__incr_shift_seconds(ts_expr, seconds) %}
+  DATETIME_ADD({{ ts_expr }}, INTERVAL {{ seconds }} SECOND)
+{%- endmacro %}
