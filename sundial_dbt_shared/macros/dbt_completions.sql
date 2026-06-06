@@ -19,9 +19,9 @@
 {#                                                                    #}
 {#  Tenant requirements:                                              #}
 {#    - BigQuery: vars `target_project` and `target_dataset` must be  #}
-{#      set. Snowflake: var `target_schema` is REQUIRED (no           #}
-{#      `target.schema` fallback); `target_database` is optional       #}
-{#      (otherwise `target.database` is used).                         #}
+{#      set. Snowflake: `target_schema`/`target_database` vars win,    #}
+{#      otherwise the active profile's `target.schema`/`target.database`#}
+{#      are used as fallbacks.                                         #}
 {#    - The tenant must define an `execution_ts()` macro returning a  #}
 {#      timestamp/date expression VALID FOR THEIR OWN WAREHOUSE (each  #}
 {#      tenant targets a single warehouse). Sundial only wraps it     #}
@@ -37,10 +37,6 @@
 {#  Wire-up in tenant dbt_project.yml:                                #}
 {#    on-run-start:                                                   #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_table() }}"   #}
-{#      # ensure_run_group_columns() MUST come right after the create #}
-{#      # so a pre-existing table gains the lock + watermark columns   #}
-{#      # before any hook MERGEs into them.                            #}
-{#      - "{{ sundial_dbt_shared.ensure_run_group_columns() }}"       #}
 {#      - "{{ sundial_dbt_shared.create_dbt_completions_view() }}"    #}
 {#    on-run-end:                                                     #}
 {#      - "{{ sundial_dbt_shared.log_run_results() }}"                #}
@@ -58,18 +54,19 @@
 {#      # tenant's start_ts()/end_ts() — see validate_partial_backfill / #}
 {#      # record_window_start / record_window_end below.                #}
 {#                                                                    #}
-{#  First-time setup / migration:                                     #}
+{#  First-time setup:                                                 #}
 {#    - create_dbt_completions_table() defines the FULL schema (status  #}
-{#      + lock + watermark columns) for fresh tables; for a table       #}
-{#      created under an earlier schema, ensure_run_group_columns()      #}
-{#      (wired above) additively back-fills the lock + watermark        #}
-{#      columns via ADD COLUMN IF NOT EXISTS — no drop/recreate needed.  #}
+{#      + lock + watermark columns) and is self-healing: on a fresh     #}
+{#      table it CREATEs IF NOT EXISTS; on an OLD table missing the      #}
+{#      lock/watermark columns it CREATE OR REPLACEs (drops + rebuilds   #}
+{#      with the full schema — the old rows are discarded, fine for a    #}
+{#      brand-new feature). No ALTER-based column migration.            #}
 {#    - The dbt_completions VIEW is CREATE OR REPLACE, so a view         #}
 {#      definition change (chunk-aware rollup / locked_out filter)        #}
 {#      applies on the NEXT run automatically — no manual drop. The       #}
 {#      replace is atomic, so readers never see a missing view.          #}
-{#    - Snowflake: `target_schema` is REQUIRED (the `target.schema`      #}
-{#      profile fallback was removed); set the var explicitly.          #}
+{#    - Snowflake: `target_schema` var wins, else the `target.schema`    #}
+{#      profile value is used as a fallback.                            #}
 {# ------------------------------------------------------------------ #}
 
 {# ------------------------------------------------------------------ #}
@@ -82,6 +79,17 @@
 
 {% macro dbt_completions_view() %}
   {{ return(adapter.dispatch('dbt_completions_view', 'sundial_dbt_shared')()) }}
+{% endmacro %}
+
+{# Returns the dbt_completions_raw table as a Relation object (database/schema/
+   identifier), so create_dbt_completions_table() can introspect its columns at
+   runtime via adapter.get_relation / get_columns_in_relation. The string FQN
+   used in DDL comes from dbt_completions_table(); this is the structured form.
+   ⚠️ TEMPORARY — exists only for the create-or-replace migration in
+   create_dbt_completions_table(); delete both together once all tables are
+   on the full schema. #}
+{% macro completions_relation() %}
+  {{ return(adapter.dispatch('completions_relation', 'sundial_dbt_shared')()) }}
 {% endmacro %}
 
 {% macro execution_ts_as_datestr() %}
@@ -110,8 +118,51 @@
   {{ return(adapter.dispatch('lock_ts_sub', 'sundial_dbt_shared')(ts_expr, minutes)) }}
 {% endmacro %}
 
+{# Coerce a warehouse timestamp/datetime/date/string expression to the
+   completions 'datetime' column type (naive: BigQuery DATETIME / Snowflake
+   TIMESTAMP_NTZ). The start_ts/end_ts watermark columns are 'datetime', and
+   BigQuery does not implicitly convert TIMESTAMP->DATETIME — so wrap any
+   start_ts()/end_ts() expression with this before writing it. Both adapters
+   interpret a bare TIMESTAMP at UTC (see the per-adapter impls for tz caveats).#}
+{% macro to_completions_datetime(ts_expr) %}
+  {{ return(adapter.dispatch('to_completions_datetime', 'sundial_dbt_shared')(ts_expr)) }}
+{% endmacro %}
+
+{# Returns a SQL expression for "today minus ``days``" as a 'YYYY-MM-DD' string,
+   to compare against the execution_ts column (also a YYYY-MM-DD string).
+   Evaluated at query time (uses CURRENT_DATE), so the view's window slides. #}
+{% macro execution_ts_days_ago(days) %}
+  {{ return(adapter.dispatch('execution_ts_days_ago', 'sundial_dbt_shared')(days)) }}
+{% endmacro %}
+
+{#
+  create_dbt_completions_table — self-healing on-run-start create.
+
+  ⚠️ TEMPORARY (remove the CREATE OR REPLACE branch once every tenant's
+  dbt_completions_raw has the full lock/watermark schema). After that, revert
+  this macro to a plain `CREATE TABLE IF NOT EXISTS (...)` — the runtime
+  column-introspection + completions_relation() primitive exist ONLY to migrate
+  old tables by replacement and should be deleted with it.
+
+  At runtime it introspects the existing dbt_completions_raw (if any) and picks
+  the right DDL:
+    - table absent, OR present with the full schema  -> CREATE TABLE IF NOT EXISTS
+      (a harmless no-op when it already exists).
+    - table present but MISSING any lock/watermark column -> CREATE OR REPLACE
+      TABLE with the full schema. This DROPS the old table and its rows; that is
+      acceptable because the lock/watermark feature is new and a pre-feature
+      table holds nothing worth preserving for it. (NOTE: only triggers on the
+      transition run; once the columns exist no replace ever happens. Avoid
+      deploying this for the first time mid-write under chunked fan-out, where a
+      parallel invocation could replace the table while another is writing.)
+
+  Detection uses dbt's warehouse-agnostic relation APIs (no information_schema
+  dialect handling); column names are lower-cased before comparison so it works
+  on Snowflake's upper-cased catalog too. Both DDL paths go through
+  with_merge_retry to absorb concurrent-DDL errors from parallel on-run-start.
+#}
 {% macro create_dbt_completions_table() %}
-  CREATE TABLE IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_table() }} (
+  {%- set cols -%}
     model_name          {{ sundial_dbt_shared.completions_col_type('string') }},
     execution_ts        {{ sundial_dbt_shared.completions_col_type('string') }},
     status              {{ sundial_dbt_shared.completions_col_type('string') }},
@@ -119,90 +170,165 @@
     run_group_id        {{ sundial_dbt_shared.completions_col_type('string') }},
     chunk_key           {{ sundial_dbt_shared.completions_col_type('string') }},
     heartbeat_at        {{ sundial_dbt_shared.completions_col_type('timestamp') }},
-    window_start_ts {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    window_end_ts   {{ sundial_dbt_shared.completions_col_type('datetime') }}
-  )
-{% endmacro %}
+    start_ts     {{ sundial_dbt_shared.completions_col_type('datetime') }},
+    end_ts       {{ sundial_dbt_shared.completions_col_type('datetime') }}
+  {%- endset -%}
 
-{# Additive column add for tables created before run grouping / the lock /
-   the watermark. Wire into on-run-start AFTER create_dbt_completions_table().
-   Covers the full set of columns added on top of the original
-   (model_name, execution_ts, status, updated_at) table. BigQuery and Snowflake
-   both support ADD COLUMN IF NOT EXISTS, so this is a safe no-op once applied. #}
-{% macro ensure_run_group_columns() %}
-  ALTER TABLE {{ sundial_dbt_shared.dbt_completions_table() }}
-    ADD COLUMN IF NOT EXISTS run_group_id    {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS chunk_key       {{ sundial_dbt_shared.completions_col_type('string') }},
-    ADD COLUMN IF NOT EXISTS heartbeat_at    {{ sundial_dbt_shared.completions_col_type('timestamp') }},
-    ADD COLUMN IF NOT EXISTS window_start_ts {{ sundial_dbt_shared.completions_col_type('datetime') }},
-    ADD COLUMN IF NOT EXISTS window_end_ts   {{ sundial_dbt_shared.completions_col_type('datetime') }}
+  {%- set required = ['run_group_id', 'chunk_key', 'heartbeat_at', 'start_ts', 'end_ts'] -%}
+  {%- set rel = sundial_dbt_shared.completions_relation() -%}
+  {%- set existing = adapter.get_relation(database=rel.database, schema=rel.schema, identifier=rel.identifier) if execute else none -%}
+
+  {%- if existing is not none -%}
+    {%- set have = adapter.get_columns_in_relation(existing) | map(attribute='name') | map('lower') | list -%}
+    {%- set missing = required | reject('in', have) | list -%}
+  {%- else -%}
+    {%- set missing = [] -%}
+  {%- endif -%}
+
+  {%- if existing is not none and missing | length > 0 -%}
+    {%- set ddl -%}
+      CREATE OR REPLACE TABLE {{ sundial_dbt_shared.dbt_completions_table() }} (
+        {{ cols }}
+      )
+    {%- endset -%}
+    {{ sundial_dbt_shared.with_merge_retry(ddl) }}
+  {%- else -%}
+    {%- set ddl -%}
+      CREATE TABLE IF NOT EXISTS {{ sundial_dbt_shared.dbt_completions_table() }} (
+        {{ cols }}
+      )
+    {%- endset -%}
+    {{ sundial_dbt_shared.with_merge_retry(ddl) }}
+  {%- endif -%}
 {% endmacro %}
 
 {#
-  create_dbt_completions_view — chunk-aware rollup, one row per (model, execution_ts).
+  create_dbt_completions_view — one row per (model, execution_ts) = that date's
+  latest run, collective across chunks.
 
   The hooks MERGE every status transition into dbt_completions_raw (several rows
-  per model per run). This view collapses each (model, execution_ts) to a single
-  status by taking the LATEST run_group (a later re-run supersedes an earlier one
-  on the same date) and rolling its chunks up:
-    - failed    if ANY chunk failed
-    - succeeded only if EVERY started chunk reached succeeded (whole run done)
-    - started   otherwise (some chunk still in flight)
+  per model per run, one per chunk per status). This view reduces that to ONE
+  row per (model_name, execution_ts): within each date the LATEST run_group (a
+  later re-run / backfill supersedes an earlier one on the same date), rolled up
+  across that run's chunks. A model keeps one row per execution_ts it ran on in
+  the window — not just its most recent date.
+
+  Rollup rule (per chunk, take its LATEST status by updated_at — so a retry that
+  succeeds clears an earlier 'failed' for the same chunk):
+    - failed    if ANY chunk's latest status is 'failed'
+    - started   else if ANY chunk's latest status is 'started' (still in flight)
+    - succeeded else (every chunk's latest is a non-failed terminal)
+  This is correct latest-state semantics (not the old count-equality, which
+  mis-read succeeded-only and mismatched-chunk runs).
+
   'locked_out' / 'crashed' rows are excluded — they mean "this run produced no
-  data", so they never mask the real data-producing run. This is what makes a
-  partially-failed chunked run read as 'failed' (and therefore NOT 'succeeded' to
-  sundial's source-marker check), instead of the old "latest updated_at wins".
+  data", so they never mask the real data-producing run.
 
-  Standard SQL (CTEs + window) — runs unchanged on BigQuery and Snowflake; only
-  the object names come from the dispatched FQN primitives.
+  Exposed columns = all of dbt_completions_raw EXCEPT heartbeat_at:
+    model_name, execution_ts, status, run_group_id, chunk_key,
+    start_ts, end_ts, updated_at
+  Aggregated to the one-row grain:
+    - run_group_id   : the winning run_group (single value).
+    - chunk_key      : the chunk key if the run was single-chunk (e.g. 'full'),
+                       else the sentinel '__all__' (the row is a cross-chunk
+                       rollup spanning every chunk of the run).
+    - start_ts: MIN across the run's chunks (overall covered-from).
+    - end_ts  : MAX across the run's chunks (overall covered-to).
+    - updated_at     : MAX across the run.
 
-  Emitted as CREATE OR REPLACE VIEW so a change to the definition (chunk-aware
-  rollup / locked_out filter) applies on the very NEXT run with no manual drop.
-  The replace is atomic on both BigQuery and Snowflake, so the parallel
-  on-run-start invocations (chunked fan-out fires one per chunk) never expose a
-  missing view to sundial's readers; wrapping the DDL in with_merge_retry
-  additionally absorbs BigQuery's metadata-level concurrent-update error when
-  several invocations replace the view at once. All invocations write a
-  byte-identical definition, so whichever lands last is correct.
+  Bounded to the last ``dbt_completions_view_days`` days (default 30) of
+  execution_ts so long-dead models drop off and the scan stays small; a model
+  that last ran 2 days ago still appears, at its older latest execution_ts.
+
+  Emitted as CREATE OR REPLACE VIEW so a definition change applies on the next
+  run with no manual drop; the replace is atomic on both warehouses, and the DDL
+  is wrapped in with_merge_retry to absorb BigQuery's metadata-level
+  concurrent-update error when parallel on-run-start invocations replace it at
+  once (all write a byte-identical definition, so whichever lands last is right).
 #}
 {% macro create_dbt_completions_view() %}
+  {%- set days = var('dbt_completions_view_days', 30) | int -%}
   {%- set view_sql -%}
   CREATE OR REPLACE VIEW {{ sundial_dbt_shared.dbt_completions_view() }} AS
   WITH live AS (
-    SELECT model_name, execution_ts, run_group_id, chunk_key, status, updated_at
+    SELECT model_name, execution_ts, run_group_id, chunk_key, status, updated_at,
+           start_ts, end_ts
     FROM {{ sundial_dbt_shared.dbt_completions_table() }}
     WHERE status NOT IN ('locked_out', 'crashed')
+      AND execution_ts >= {{ sundial_dbt_shared.execution_ts_days_ago(days) }}
   ),
-  latest_run AS (
+  {# Per (model, execution_ts): pick the latest run_group (max updated_at, then
+     run_group_id for a deterministic tie-break). A later re-run / backfill on the
+     same date supersedes an earlier one. #}
+  ranked AS (
     SELECT
       model_name, execution_ts, run_group_id,
       ROW_NUMBER() OVER (
-        PARTITION BY model_name, execution_ts ORDER BY MAX(updated_at) DESC
+        PARTITION BY model_name, execution_ts
+        ORDER BY MAX(updated_at) DESC, run_group_id DESC
       ) AS _rn
     FROM live
     GROUP BY model_name, execution_ts, run_group_id
   ),
-  latest_rows AS (
-    SELECT l.model_name, l.execution_ts, l.chunk_key, l.status, l.updated_at
+  winner AS (
+    SELECT model_name, execution_ts, run_group_id
+    FROM ranked WHERE _rn = 1
+  ),
+  win_rows AS (
+    SELECT l.*
     FROM live l
-    JOIN latest_run r
-      ON l.model_name = r.model_name
-     AND l.execution_ts = r.execution_ts
-     AND l.run_group_id = r.run_group_id
-    WHERE r._rn = 1
+    JOIN winner w
+      ON l.model_name = w.model_name
+     AND l.execution_ts = w.execution_ts
+     AND l.run_group_id = w.run_group_id
+  ),
+  {# Each chunk's latest status only (so a successful retry supersedes a prior
+     'failed' for that chunk). #}
+  chunk_final AS (
+    SELECT model_name, execution_ts, chunk_key, status
+    FROM (
+      SELECT model_name, execution_ts, chunk_key, status,
+        ROW_NUMBER() OVER (
+          PARTITION BY model_name, execution_ts, chunk_key ORDER BY updated_at DESC
+        ) AS _crn
+      FROM win_rows
+    ) c
+    WHERE _crn = 1
+  ),
+  status_roll AS (
+    SELECT model_name, execution_ts,
+      CASE
+        WHEN SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) > 0 THEN 'failed'
+        WHEN SUM(CASE WHEN status = 'started' THEN 1 ELSE 0 END) > 0 THEN 'started'
+        ELSE 'succeeded'
+      END AS status
+    FROM chunk_final
+    GROUP BY model_name, execution_ts
+  ),
+  {# run_group / chunk_key / window columns for the winning run. start_ts/end_ts
+     live only on 'started' rows; MIN/MAX skip the NULLs on terminal rows. #}
+  win_agg AS (
+    SELECT model_name, execution_ts,
+      MAX(run_group_id) AS run_group_id,
+      CASE WHEN COUNT(DISTINCT chunk_key) = 1 THEN MAX(chunk_key) ELSE '__all__' END AS chunk_key,
+      MIN(start_ts) AS start_ts,
+      MAX(end_ts)   AS end_ts,
+      MAX(updated_at)      AS updated_at
+    FROM win_rows
+    GROUP BY model_name, execution_ts
   )
   SELECT
-    model_name,
-    execution_ts,
-    CASE
-      WHEN SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'failed'
-      WHEN COUNT(DISTINCT CASE WHEN status = 'started'   THEN chunk_key END)
-         = COUNT(DISTINCT CASE WHEN status = 'succeeded' THEN chunk_key END) THEN 'succeeded'
-      ELSE 'started'
-    END AS status,
-    MAX(updated_at) AS updated_at
-  FROM latest_rows
-  GROUP BY model_name, execution_ts
+    a.model_name,
+    a.execution_ts,
+    s.status,
+    a.run_group_id,
+    a.chunk_key,
+    a.start_ts,
+    a.end_ts,
+    a.updated_at
+  FROM win_agg a
+  JOIN status_roll s
+    ON a.model_name = s.model_name AND a.execution_ts = s.execution_ts
   {%- endset -%}
   {{ sundial_dbt_shared.with_merge_retry(view_sql) }}
 {% endmacro %}
@@ -546,7 +672,7 @@
 {#  is no separate commit step.                                           #}
 {#                                                                    #}
 {#  read_watermark mirrors sundial's last_processed_timestamp:            #}
-{#  MAX(window_end_ts) over this model's COMPLETE runs — run_groups whose  #}
+{#  MAX(end_ts) over this model's COMPLETE runs — run_groups whose  #}
 {#  every 'started' chunk reached a 'succeeded' terminal. Because          #}
 {#  log_run_results only writes 'succeeded' when the build AND its         #}
 {#  blocking (error-severity) tests pass, a failing table test holds the   #}
@@ -557,17 +683,20 @@
 {#  MAX gives no-regress (a partial backfill's historical end is ignored). #}
 {# ------------------------------------------------------------------ #}
 {% macro read_watermark(model_name) %}
-  SELECT MAX(w.window_end_ts)
+  SELECT MAX(w.end_ts)
   FROM {{ sundial_dbt_shared.dbt_completions_table() }} w
   WHERE w.model_name = '{{ model_name }}'
     AND w.status = 'started'
-    AND w.window_end_ts IS NOT NULL
-    AND w.run_group_id NOT IN (
-      -- run_groups with any 'started' chunk that has NO 'succeeded' sibling
-      -- (still running, failed, blocking-test-failed, locked_out, crashed)
-      SELECT u.run_group_id
+    AND w.end_ts IS NOT NULL
+    -- Exclude w if its OWN run_group has any 'started' chunk with NO 'succeeded'
+    -- sibling (still running, failed, blocking-test-failed, locked_out, crashed).
+    -- NOT EXISTS (not NOT IN): null-safe, so a stray run_group_id = NULL row can't
+    -- poison the predicate and silently blank the whole watermark.
+    AND NOT EXISTS (
+      SELECT 1
       FROM {{ sundial_dbt_shared.dbt_completions_table() }} u
-      WHERE u.model_name = '{{ model_name }}'
+      WHERE u.model_name = w.model_name
+        AND u.run_group_id = w.run_group_id
         AND u.status = 'started'
         AND NOT EXISTS (
           SELECT 1 FROM {{ sundial_dbt_shared.dbt_completions_table() }} s
@@ -584,8 +713,10 @@
             and var('record_incremental_window', true)) }}
 {% endmacro %}
 
-{# Upsert window_end_ts onto this run's 'started' row (the watermark
-   contributor). end_sql is a self-contained DATETIME expression. #}
+{# Upsert end_ts onto this run's 'started' row (the watermark
+   contributor). end_sql is a self-contained timestamp/datetime/date expression;
+   it is coerced to the 'datetime' column type via to_completions_datetime(), so
+   a tz-aware TIMESTAMP end_ts() is accepted without a manual cast. #}
 {% macro record_window_end(end_sql) %}
   {% if sundial_dbt_shared._should_record_window() %}
     {%- set rg = var('run_group_id', invocation_id) -%}
@@ -596,26 +727,29 @@
         SELECT '{{ this.name }}' AS model_name,
                {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
                '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
-               ({{ end_sql }}) AS we
+               {{ sundial_dbt_shared.to_completions_datetime(end_sql) }} AS we
       ) S
       ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
          AND T.chunk_key = S.chunk_key AND T.status = 'started'
-      WHEN MATCHED THEN UPDATE SET window_end_ts = S.we
-      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, window_end_ts, updated_at)
+      WHEN MATCHED THEN UPDATE SET end_ts = S.we
+      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, end_ts, updated_at)
         VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.we, CURRENT_TIMESTAMP())
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
   {% endif %}
 {% endmacro %}
 
-{# Upsert window_start_ts onto the 'started' row. start_sql may reference
+{# Upsert start_ts onto the 'started' row. start_sql may reference
    read_watermark (a scalar subquery over this table) — resolve it to a
-   literal FIRST so the MERGE source never reads the table it writes. #}
+   literal FIRST so the MERGE source never reads the table it writes. The
+   resolution SELECT coerces start_sql to the 'datetime' type via
+   to_completions_datetime(), so the resolved value is naive and the re-injected
+   literal can't carry a tz offset that would break the CAST. #}
 {% macro record_window_start(start_sql) %}
   {% if sundial_dbt_shared._should_record_window() %}
     {%- set rg = var('run_group_id', invocation_id) -%}
     {%- set ck = var('chunk_key', 'full') -%}
-    {%- set res = run_query("SELECT (" ~ start_sql ~ ") AS ws") -%}
+    {%- set res = run_query("SELECT " ~ sundial_dbt_shared.to_completions_datetime(start_sql) ~ " AS ws") -%}
     {%- set ws = res.rows[0][0] if res is not none and res.rows | length > 0 else none -%}
     {% if ws is not none %}
       {%- set sql -%}
@@ -628,8 +762,8 @@
         ) S
         ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
            AND T.chunk_key = S.chunk_key AND T.status = 'started'
-        WHEN MATCHED THEN UPDATE SET window_start_ts = S.ws
-        WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, window_start_ts, updated_at)
+        WHEN MATCHED THEN UPDATE SET start_ts = S.ws
+        WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, start_ts, updated_at)
           VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.ws, CURRENT_TIMESTAMP())
       {%- endset -%}
       {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
