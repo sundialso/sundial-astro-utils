@@ -58,10 +58,38 @@
   {%- endif -%}
 {% endmacro %}
 
+{# start_ts resolves the watermark lower bound to a LITERAL at compile time via
+   run_query, then injects it as a constant. This is required for BigQuery tables
+   with require_partition_filter: BigQuery only does partition elimination on
+   constants / scripting vars / CURRENT_* — NOT on a subquery. The watermark
+   (read_watermark) and the MAX(timestamp_column) fallback are subqueries, so
+   embedding them inline makes the partition filter non-prunable and the warehouse
+   rejects the query ("Cannot query ... without a filter ... for partition
+   elimination"). Resolving to a literal keeps the window prunable on both
+   warehouses. The result is memoised on the model node so the N start_ts() calls
+   in one model render issue ONE resolving query, not N. #}
 {% macro start_ts(timestamp_column, lookback_value, first_timestamp) %}
   {%- if var('backfill_start_ts', none) is not none -%}
     {{ sundial_dbt_shared.incr_cast_ts(var('backfill_start_ts')) }}
   {%- elif is_incremental() -%}
+    {{ sundial_dbt_shared.incr_cast_ts(sundial_dbt_shared._resolve_start_ts(timestamp_column, lookback_value, first_timestamp)) }}
+  {%- else -%}
+    {{ sundial_dbt_shared.incr_cast_ts(first_timestamp) }}
+  {%- endif -%}
+{% endmacro %}
+
+{# Resolve the incremental lower bound to a scalar literal (string). Runs the
+   watermark/MAX/first COALESCE + (+1s, -lookback, GREATEST(first)) as ONE query
+   and returns the value, memoised per (model, timestamp_column, lookback) on the
+   model node. During parse (execute is false) there is no warehouse, so it falls
+   back to first_timestamp — the real value is resolved when the model runs. #}
+{% macro _resolve_start_ts(timestamp_column, lookback_value, first_timestamp) %}
+  {%- if not execute -%}
+    {{- return(first_timestamp) -}}
+  {%- endif -%}
+  {%- set memo_key = '__sundial_start_ts__' ~ timestamp_column ~ '__' ~ (lookback_value | int) -%}
+  {%- set cached = model.get(memo_key) if model is not none else none -%}
+  {%- if cached is none -%}
     {%- set lower_bound -%}
       COALESCE(
         ({{ sundial_dbt_shared.read_watermark(this.name) }}),
@@ -69,15 +97,19 @@
         {{ sundial_dbt_shared.incr_cast_ts(first_timestamp) }}
       )
     {%- endset -%}
-    GREATEST(
-      {{ sundial_dbt_shared.incr_shift_days(
-           sundial_dbt_shared.incr_shift_seconds(lower_bound, 1),
-           -1 * (lookback_value | int)) }},
-      {{ sundial_dbt_shared.incr_cast_ts(first_timestamp) }}
-    )
-  {%- else -%}
-    {{ sundial_dbt_shared.incr_cast_ts(first_timestamp) }}
+    {%- set resolve_sql -%}
+      SELECT GREATEST(
+        {{ sundial_dbt_shared.incr_shift_days(
+             sundial_dbt_shared.incr_shift_seconds(lower_bound, 1),
+             -1 * (lookback_value | int)) }},
+        {{ sundial_dbt_shared.incr_cast_ts(first_timestamp) }}
+      ) AS s
+    {%- endset -%}
+    {%- set res = run_query(resolve_sql) -%}
+    {%- set cached = (res.rows[0][0] | string) if (res is not none and res.rows | length > 0 and res.rows[0][0] is not none) else first_timestamp -%}
+    {%- if model is not none -%}{%- do model.update({memo_key: cached}) -%}{%- endif -%}
   {%- endif -%}
+  {{- return(cached) -}}
 {% endmacro %}
 
 {% macro end_ts(lag_value) %}

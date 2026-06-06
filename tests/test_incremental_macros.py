@@ -40,15 +40,33 @@ def _load_template():
 TMPL = _load_template()
 
 
-def module(prefix, vars_=None):
-    """Build the rendered macro module for one adapter (`bigquery`/`snowflake`)."""
+def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
+    """Build the rendered macro module for one adapter (`bigquery`/`snowflake`).
+
+    Stubs run_query to return `resolved` as the resolved start_ts literal, and
+    tracks the call count so the memoisation can be asserted. `model` is a real
+    dict so the per-render memo (model.get / model.update) works.
+    """
     vars_ = vars_ or {}
+    calls = {"n": 0, "last_sql": None}
+
+    def run_query(sql):
+        calls["n"] += 1
+        calls["last_sql"] = sql
+
+        class Res:
+            rows = [[resolved]]
+        return Res()
+
     g = {
         "return": lambda x: x,
         "var": lambda name, default=None: vars_.get(name, default),
         "is_incremental": lambda: vars_.get("__incremental", True),
+        "execute": vars_.get("__execute", True),
         "read_watermark": lambda m: "SELECT MAX(end_ts) FROM compl WHERE model_name='%s'" % m,
         "record_window_end": lambda expr: "",
+        "run_query": run_query,
+        "model": {},
         "this": "`proj.ds.m`" if prefix == "bigquery" else '"DB"."SC"."M"',
     }
 
@@ -58,6 +76,7 @@ def module(prefix, vars_=None):
 
     g["adapter"] = Adapter()
     mod = TMPL.make_module(g)
+    mod._calls = calls
     return mod
 
 
@@ -105,22 +124,37 @@ class IncrementalMacroTests(unittest.TestCase):
         self.assertEqual(out, "CAST('2026-01-01' AS DATETIME)")
 
     # ---- start_ts -----------------------------------------------------
-    def test_start_ts_watermark_with_max_fallback(self):
+    def test_start_ts_emits_resolved_literal_not_subquery(self):
+        # The watermark is resolved at compile time → start_ts must emit a CONSTANT
+        # literal (prunable on BigQuery require_partition_filter), NOT a subquery.
         out = norm(module("bigquery").start_ts("event_ts", 7, "2021-01-01"))
-        # watermark first, MAX(target) fallback, then first_timestamp
-        self.assertIn("SELECT MAX(end_ts) FROM compl", out)          # read_watermark
-        self.assertIn("SELECT MAX(event_ts) FROM `proj.ds.m`", out)  # first-run fallback
-        self.assertIn("CAST('2021-01-01' AS DATETIME)", out)         # final fallback + floor
-        self.assertIn("INTERVAL 1 SECOND", out)                      # resume = watermark + 1s
-        self.assertIn("INTERVAL -7 DAY", out)                        # lookback
-        self.assertTrue(out.startswith("GREATEST("))                 # floored at first_timestamp
+        self.assertEqual(out, "CAST('2026-06-05 23:59:59' AS DATETIME)")
+        self.assertNotIn("SELECT", out)     # no inline subquery in the model SQL
+        self.assertNotIn("GREATEST", out)   # GREATEST was resolved away
+        self.assertNotIn("read_watermark", out)
 
-    def test_start_ts_snowflake_dialect(self):
+    def test_start_ts_snowflake_literal(self):
         out = norm(module("snowflake").start_ts("event_ts", 7, "2021-01-01"))
-        self.assertIn('SELECT MAX(event_ts) FROM "DB"."SC"."M"', out)
-        self.assertIn("DATEADD(SECOND, 1,", out)
-        self.assertIn("DATEADD(DAY, -7,", out)
-        self.assertIn("TIMESTAMP_NTZ", out)
+        self.assertEqual(out, "CAST('2026-06-05 23:59:59' AS TIMESTAMP_NTZ)")
+
+    def test_start_ts_resolve_sql_has_watermark_and_fallback(self):
+        # The query that RESOLVES the literal still uses watermark + MAX fallback.
+        mod = module("bigquery")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        sql = " ".join(mod._calls["last_sql"].split())
+        self.assertIn("SELECT MAX(end_ts) FROM compl", sql)               # read_watermark
+        self.assertIn("SELECT MAX(event_ts) FROM `proj.ds.m`", sql)       # first-run fallback
+        self.assertIn("INTERVAL 1 SECOND", sql)                           # +1s resume
+        self.assertIn("INTERVAL -7 DAY", sql)                             # lookback
+        self.assertIn("GREATEST(", sql)                                   # floored at first
+
+    def test_start_ts_memoized_one_query_per_model(self):
+        # N start_ts() calls with the same args in one model render → ONE query.
+        mod = module("bigquery")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        self.assertEqual(mod._calls["n"], 1)
 
     def test_start_ts_backfill_override(self):
         out = norm(module("snowflake", {"backfill_start_ts": "2026-02-01"}).start_ts("event_ts", 7, "2021-01-01"))

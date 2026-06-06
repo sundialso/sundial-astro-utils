@@ -719,23 +719,33 @@
    a tz-aware TIMESTAMP end_ts() is accepted without a manual cast. #}
 {% macro record_window_end(end_sql) %}
   {% if sundial_dbt_shared._should_record_window() %}
-    {%- set rg = var('run_group_id', invocation_id) -%}
-    {%- set ck = var('chunk_key', 'full') -%}
-    {%- set sql -%}
-      MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
-      USING (
-        SELECT '{{ this.name }}' AS model_name,
-               {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
-               '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
-               {{ sundial_dbt_shared.to_completions_datetime(end_sql) }} AS we
-      ) S
-      ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
-         AND T.chunk_key = S.chunk_key AND T.status = 'started'
-      WHEN MATCHED THEN UPDATE SET end_ts = S.we
-      WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, end_ts, updated_at)
-        VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.we, CURRENT_TIMESTAMP())
-    {%- endset -%}
-    {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
+    {# Dedupe identical writes within a model render: a model often calls end_ts()
+       many times (one per CTE/WHERE) with the SAME expression, which would fire an
+       identical MERGE each time and hammer the rate-limited completions table.
+       Memoise the recorded end expressions on the model node so each distinct
+       value writes once. (Distinct lags → distinct end_sql → each still recorded;
+       last distinct value wins on end_ts, as before.) #}
+    {%- set memo_key = '__sundial_recorded_end__' ~ (end_sql | trim) -%}
+    {%- if model is none or model.get(memo_key) is none -%}
+      {%- if model is not none -%}{%- do model.update({memo_key: true}) -%}{%- endif -%}
+      {%- set rg = var('run_group_id', invocation_id) -%}
+      {%- set ck = var('chunk_key', 'full') -%}
+      {%- set sql -%}
+        MERGE INTO {{ sundial_dbt_shared.dbt_completions_table() }} T
+        USING (
+          SELECT '{{ this.name }}' AS model_name,
+                 {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
+                 '{{ rg }}' AS run_group_id, '{{ ck }}' AS chunk_key,
+                 {{ sundial_dbt_shared.to_completions_datetime(end_sql) }} AS we
+        ) S
+        ON T.model_name = S.model_name AND T.run_group_id = S.run_group_id
+           AND T.chunk_key = S.chunk_key AND T.status = 'started'
+        WHEN MATCHED THEN UPDATE SET end_ts = S.we
+        WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, end_ts, updated_at)
+          VALUES (S.model_name, S.execution_ts, 'started', S.run_group_id, S.chunk_key, S.we, CURRENT_TIMESTAMP())
+      {%- endset -%}
+      {% do run_query(sundial_dbt_shared.with_merge_retry(sql)) %}
+    {%- endif -%}
   {% endif %}
 {% endmacro %}
 
