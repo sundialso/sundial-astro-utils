@@ -70,6 +70,15 @@
    in one model render issue ONE resolving query, not N. #}
 {% macro start_ts(timestamp_column, lookback_value, first_timestamp) %}
   {%- if var('backfill_start_ts', none) is not none -%}
+    {# Validate backfill bounds ONLY on a partial-backfill run (this branch is
+       reached only when backfill_start_ts is set), so normal runs do no extra
+       work at all. validate_partial_backfill itself no-ops unless BOTH backfill
+       vars are set, and it raises on an invalid range / one beyond the watermark.
+       Memoised per model so the N start_ts() calls validate once. #}
+    {%- if execute and (model is none or model.get('__sundial_backfill_validated__') is none) -%}
+      {%- if model is not none -%}{%- do model.update({'__sundial_backfill_validated__': true}) -%}{%- endif -%}
+      {%- do sundial_dbt_shared.validate_partial_backfill(this.name, first_timestamp) -%}
+    {%- endif -%}
     {{ sundial_dbt_shared.incr_cast_ts(var('backfill_start_ts')) }}
   {%- elif is_incremental() -%}
     {{ sundial_dbt_shared.incr_cast_ts(sundial_dbt_shared._resolve_start_ts(timestamp_column, lookback_value, first_timestamp)) }}

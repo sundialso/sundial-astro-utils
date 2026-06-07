@@ -40,6 +40,14 @@ def _load_template():
 TMPL = _load_template()
 
 
+class _Relation(str):
+    """Mimics dbt's `this`: renders as the FQN, but exposes `.name`."""
+    def __new__(cls, fqn, name):
+        obj = super().__new__(cls, fqn)
+        obj.name = name
+        return obj
+
+
 def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
     """Build the rendered macro module for one adapter (`bigquery`/`snowflake`).
 
@@ -58,7 +66,7 @@ def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
             rows = [[resolved]]
         return Res()
 
-    logged = {"start_values": []}
+    logged = {"start_values": [], "validated": []}
 
     g = {
         "return": lambda x: x,
@@ -69,9 +77,11 @@ def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
         "record_window_end": lambda expr: "",
         # lives in dbt_completions.sql (not loaded here) — stub + capture the value
         "record_window_start_value": lambda v: logged["start_values"].append(v),
+        "validate_partial_backfill": lambda m, ft=None: logged["validated"].append((m, ft)),
         "run_query": run_query,
         "model": {},
-        "this": "`proj.ds.m`" if prefix == "bigquery" else '"DB"."SC"."M"',
+        # str subclass so `{{ this }}` renders the FQN and `this.name` works
+        "this": _Relation("`proj.ds.m`" if prefix == "bigquery" else '"DB"."SC"."M"', "my_model"),
     }
 
     class Adapter:
@@ -172,6 +182,21 @@ class IncrementalMacroTests(unittest.TestCase):
     def test_start_ts_backfill_override(self):
         out = norm(module("snowflake", {"backfill_start_ts": "2026-02-01"}).start_ts("event_ts", 7, "2021-01-01"))
         self.assertEqual(out, "CAST('2026-02-01' AS TIMESTAMP_NTZ)")
+
+    # ---- partial-backfill validation gating ---------------------------
+    def test_normal_run_does_not_validate_backfill(self):
+        # No backfill vars → backfill branch not taken → validation never runs.
+        mod = module("bigquery")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        self.assertEqual(mod._logged["validated"], [])
+
+    def test_backfill_run_validates_once(self):
+        # On a backfill run, validate_partial_backfill is called once (memoised),
+        # with the model name + first_timestamp (so all three checks apply).
+        mod = module("bigquery", {"backfill_start_ts": "2026-02-01"})
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        self.assertEqual(mod._logged["validated"], [("my_model", "2021-01-01")])
 
     def test_start_ts_non_incremental_is_first_timestamp(self):
         out = norm(module("bigquery", {"__incremental": False}).start_ts("event_ts", 7, "2021-01-01"))
