@@ -537,7 +537,7 @@
   {%- if execute -%}
     {%- set rg = var('run_group_id', invocation_id) -%}
     {%- set ck = var('chunk_key', 'full') -%}
-    {%- set ttl = var('dbt_run_lock_ttl_minutes', 240) | int -%}
+    {%- set ttl = var('dbt_run_lock_ttl_minutes', 60) | int -%}
     {%- set tbl = sundial_dbt_shared.dbt_completions_table() -%}
     {%- set terminal = "('succeeded','failed','locked_out','crashed')" -%}
 

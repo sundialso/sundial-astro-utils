@@ -39,6 +39,11 @@ _CONN_ID_ENV = "SUNDIAL_DBT_CONN_ID"
 # adapter builds the per-row ``SELECT`` fragments (with its own placeholder
 # syntax) and the quoted table name, then hands them here.
 def _merge_sql(table_fqn: str, row_selects: list[str]) -> str:
+    # Key includes run_group_id + chunk_key to match the dbt macros' schema. The
+    # dbt_completions VIEW picks the winning run_group per (model, execution_ts)
+    # and joins on run_group_id, so the reconciliation row MUST carry the run's
+    # run_group_id (and chunk_key) — a NULL run_group row would win the ranking by
+    # updated_at but then fail the view's run_group join and drop the model.
     return f"""
     MERGE INTO {table_fqn} T
     USING (
@@ -47,9 +52,11 @@ def _merge_sql(table_fqn: str, row_selects: list[str]) -> str:
     ON T.model_name = S.model_name
        AND T.execution_ts = S.execution_ts
        AND T.status = S.status
+       AND T.run_group_id = S.run_group_id
+       AND T.chunk_key = S.chunk_key
     WHEN MATCHED THEN UPDATE SET updated_at = S.updated_at
-    WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, updated_at)
-      VALUES (S.model_name, S.execution_ts, S.status, S.updated_at)
+    WHEN NOT MATCHED THEN INSERT (model_name, execution_ts, status, run_group_id, chunk_key, updated_at)
+      VALUES (S.model_name, S.execution_ts, S.status, S.run_group_id, S.chunk_key, S.updated_at)
     """
 
 
@@ -132,10 +139,16 @@ class WarehouseAdapter(ABC):
         conn_id: str,
         table_fqn: str,
         execution_ts: str,
+        run_group_id: str,
         rows: list[dict[str, str]],
+        chunk_key: str = "full",
     ) -> None:
         """Run the idempotent MERGE writing one row per ``{model_name, status}``
-        for ``execution_ts`` into ``table_fqn``.
+        for ``(execution_ts, run_group_id, chunk_key)`` into ``table_fqn``.
+
+        ``run_group_id`` ties the reconciliation row to the run's other rows
+        (started / failed) so the dbt_completions view rolls it up correctly.
+        ``chunk_key`` is ``"full"`` for non-chunked models (all current tenants).
         """
 
     def resolve_conn_id(self) -> str:
@@ -183,7 +196,9 @@ class BigQueryAdapter(WarehouseAdapter):
         conn_id: str,
         table_fqn: str,
         execution_ts: str,
+        run_group_id: str,
         rows: list[dict[str, str]],
+        chunk_key: str = "full",
     ) -> None:
         if not rows:
             return
@@ -199,11 +214,15 @@ class BigQueryAdapter(WarehouseAdapter):
             return
 
         selects: list[str] = []
-        params: list[Any] = [ScalarQueryParameter("e", "STRING", execution_ts)]
+        params: list[Any] = [
+            ScalarQueryParameter("e", "STRING", execution_ts),
+            ScalarQueryParameter("rg", "STRING", run_group_id),
+            ScalarQueryParameter("ck", "STRING", chunk_key),
+        ]
         for i, row in enumerate(rows):
             selects.append(
-                f"SELECT @m{i} AS model_name, @e AS execution_ts, "
-                f"@s{i} AS status, CURRENT_TIMESTAMP() AS updated_at"
+                f"SELECT @m{i} AS model_name, @e AS execution_ts, @s{i} AS status, "
+                f"@rg AS run_group_id, @ck AS chunk_key, CURRENT_TIMESTAMP() AS updated_at"
             )
             params.append(ScalarQueryParameter(f"m{i}", "STRING", row["model_name"]))
             params.append(ScalarQueryParameter(f"s{i}", "STRING", row["status"]))
@@ -240,7 +259,9 @@ class SnowflakeAdapter(WarehouseAdapter):
         conn_id: str,
         table_fqn: str,
         execution_ts: str,
+        run_group_id: str,
         rows: list[dict[str, str]],
+        chunk_key: str = "full",
     ) -> None:
         if not rows:
             return
@@ -256,11 +277,11 @@ class SnowflakeAdapter(WarehouseAdapter):
 
         # Snowflake's connector uses pyformat (``%(name)s``) parameter binding.
         selects: list[str] = []
-        params: dict[str, str] = {"e": execution_ts}
+        params: dict[str, str] = {"e": execution_ts, "rg": run_group_id, "ck": chunk_key}
         for i, row in enumerate(rows):
             selects.append(
-                f"SELECT %(m{i})s AS model_name, %(e)s AS execution_ts, "
-                f"%(s{i})s AS status, CURRENT_TIMESTAMP() AS updated_at"
+                f"SELECT %(m{i})s AS model_name, %(e)s AS execution_ts, %(s{i})s AS status, "
+                f"%(rg)s AS run_group_id, %(ck)s AS chunk_key, CURRENT_TIMESTAMP() AS updated_at"
             )
             params[f"m{i}"] = row["model_name"]
             params[f"s{i}"] = row["status"]
