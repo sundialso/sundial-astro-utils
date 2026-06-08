@@ -46,9 +46,12 @@ Per model, both Airflow run and test states are inspected:
   - tests-only invocation, test success, no/skipped run            → ``succeeded``
   - anything still in-flight or skipped                            → no row
 
-Same three-column MERGE key as the dbt macro
-(``model_name + execution_ts + status``) — idempotent against any concurrent
-or repeated writes.
+Same MERGE key as the dbt macros — ``model_name + execution_ts + status +
+run_group_id + chunk_key`` — idempotent against any concurrent or repeated
+writes. The ``run_group_id`` (from the run's dbt vars / Airflow run_id) ties the
+reconciliation row to the run's other rows so the ``dbt_completions`` view, which
+picks a winning run_group and rolls status up per chunk, reads it correctly;
+``chunk_key`` is ``"full"`` for non-chunked models (all current tenants).
 """
 from __future__ import annotations
 
@@ -188,6 +191,7 @@ class _CompletionsTarget:
     adapter: WarehouseAdapter
     table_fqn: str
     execution_ts: str
+    run_group_id: str
 
 
 def _get_completions_target(dag_run: Any) -> _CompletionsTarget | None:
@@ -235,7 +239,14 @@ def _get_completions_target(dag_run: Any) -> _CompletionsTarget | None:
     table_fqn = adapter.build_table_fqn(dbt_vars, COMPLETIONS_TABLE)
     if not table_fqn:
         return None
-    return _CompletionsTarget(adapter, table_fqn, execution_ts)
+    # run_group_id ties the reconciliation row to the run's other rows. dbt sets it
+    # from the Airflow run_id (dag_factory), so it's in the same vars blob; fall back
+    # to dag_run.run_id for runs whose XCom predates run_group_id. Required: a row
+    # without it would be dropped by the view's run_group join (see _merge_sql).
+    run_group_id = dbt_vars.get("run_group_id") or getattr(dag_run, "run_id", None)
+    if not run_group_id:
+        return None
+    return _CompletionsTarget(adapter, table_fqn, execution_ts, run_group_id)
 
 
 def _parse_model_task(task_id: str) -> tuple[str, str] | None:
@@ -394,6 +405,7 @@ def reconcile_model(task_instance: Any) -> None:
             target.adapter.resolve_conn_id(),
             target.table_fqn,
             target.execution_ts,
+            target.run_group_id,
             [{"model_name": model_name, "status": status}],
         )
     except Exception:
