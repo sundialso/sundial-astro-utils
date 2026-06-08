@@ -42,7 +42,7 @@ from sundial_airflow.backfill.manifest_parser import (
 from sundial_airflow.chunking.graph import build_chunked_model_graph
 from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.target import ensure_chunk_target
-from sundial_airflow.chunking.watermarks import fetch_watermark_ends
+from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
@@ -251,6 +251,8 @@ def make_dbt_dag(
 
             if default_project:
                 dbt_vars["target_project"] = default_project
+                if warehouse == "snowflake":
+                    dbt_vars["target_database"] = default_project
 
             dbt_vars["execution_ts"] = (
                 params.get("execution_ts")
@@ -375,16 +377,16 @@ def make_dbt_dag(
                         if v.name in selected_models
                     }
                 watermark_models = [
-                    m.name for m in plan_models.values() if m.kind == CHUNKED
+                    m for m in plan_models.values() if m.kind == CHUNKED
                 ]
                 watermark_vars = dict(dbt_vars)
                 if chunk_target_dataset_or_schema:
                     watermark_vars[vars_field] = chunk_target_dataset_or_schema
-                watermarks = fetch_watermark_ends(
+                watermarks = fetch_partition_watermarks(
                     warehouse=warehouse,
                     conn_id=warehouse_conn_id,
                     dbt_vars=watermark_vars,
-                    model_names=watermark_models,
+                    models=watermark_models,
                 )
                 plans = build_run_plan(
                     models=plan_models,
@@ -393,6 +395,15 @@ def make_dbt_dag(
                     execution_ts=execution_date,
                 )
                 run_plan = serialize_run_plan(plans)
+                for name, wm in watermarks.items():
+                    plan = run_plan.get(name, {})
+                    logger.info(
+                        "Run plan summary: %s watermark=%s disposition=%s chunks=%d",
+                        name,
+                        wm,
+                        plan.get("disposition"),
+                        len(plan.get("chunks") or []),
+                    )
 
             chunked_vars = dict(dbt_vars)
             if chunk_target_dataset_or_schema:

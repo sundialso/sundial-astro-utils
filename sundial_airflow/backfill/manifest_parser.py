@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 CHUNKED = "chunked"
 FULL_REFRESH = "full_refresh"
 
+_START_TS_PARTITION_RE = re.compile(
+    r"""start_ts\s*\(\s*['"]([^'"]+)['"]\s*,""",
+)
 _START_TS_RE = re.compile(
     r"""start_ts\s*\(
         \s*[^,]+,
@@ -39,6 +42,8 @@ class BackfillModel:
     first_timestamp: Optional[date]
     depends_on: list[str]
     chunk_months: Optional[int] = None
+    partition_column: Optional[str] = None
+    table_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +120,8 @@ def load_backfill_models(
                 d for d in node.get("depends_on", {}).get("nodes", [])
                 if d.startswith("model.")
             ],
+            partition_column=_extract_partition_column(raw_sql),
+            table_name=node.get("alias") or node["name"],
         )
 
     promoted = _apply_chunking_config(models, chunking_config or {})
@@ -199,6 +206,14 @@ def _is_eligible(node: dict) -> bool:
     if node.get("resource_type") != "model":
         return False
     return (node.get("config") or {}).get("materialized") != "ephemeral"
+
+
+def _extract_partition_column(raw_sql: str) -> Optional[str]:
+    """Return the partition column from the first ``start_ts()`` call."""
+    sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
+    sql = _LINE_COMMENT_RE.sub("", sql)
+    match = _START_TS_PARTITION_RE.search(sql)
+    return match.group(1) if match else None
 
 
 def _extract_first_timestamp(raw_sql: str) -> Optional[date]:

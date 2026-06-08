@@ -90,9 +90,25 @@ def build_chunked_model_graph(
         """Return active chunk windows from the run plan."""
         prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
         plan = (prep.get("run_plan") or {}).get(model_name)
-        if not plan or plan.get("disposition") != "chunked":
+        if not plan:
+            logger.warning("No run plan for %r in prepare xcom.", model_name)
             return []
-        return list(plan.get("chunks") or [])
+        disposition = plan.get("disposition")
+        chunks = list(plan.get("chunks") or [])
+        if disposition != "chunked":
+            logger.info(
+                "plan_chunks %r: disposition=%s → 0 mapped tasks (use run_incremental)",
+                model_name,
+                disposition,
+            )
+            return []
+        logger.info(
+            "plan_chunks %r: %d chunk(s): %s",
+            model_name,
+            len(chunks),
+            ", ".join(c["chunk_id"] for c in chunks),
+        )
+        return chunks
 
     @task(
         trigger_rule="none_failed",
@@ -139,12 +155,15 @@ def build_chunked_model_graph(
             planned = _plan_chunks.override(task_id="plan_chunks")(
                 model_name=model.name,
             )
-            mapped_chunks = _run_chunk.partial(model_name=model.name).expand(
-                chunk_spec=planned,
+            mapped_chunks = (
+                _run_chunk.override(task_id="run_chunk")
+                .partial(model_name=model.name)
+                .expand(chunk_spec=planned)
             )
             incremental = _run_incremental.override(task_id="run_incremental")(
                 model_name=model.name,
             )
+            upstream_task >> planned
 
             test_task = DbtTestLocalOperator(
                 task_id="test",

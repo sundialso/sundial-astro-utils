@@ -1,74 +1,98 @@
-"""Batch watermark reads from ``dbt_completions_raw``."""
+"""Batch watermark reads from model partition columns."""
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
-from sundial_airflow.warehouses import WarehouseAdapter, get_adapter
+from sundial_airflow.backfill.manifest_parser import BackfillModel
+from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
 
-# Keep in sync with ``sundial_dbt_shared/macros/dbt_completions.sql :: read_watermark``.
-_INCOMPLETE_RUN_GROUP = """
-    SELECT 1
-    FROM {table} u
-    WHERE u.model_name = w.model_name
-      AND u.run_group_id = w.run_group_id
-      AND u.status = 'started'
-      AND NOT EXISTS (
-        SELECT 1 FROM {table} s
-        WHERE s.model_name = u.model_name
-          AND s.run_group_id = u.run_group_id
-          AND s.chunk_key = u.chunk_key
-          AND s.status = 'succeeded'
-      )
-"""
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def watermark_batch_sql(table_fqn: str, placeholder_style: str) -> str:
-    """Build a grouped watermark query for the given bind style."""
-    if placeholder_style == "bigquery":
-        model_filter = "w.model_name IN UNNEST(@models)"
-    else:
-        model_filter = "w.model_name IN (%(models)s)"
-    incomplete = _INCOMPLETE_RUN_GROUP.format(table=table_fqn)
-    return f"""
-    SELECT w.model_name, MAX(w.end_ts) AS watermark_end
-    FROM {table_fqn} w
-    WHERE {model_filter}
-      AND w.status = 'started'
-      AND w.end_ts IS NOT NULL
-      AND NOT EXISTS ({incomplete})
-    GROUP BY w.model_name
-    """
+def _validate_ident(name: str, label: str) -> str:
+    if not isinstance(name, str) or not _IDENT_RE.match(name):
+        raise ValueError(
+            f"Invalid {label} {name!r}: must match {_IDENT_RE.pattern!r}."
+        )
+    return name
 
 
-def fetch_watermark_ends(
+def partition_watermark_sql(table_fqn: str, partition_column: str) -> str:
+    """Build a MAX(partition_column) query for one model table."""
+    col = _validate_ident(partition_column, "partition column")
+    return f"SELECT MAX({col}) FROM {table_fqn}"
+
+
+def fetch_partition_watermarks(
     *,
     warehouse: str,
     conn_id: str | None,
     dbt_vars: dict[str, Any],
-    model_names: list[str],
+    models: list[BackfillModel],
 ) -> dict[str, datetime | None]:
-    """Return the latest complete watermark ``end_ts`` per model."""
-    if not model_names:
-        return {}
+    """Return the latest partition value per chunked model from its target table."""
     adapter = get_adapter(warehouse)
     if adapter is None:
         logger.warning("No warehouse adapter for %r; watermarks unavailable.", warehouse)
         return {}
-    conn_id = conn_id or adapter.resolve_conn_id()
-    table_fqn = adapter.build_table_fqn(dbt_vars, "dbt_completions_raw")
-    if not table_fqn:
-        logger.warning("Cannot resolve dbt_completions_raw FQN; watermarks unavailable.")
-        return {}
 
-    if warehouse == "bigquery":
-        return _fetch_bigquery(conn_id, table_fqn, model_names)
+    conn_id = conn_id or adapter.resolve_conn_id()
+    watermarks: dict[str, datetime | None] = {}
+    for model in models:
+        if model.kind != CHUNKED:
+            continue
+        if not model.partition_column:
+            logger.warning(
+                "Model %r has no start_ts() partition column; treating as first run.",
+                model.name,
+            )
+            watermarks[model.name] = None
+            continue
+
+        table_name = model.table_name or model.name
+        table_fqn = adapter.build_table_fqn(dbt_vars, table_name)
+        if not table_fqn:
+            logger.warning(
+                "Cannot resolve table FQN for %r; treating as first run.",
+                model.name,
+            )
+            watermarks[model.name] = None
+            continue
+
+        watermark = _fetch_one(
+            warehouse=warehouse,
+            conn_id=conn_id,
+            table_fqn=table_fqn,
+            partition_column=model.partition_column,
+        )
+        watermarks[model.name] = watermark
+        logger.info(
+            "Partition watermark for %r: %s (table=%s, column=%s)",
+            model.name,
+            watermark,
+            table_fqn,
+            model.partition_column,
+        )
+    return watermarks
+
+
+def _fetch_one(
+    *,
+    warehouse: str,
+    conn_id: str,
+    table_fqn: str,
+    partition_column: str,
+) -> datetime | None:
     if warehouse == "snowflake":
-        return _fetch_snowflake(conn_id, table_fqn, model_names)
-    return {}
+        return _fetch_snowflake(conn_id, table_fqn, partition_column)
+    if warehouse == "bigquery":
+        return _fetch_bigquery(conn_id, table_fqn, partition_column)
+    return None
 
 
 def _parse_watermark(value: Any) -> datetime | None:
@@ -83,42 +107,61 @@ def _parse_watermark(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value)[:10])
 
 
-def _fetch_bigquery(
-    conn_id: str, table_fqn: str, model_names: list[str],
-) -> dict[str, datetime | None]:
-    try:
-        from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-        from google.cloud.bigquery import ArrayQueryParameter, QueryJobConfig
-    except ImportError:
-        logger.warning("apache-airflow-providers-google not installed.")
-        return {}
-
-    sql = watermark_batch_sql(table_fqn, "bigquery")
-    hook = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
-    job = hook.get_client().query(
-        sql,
-        job_config=QueryJobConfig(
-            query_parameters=[ArrayQueryParameter("models", "STRING", model_names)],
-        ),
+def _is_missing_table_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "does not exist" in message
+        or "not authorized" in message and "object" in message
+        or "002003" in message
+        or "object not found" in message
     )
-    return {row.model_name: _parse_watermark(row.watermark_end) for row in job.result()}
 
 
 def _fetch_snowflake(
-    conn_id: str, table_fqn: str, model_names: list[str],
-) -> dict[str, datetime | None]:
+    conn_id: str,
+    table_fqn: str,
+    partition_column: str,
+) -> datetime | None:
     try:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
     except ImportError:
         logger.warning("apache-airflow-providers-snowflake not installed.")
-        return {}
+        return None
 
-    placeholders = ", ".join(f"%(m{i})s" for i in range(len(model_names)))
-    sql = watermark_batch_sql(table_fqn, "snowflake").replace(
-        "w.model_name IN (%(models)s)",
-        f"w.model_name IN ({placeholders})",
-    )
-    params = {f"m{i}": name for i, name in enumerate(model_names)}
+    sql = partition_watermark_sql(table_fqn, partition_column)
     hook = SnowflakeHook(snowflake_conn_id=conn_id)
-    rows = hook.get_records(sql, parameters=params)
-    return {row[0]: _parse_watermark(row[1]) for row in rows}
+    try:
+        rows = hook.get_records(sql)
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            logger.info("Partition watermark table %s not found; first run.", table_fqn)
+            return None
+        raise
+    if not rows or rows[0][0] is None:
+        return None
+    return _parse_watermark(rows[0][0])
+
+
+def _fetch_bigquery(
+    conn_id: str,
+    table_fqn: str,
+    partition_column: str,
+) -> datetime | None:
+    try:
+        from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+    except ImportError:
+        logger.warning("apache-airflow-providers-google not installed.")
+        return None
+
+    sql = partition_watermark_sql(table_fqn, partition_column)
+    hook = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
+    try:
+        rows = list(hook.get_client().query(sql).result())
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            logger.info("Partition watermark table %s not found; first run.", table_fqn)
+            return None
+        raise
+    if not rows or rows[0][0] is None:
+        return None
+    return _parse_watermark(rows[0][0])
