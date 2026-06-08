@@ -33,6 +33,15 @@ from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
 from cosmos.constants import TestBehavior
 from cosmos.operators.local import DbtTestLocalOperator
 
+from sundial_airflow.backfill.manifest_parser import (
+    CHUNKED,
+    load_backfill_models,
+    load_chunking_config,
+    topological_order,
+)
+from sundial_airflow.chunking.graph import build_chunked_model_graph
+from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.watermarks import fetch_watermark_ends
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
@@ -121,6 +130,9 @@ def make_dbt_dag(
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
+    chunking_config_path: str | Path | None = None,
+    warehouse_conn_id: str | None = None,
+    chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -197,6 +209,21 @@ def make_dbt_dag(
         recursive_tests=recursive_tests,
     )
     source_to_models = discover_source_to_models(project_path_str)
+
+    manifest_path = Path(project_path_str) / "target" / "manifest.json"
+    _chunk_models: dict = {}
+    _chunk_order: list = []
+    _chunked_names: list[str] = []
+    if chunking_config_path is not None:
+        try:
+            _chunk_config = load_chunking_config(chunking_config_path)
+            _chunk_models = load_backfill_models(manifest_path, _chunk_config)
+            _chunk_order = topological_order(_chunk_models) if _chunk_models else []
+            _chunked_names = [m.name for m in _chunk_order if m.kind == CHUNKED]
+        except Exception as exc:
+            logger.warning(
+                "Chunking config parse failed for DAG %r: %s", dag_id, exc,
+            )
 
     @dag(
         dag_id=dag_id,
@@ -326,6 +353,33 @@ def make_dbt_dag(
                     sorted(selected_models),
                 )
 
+            run_plan: dict = {}
+            if _chunked_names:
+                exec_raw = dbt_vars.get("execution_ts") or _dt.date.today().isoformat()
+                execution_date = _dt.date.fromisoformat(str(exec_raw)[:10])
+                plan_models = _chunk_models
+                if selected_models is not None:
+                    plan_models = {
+                        k: v for k, v in _chunk_models.items()
+                        if v.name in selected_models
+                    }
+                watermark_models = [
+                    m.name for m in plan_models.values() if m.kind == CHUNKED
+                ]
+                watermarks = fetch_watermark_ends(
+                    warehouse=warehouse,
+                    conn_id=warehouse_conn_id,
+                    dbt_vars=dbt_vars,
+                    model_names=watermark_models,
+                )
+                plans = build_run_plan(
+                    models=plan_models,
+                    watermarks=watermarks,
+                    backfill_mode=backfill_mode,
+                    execution_ts=execution_date,
+                )
+                run_plan = serialize_run_plan(plans)
+
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
@@ -335,6 +389,7 @@ def make_dbt_dag(
                 "selected_models": selected_models,
                 "run_context": run_context,
                 "run_context_tag": run_context_tag,
+                "run_plan": run_plan,
             }
 
         dbt_args = prepare_dbt_args()
@@ -362,7 +417,10 @@ def make_dbt_dag(
                     pre_execute=make_source_test_skip_hook(dependents),
                 )
 
-        manifest_path = Path(project_path_str) / "target" / "manifest.json"
+        cosmos_render = RenderConfig(
+            test_behavior=TestBehavior.AFTER_EACH,
+            exclude=_chunked_names or None,
+        )
         dbt_models = DbtTaskGroup(
             group_id="dbt_models",
             project_config=ProjectConfig(
@@ -371,7 +429,7 @@ def make_dbt_dag(
             ),
             profile_config=profile_config,
             execution_config=venv_execution_config,
-            render_config=RenderConfig(test_behavior=TestBehavior.AFTER_EACH),
+            render_config=cosmos_render,
             operator_args={
                 "vars": (
                     "{{ ti.xcom_pull(task_ids='"
@@ -413,9 +471,51 @@ def make_dbt_dag(
         dbt_args >> source_test_group
         dbt_args >> dbt_models
 
-        run_tasks_by_model = _collect_run_tasks(dbt_models)
+        cosmos_runs = _collect_run_tasks(dbt_models)
+        run_tasks_by_model = dict(cosmos_runs)
+        chunk_groups: dict[str, Any] = {}
+        chunk_tests: dict[str, Any] = {}
+
+        if _chunk_order:
+            chunk_groups, chunk_tests = build_chunked_model_graph(
+                order=_chunk_order,
+                project_path_str=project_path_str,
+                dbt_executable=dbt_executable,
+                dbt_profile_name=dbt_profile_name,
+                profile_config=profile_config,
+                profile_config_factory=profile_config_factory,
+                chunk_var_keys=chunk_var_keys,
+                upstream_task=dbt_args,
+            )
+            models_by_key = {m.node_key: m for m in _chunk_order}
+
+            for chunked in _chunk_order:
+                if chunked.kind != CHUNKED or chunked.name not in chunk_groups:
+                    continue
+                tg = chunk_groups[chunked.name]
+                for dep_key in chunked.depends_on:
+                    dep = models_by_key.get(dep_key)
+                    if dep is None or dep.name in chunk_groups:
+                        continue
+                    cosmos_run = cosmos_runs.get(dep.name)
+                    if cosmos_run is not None:
+                        cosmos_run >> tg
+
+            for model in _chunk_order:
+                cosmos_run = cosmos_runs.get(model.name)
+                if cosmos_run is None:
+                    continue
+                for dep_key in model.depends_on:
+                    dep = models_by_key.get(dep_key)
+                    if dep is None or dep.name not in chunk_tests:
+                        continue
+                    chunk_tests[dep.name] >> cosmos_run
+
         for (source_name, table_name), test_task in source_test_tasks.items():
             for model_name in source_to_models.get((source_name, table_name), ()):
+                if model_name in chunk_groups:
+                    test_task >> chunk_groups[model_name]
+                    continue
                 run_task = run_tasks_by_model.get(model_name)
                 if run_task is None:
                     logger.warning(

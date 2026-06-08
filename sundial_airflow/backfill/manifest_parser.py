@@ -170,10 +170,28 @@ def compute_static_chunks(
     for m in models.values():
         if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
             continue
-        out[m.name] = [
-            (s, e, s.strftime("%Y-%m"))
-            for s, e in _generate_chunks(m.first_timestamp, m.chunk_months, today)
-        ]
+        out[m.name] = chunk_windows_from_anchor(
+            m.first_timestamp, m.chunk_months, m.first_timestamp, today,
+        )
+    return out
+
+
+def chunk_windows_from_anchor(
+    anchor: date,
+    chunk_months: int,
+    range_start: date,
+    range_end: date,
+) -> list[tuple[date, date, str]]:
+    """Return aligned chunk windows overlapping ``[range_start, range_end)``."""
+    if range_end <= range_start or chunk_months < 1:
+        return []
+    out: list[tuple[date, date, str]] = []
+    for start, end in _generate_chunks(anchor, chunk_months, range_end):
+        if start >= range_end or end <= range_start:
+            continue
+        win_start = max(start, range_start)
+        win_end = min(end, range_end)
+        out.append((win_start, win_end, start.strftime("%Y-%m")))
     return out
 
 

@@ -96,3 +96,60 @@ def skip_unselected(context) -> None:
 
     if model_name not in selected_models:
         raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
+
+def _chunked_run_plan(context, model_name: str) -> dict | None:
+    """Load the run-plan entry for one chunked model."""
+    prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+    return (prep.get("run_plan") or {}).get(model_name)
+
+
+def skip_chunked_run(context, model_name: str) -> None:
+    """Skip a mapped chunk run when tests/empty mode is on or model is unselected."""
+    params = context.get("params", {})
+    if params.get("skip_tests") or params.get("empty"):
+        raise AirflowSkipException("Skipped (skip_tests or empty mode)")
+
+    prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+    selected_models = prep.get("selected_models")
+    if selected_models is not None and model_name not in selected_models:
+        raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
+    if _chunked_run_plan(context, model_name) is None:
+        raise AirflowSkipException(f"No run plan for '{model_name}'")
+
+
+def skip_chunked_incremental(context, model_name: str) -> None:
+    """Skip incremental run when the plan selected chunked mode."""
+    params = context.get("params", {})
+    if params.get("skip_tests") or params.get("empty"):
+        raise AirflowSkipException("Skipped (skip_tests or empty mode)")
+
+    prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+    selected_models = prep.get("selected_models")
+    if selected_models is not None and model_name not in selected_models:
+        raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
+    plan = _chunked_run_plan(context, model_name)
+    if plan is None:
+        raise AirflowSkipException(f"No run plan for '{model_name}'")
+    if plan.get("disposition") != "single":
+        raise AirflowSkipException(
+            f"Incremental run skipped for '{model_name}' "
+            f"(disposition={plan.get('disposition')})"
+        )
+
+
+def skip_chunked_model_test(context, model_name: str) -> None:
+    """Skip chunked-model tests when tests are off or the model is unselected."""
+    params = context.get("params", {})
+    if params.get("skip_tests") or params.get("empty"):
+        raise AirflowSkipException("Tests skipped (skip_tests or empty mode)")
+
+    prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+    selected_models = prep.get("selected_models")
+    if selected_models is not None and model_name not in selected_models:
+        raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
+    if model_name not in (prep.get("run_plan") or {}):
+        raise AirflowSkipException(f"No run plan for '{model_name}'")
