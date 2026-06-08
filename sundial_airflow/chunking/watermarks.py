@@ -44,8 +44,6 @@ def fetch_partition_watermarks(
     conn_id = conn_id or adapter.resolve_conn_id()
     watermarks: dict[str, datetime | None] = {}
     for model in models:
-        if model.kind != CHUNKED:
-            continue
         if not model.partition_column:
             logger.warning(
                 "Model %r has no start_ts() partition column; treating as first run.",
