@@ -176,9 +176,10 @@ auditing entirely.
 - **`select` Param.** Operators can scope a run to a dbt-style selector
   (`model+`, `+model+`, etc.) at trigger time; unselected models skip
   via `trigger_rule="none_failed"` without breaking downstream tasks.
-- **Audit trail.** Each successful task writes one row to
-  `<audit_schema>.BACKFILL_AUDIT` (auto-created). Reporting is
-  ad-hoc — operators run `dbt run-operation backfill_report` (or
+- **Audit trail.** Each successful task writes one row to the warehouse
+  audit table (Snowflake: `<AUDIT_SCHEMA>.BACKFILL_AUDIT`; BigQuery:
+  `` `<project>.<dataset>.backfill_audit` ``). Reporting is ad-hoc —
+  operators run `dbt run-operation backfill_report` (or
   `backfill_warehouse_report`) against the audit table after the run
   completes.
 - **Manual only.** `schedule=None`, `max_active_runs=1`.

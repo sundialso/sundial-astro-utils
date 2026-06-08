@@ -1,10 +1,4 @@
-"""Parse dbt ``manifest.json`` + tenant chunking config into a backfill graph.
-
-Models default to ``FULL_REFRESH``; a model is promoted to ``CHUNKED``
-only if ``chunking_config.json`` opts it in with a positive
-``chunk_size`` AND its SQL contains a parseable ``start_ts()`` call.
-``config.meta.backfill_disabled: true`` opts a model out entirely.
-"""
+"""Parse manifest.json and chunking config into a backfill graph."""
 from __future__ import annotations
 
 import json
@@ -22,8 +16,6 @@ logger = logging.getLogger(__name__)
 CHUNKED = "chunked"
 FULL_REFRESH = "full_refresh"
 
-# Matches the third positional argument of `start_ts(col, lookback, 'first_ts')`.
-# Whitespace-tolerant; matches both quote styles; spans newlines.
 _START_TS_RE = re.compile(
     r"""start_ts\s*\(
         \s*[^,]+,
@@ -39,7 +31,7 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 @dataclass
 class BackfillModel:
-    """A dbt model in the backfill DAG. ``chunk_months`` is set iff ``kind == CHUNKED``."""
+    """One dbt model in the backfill DAG."""
 
     node_key: str
     name: str
@@ -51,23 +43,17 @@ class BackfillModel:
 
 @dataclass(frozen=True)
 class ChunkingConfigEntry:
-    """One entry in ``chunking_config.json``."""
+    """One chunking_config.json entry."""
 
     model_name: str
     chunking_enabled: bool
     chunk_size: Optional[int] = None
 
 
-# ── Public API ────────────────────────────────────────────────────────────
-
 def load_chunking_config(
     config_path: str | Path | None,
 ) -> dict[str, ChunkingConfigEntry]:
-    """Load and validate ``chunking_config.json`` → ``{model_name -> entry}``.
-
-    Fail-soft: missing file, bad JSON, or malformed entries log a
-    warning and are dropped — never raised. Duplicates: last wins.
-    """
+    """Load chunking_config.json as {model_name: entry}."""
     if config_path is None:
         return {}
     path = Path(config_path)
@@ -107,11 +93,7 @@ def load_backfill_models(
     manifest_path: str | Path,
     chunking_config: dict[str, ChunkingConfigEntry] | None = None,
 ) -> dict[str, BackfillModel]:
-    """Discover eligible models from ``manifest.json`` and apply chunking config.
-
-    Returns ``{node_key -> BackfillModel}`` where ``node_key`` is the
-    full dbt key ``"model.<project>.<name>"``.
-    """
+    """Load eligible manifest models and apply chunking config."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     models: dict[str, BackfillModel] = {}
     opted_out = 0
@@ -150,10 +132,7 @@ def load_backfill_models(
 def topological_order(
     models: dict[str, BackfillModel],
 ) -> list[BackfillModel]:
-    """Return models in upstream-first topological order (name-sorted within layers).
-
-    Raises ``ValueError`` on cycles.
-    """
+    """Return models in upstream-first topological order."""
     remaining = set(models.keys())
     completed: set[str] = set()
     ordered: list[BackfillModel] = []
@@ -186,10 +165,7 @@ def compute_static_chunks(
     models: dict[str, BackfillModel],
     today: date,
 ) -> dict[str, list[tuple[date, date, str]]]:
-    """Static ``(start, end, "YYYY-MM")`` chunk list per ``CHUNKED`` model.
-
-    Called once at DAG parse time; each tuple becomes one ``chunk_<YYYY-MM>`` task.
-    """
+    """Return static (start, end, chunk_id) windows per chunked model."""
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
         if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
@@ -201,8 +177,6 @@ def compute_static_chunks(
     return out
 
 
-# ── Internals ─────────────────────────────────────────────────────────────
-
 def _is_eligible(node: dict) -> bool:
     if node.get("resource_type") != "model":
         return False
@@ -210,11 +184,7 @@ def _is_eligible(node: dict) -> bool:
 
 
 def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
-    """Earliest ``first_timestamp`` from any ``start_ts()`` call in ``raw_sql``.
-
-    Comments are stripped first; when multiple calls are present the earliest wins
-    so the backfill window covers every required range.
-    """
+    """Return the earliest start_ts() anchor date from model SQL."""
     sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
     sql = _LINE_COMMENT_RE.sub("", sql)
     parsed: list[date] = []
@@ -229,7 +199,7 @@ def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
 
 
 def _parse_config_entry(item: object, idx: int) -> Optional[ChunkingConfigEntry]:
-    """Validate one config entry; return None (with a warning) if malformed."""
+    """Parse one chunking config entry."""
     if not isinstance(item, dict):
         logger.warning(
             "Chunking config entry #%d is not an object — skipped.", idx,
@@ -272,7 +242,7 @@ def _apply_chunking_config(
     models: dict[str, BackfillModel],
     config: dict[str, ChunkingConfigEntry],
 ) -> int:
-    """Promote eligible models from FULL_REFRESH → CHUNKED. Returns count promoted."""
+    """Promote configured models to CHUNKED."""
     by_name = {m.name: m for m in models.values()}
     promoted = 0
     for cfg_name, entry in config.items():
@@ -315,7 +285,7 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Non-overlapping contiguous windows from ``first_timestamp`` to ``today``."""
+    """Build contiguous month windows from first_timestamp through today."""
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"

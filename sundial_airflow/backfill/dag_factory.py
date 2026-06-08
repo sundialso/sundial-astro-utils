@@ -1,15 +1,4 @@
-"""``make_backfill_dag`` — lineage-preserving chunked backfill DAG factory.
-
-Reads ``target/manifest.json``, classifies each eligible model as
-``CHUNKED`` (per ``chunking_config.json``) or ``FULL_REFRESH``,
-topologically sorts them, and emits a DAG that mirrors the dbt lineage
-one TaskGroup per model. ``CHUNKED`` groups expand into static
-``chunk_<YYYY-MM>`` tasks; ``FULL_REFRESH`` groups are a single ``run``
-task. Every successful task writes to ``<audit_schema>.BACKFILL_AUDIT``;
-reports are ad-hoc (``dbt run-operation backfill_report``).
-
-See ``<tenant>_dbt/BACKFILL.md`` for the operator runbook.
-"""
+"""Chunked backfill DAG factory."""
 from __future__ import annotations
 
 import datetime as _dt
@@ -28,7 +17,7 @@ from airflow.models.param import Param
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 
-from . import _audit
+from ._audit import create_audit_writer
 from .manifest_parser import (
     CHUNKED,
     FULL_REFRESH,
@@ -73,8 +62,7 @@ def make_backfill_dag(
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
     max_active_tasks: int = 16,
 ) -> Any:
-    """Build and register a lineage-preserving chunked backfill DAG.
-    """
+    """Build and register a chunked backfill DAG."""
     warehouse = warehouse.lower()
     if warehouse not in ("snowflake", "bigquery"):
         raise ValueError(
@@ -88,9 +76,6 @@ def make_backfill_dag(
     tags = ["dbt", "backfill", f"tenant:{tenant}", *(extra_tags or [])]
     merged_default_args = {**_DEFAULT_ARGS, **(default_args or {})}
 
-    # ── Parse manifest at DAG-parse time. Cheap (single JSON load + sort);
-    #    re-runs every scheduler cycle so today's date and any chunking-
-    #    config edits flow through automatically.
     try:
         _config = load_chunking_config(chunking_config_path)
         _models = load_backfill_models(manifest_path, _config)
@@ -98,13 +83,13 @@ def make_backfill_dag(
         _static_chunks = (
             compute_static_chunks(_models, _dt.date.today()) if _models else {}
         )
-    except Exception as exc:  # missing/malformed manifest, cycle, etc.
+    except Exception as exc:
         logger.warning(
             "Backfill manifest parse failed for DAG %r: %s. "
             "Run `dbt compile` to regenerate manifest.json.",
             dag_id, exc,
         )
-        _models, _order, _static_chunks = {}, [], {}
+        _order, _static_chunks = [], {}
 
     if _order:
         chunk_total = sum(len(v) for v in _static_chunks.values())
@@ -196,41 +181,27 @@ def make_backfill_dag(
                     f"dbt run failed for {model_name} (exit={result.returncode})"
                 )
 
-        def _audit_writer() -> _audit.AuditWriter:
-            if warehouse == "bigquery":
-                from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
-                hook = BigQueryHook(
-                    gcp_conn_id=warehouse_conn_id,
-                    location=bq_location,
-                    use_legacy_sql=False,
-                )
-                return _audit.BigQueryAuditWriter(
-                    hook,
-                    project_id=bq_audit_project,
-                    create_dataset=bq_audit_create_dataset,
-                )
-            from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-            return _audit.SnowflakeAuditWriter(
-                SnowflakeHook(snowflake_conn_id=warehouse_conn_id)
+        def _audit_writer():
+            return create_audit_writer(
+                warehouse,
+                warehouse_conn_id=warehouse_conn_id,
+                bq_location=bq_location,
+                bq_audit_project=bq_audit_project,
+                bq_audit_create_dataset=bq_audit_create_dataset,
             )
 
-        # ── One-time `dbt deps` install before any model task ────────────
         @task(task_id="install_deps")
         def _install_deps(**_: Any) -> None:
-            """Resolve dbt package dependencies once per DAG run."""
+            """Install dbt package dependencies."""
             result = _invoke(["deps"], "dbt deps")
             if result.returncode != 0:
                 raise RuntimeError(f"dbt deps failed (exit={result.returncode})")
 
         deps_task = _install_deps()
 
-        # ── Central planning: resolve `select` Param + broadcast plan ────
         @task(task_id="process_chunking_config")
         def _process_chunking_config(**context: Any) -> dict[str, Any]:
-            """Resolve the ``select`` Param and broadcast the run plan via XCom.
-
-            Returns ``{selected, kind, chunk_counts}``; ``selected=None`` means run-all.
-            """
+            """Resolve the select param and publish the run plan to XCom."""
             select_expr = (context["params"].get("select") or "").strip()
             if not select_expr:
                 logger.info("`select` param empty → running every eligible model.")
@@ -292,7 +263,6 @@ def make_backfill_dag(
         chunking_task = _process_chunking_config()
         deps_task >> chunking_task  # type: ignore[operator]
 
-        # ── Worker: one task per (model, chunk window) ───────────────────
         @task(trigger_rule="none_failed")
         def _run_chunk(
             model_name: str,
@@ -302,7 +272,7 @@ def make_backfill_dag(
             chunk_months: int,
             **context: Any,
         ) -> dict[str, Any]:
-            """Run one chunk window for ``model_name`` and audit it."""
+            """Run one chunk window and record audit metadata."""
             plan = context["ti"].xcom_pull(task_ids="process_chunking_config") or {}
             selected = plan.get("selected")
             if selected is not None and model_name not in selected:
@@ -340,10 +310,9 @@ def make_backfill_dag(
                 "chunk_months": chunk_months,
             }
 
-        # ── Worker: single dbt run per full-refresh model ────────────────
         @task(trigger_rule="none_failed")
         def _run_full_refresh(model_name: str, **context: Any) -> dict[str, Any]:
-            """Run ``dbt run --select <model>`` once and audit it."""
+            """Run one full-refresh model and record audit metadata."""
             plan = context["ti"].xcom_pull(task_ids="process_chunking_config") or {}
             selected = plan.get("selected")
             if selected is not None and model_name not in selected:
@@ -370,7 +339,6 @@ def make_backfill_dag(
                 )
             return {"model": model_name, "kind": "full_refresh"}
 
-        # ── Build per-model TaskGroups in topological order ──────────────
         models_by_node_key = {m.node_key: m for m in _order}
         model_groups: dict[str, TaskGroup] = {}
 

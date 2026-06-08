@@ -1,24 +1,27 @@
-"""Snowflake ``BACKFILL_AUDIT`` writer."""
+"""Snowflake BACKFILL_AUDIT writer."""
 from __future__ import annotations
 
 from typing import Any
 
-from ._base import AUDIT_TABLE, AuditWriter
+from ._base import AuditWriter
 
 
 class SnowflakeAuditWriter(AuditWriter):
-    """Writes ``BACKFILL_AUDIT`` via a ``SnowflakeHook``."""
+    """Execute BACKFILL_AUDIT DDL/DML through a SnowflakeHook."""
 
-    # Snowflake's connector uses pyformat and binds Python date/datetime/int
-    # values natively — no inline casts needed.
+    AUDIT_TABLE = "BACKFILL_AUDIT"
     _bind_replacement = r"%(\1)s"
 
-    def _execute(self, sql: str, params: dict[str, Any] | None = None) -> None:
-        self._hook.run(self._render(sql), parameters=params or None)
+    def _audit_table_ref(self, audit_schema: str) -> str:
+        return f"{audit_schema.upper()}.{self.AUDIT_TABLE}"
+
+    def _create_schema_sql(self, audit_schema: str) -> str:
+        return f"CREATE SCHEMA IF NOT EXISTS {audit_schema.upper()}"
 
     def _create_table_sql(self, audit_schema: str) -> str:
+        table = self._audit_table_ref(audit_schema)
         return f"""
-            CREATE TABLE IF NOT EXISTS {audit_schema}.{AUDIT_TABLE} (
+            CREATE TABLE IF NOT EXISTS {table} (
                 model_name      VARCHAR,
                 kind            VARCHAR,
                 start_ts        DATE,
@@ -30,3 +33,6 @@ class SnowflakeAuditWriter(AuditWriter):
                 updated_at      TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
             )
         """
+
+    def _execute(self, sql: str, params: dict[str, Any] | None = None) -> None:
+        self._hook.run(self._render(sql), parameters=params or None)
