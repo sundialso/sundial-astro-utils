@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from airflow.decorators import task
-from airflow.exceptions import AirflowSkipException
 from airflow.utils.task_group import TaskGroup
 from cosmos.operators.local import DbtTestLocalOperator
 
 from sundial_airflow.backfill.manifest_parser import CHUNKED, BackfillModel
+from sundial_airflow.chunking.chunk_spec import chunk_expand_kwargs
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
@@ -35,11 +35,12 @@ def build_chunked_model_graph(
     profile_config_factory: Callable[[str, str | None], Any],
     chunk_var_keys: tuple[str, str],
     upstream_task: Any,
-) -> tuple[dict[str, TaskGroup], dict[str, Any]]:
+) -> tuple[dict[str, TaskGroup], dict[str, Any], dict[str, Any]]:
     """Build chunked model TaskGroups with dynamically mapped chunk tasks."""
     start_var, end_var = chunk_var_keys
     model_groups: dict[str, TaskGroup] = {}
     test_tasks: dict[str, Any] = {}
+    plan_tasks: dict[str, Any] = {}
     models_by_key = {m.node_key: m for m in order}
 
     def _chunked_vars(prep: dict[str, Any]) -> dict[str, Any]:
@@ -85,85 +86,91 @@ def build_chunked_model_graph(
                 f"dbt run failed for {model_name} (exit={result.returncode})"
             )
 
-    @task
-    def _plan_chunks(model_name: str, **context: Any) -> list[dict[str, str]]:
-        """Return active chunk windows from the run plan."""
-        prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-        plan = (prep.get("run_plan") or {}).get(model_name)
-        if not plan:
-            logger.warning("No run plan for %r in prepare xcom.", model_name)
-            return []
-        disposition = plan.get("disposition")
-        chunks = list(plan.get("chunks") or [])
-        if disposition != "chunked":
+    def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any]:
+        """Create fresh TaskFlow tasks for one model (avoid shared-decorator bugs)."""
+
+        @task(task_id="plan_chunks")
+        def plan_chunks(**context: Any) -> list[dict[str, str]]:
+            """Return active chunk windows from the run plan."""
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            plan = (prep.get("run_plan") or {}).get(model_name)
+            if not plan:
+                logger.warning("No run plan for %r in prepare xcom.", model_name)
+                return []
+            disposition = plan.get("disposition")
+            chunks = list(plan.get("chunks") or [])
+            if disposition != "chunked":
+                logger.info(
+                    "plan_chunks %r: disposition=%s → 0 mapped tasks (use run_incremental)",
+                    model_name,
+                    disposition,
+                )
+                return []
             logger.info(
-                "plan_chunks %r: disposition=%s → 0 mapped tasks (use run_incremental)",
+                "plan_chunks %r: %d chunk(s): %s",
                 model_name,
-                disposition,
+                len(chunks),
+                ", ".join(c["chunk_id"] for c in chunks),
             )
-            return []
-        logger.info(
-            "plan_chunks %r: %d chunk(s): %s",
-            model_name,
-            len(chunks),
-            ", ".join(c["chunk_id"] for c in chunks),
-        )
-        return chunks
+            return chunk_expand_kwargs(chunks)
 
-    @task(
-        trigger_rule="none_failed",
-        map_index_template="{{ chunk_spec['chunk_id'] }}",
-    )
-    def _run_chunk(
-        chunk_spec: dict[str, str],
-        model_name: str,
-        **context: Any,
-    ) -> None:
-        """Run one mapped chunk window."""
-        skip_chunked_run(context, model_name=model_name)
-        prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-        base_vars = _chunked_vars(prep)
-        ti = context["ti"]
-        chunk_id = chunk_spec["chunk_id"]
-        logger.info("Running chunk %s for model %s", chunk_id, model_name)
-        base_vars[start_var] = chunk_spec["start"]
-        base_vars[end_var] = chunk_spec["end"]
-        base_vars["backfill_chunk_id"] = chunk_id
-        base_vars["chunk_key"] = chunk_id
-        base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
-        _invoke(base_vars, model_name)
-
-    @task(trigger_rule="none_failed")
-    def _run_incremental(model_name: str, **context: Any) -> None:
-        """Run one incremental pass when the run plan is single."""
-        skip_chunked_incremental(context, model_name=model_name)
-        prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-        base_vars = _chunked_vars(prep)
-        base_vars["chunk_key"] = "full"
-        base_vars["run_group_id"] = context["dag_run"].run_id
-        _invoke(
-            base_vars,
-            model_name,
-            full_refresh=bool(prep.get("full_refresh")),
+        @task(
+            task_id="run_chunk",
+            trigger_rule="none_failed",
+            map_index_template="{{ chunk_id }}",
         )
+        def run_chunk(
+            chunk_id: str,
+            chunk_start: str,
+            chunk_end: str,
+            **context: Any,
+        ) -> None:
+            """Run one mapped chunk window."""
+            logger.info(
+                "Starting run_chunk model=%s chunk=%s window=%s..%s",
+                model_name,
+                chunk_id,
+                chunk_start,
+                chunk_end,
+            )
+            skip_chunked_run(context, model_name=model_name)
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            base_vars = _chunked_vars(prep)
+            ti = context["ti"]
+            base_vars[start_var] = chunk_start
+            base_vars[end_var] = chunk_end
+            base_vars["backfill_chunk_id"] = chunk_id
+            base_vars["chunk_key"] = chunk_id
+            base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
+            _invoke(base_vars, model_name)
+
+        @task(task_id="run_incremental", trigger_rule="none_failed")
+        def run_incremental(**context: Any) -> None:
+            """Run one incremental pass when the run plan is single."""
+            logger.info("Starting run_incremental for model=%s", model_name)
+            skip_chunked_incremental(context, model_name=model_name)
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            base_vars = _chunked_vars(prep)
+            base_vars["chunk_key"] = "full"
+            base_vars["run_group_id"] = context["dag_run"].run_id
+            _invoke(
+                base_vars,
+                model_name,
+                full_refresh=bool(prep.get("full_refresh")),
+            )
+
+        planned = plan_chunks()
+        mapped = run_chunk.expand_kwargs(planned)
+        incremental = run_incremental()
+        planned >> incremental
+        return planned, mapped, incremental
 
     for model in order:
         if model.kind != CHUNKED:
             continue
 
         with TaskGroup(group_id=model.name) as tg:
-            planned = _plan_chunks.override(task_id="plan_chunks")(
-                model_name=model.name,
-            )
-            mapped_chunks = (
-                _run_chunk.override(task_id="run_chunk")
-                .partial(model_name=model.name)
-                .expand(chunk_spec=planned)
-            )
-            incremental = _run_incremental.override(task_id="run_incremental")(
-                model_name=model.name,
-            )
-            upstream_task >> planned
+            planned, mapped_chunks, incremental = _make_model_tasks(model.name)
 
             test_task = DbtTestLocalOperator(
                 task_id="test",
@@ -194,11 +201,12 @@ def build_chunked_model_graph(
         if upstreams:
             for up in upstreams:
                 if up in test_tasks:
-                    test_tasks[up] >> tg
+                    test_tasks[up] >> planned
         else:
-            upstream_task >> tg
+            upstream_task >> planned
 
         model_groups[model.name] = tg
         test_tasks[model.name] = test_task
+        plan_tasks[model.name] = planned
 
-    return model_groups, test_tasks
+    return model_groups, test_tasks, plan_tasks

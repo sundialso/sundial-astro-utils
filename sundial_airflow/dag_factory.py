@@ -505,6 +505,7 @@ def make_dbt_dag(
         run_tasks_by_model = dict(cosmos_runs)
         chunk_groups: dict[str, Any] = {}
         chunk_tests: dict[str, Any] = {}
+        chunk_plans: dict[str, Any] = {}
 
         chunk_profile_config = (
             profile_config_factory("dev", chunk_target_dataset_or_schema)
@@ -513,7 +514,7 @@ def make_dbt_dag(
         )
 
         if _chunk_order:
-            chunk_groups, chunk_tests = build_chunked_model_graph(
+            chunk_groups, chunk_tests, chunk_plans = build_chunked_model_graph(
                 order=_chunk_order,
                 project_path_str=project_path_str,
                 dbt_executable=dbt_executable,
@@ -526,16 +527,16 @@ def make_dbt_dag(
             models_by_key = {m.node_key: m for m in _chunk_order}
 
             for chunked in _chunk_order:
-                if chunked.kind != CHUNKED or chunked.name not in chunk_groups:
+                if chunked.kind != CHUNKED or chunked.name not in chunk_plans:
                     continue
-                tg = chunk_groups[chunked.name]
+                planned = chunk_plans[chunked.name]
                 for dep_key in chunked.depends_on:
                     dep = models_by_key.get(dep_key)
                     if dep is None or dep.name in chunk_groups:
                         continue
                     cosmos_run = cosmos_runs.get(dep.name)
                     if cosmos_run is not None:
-                        cosmos_run >> tg
+                        cosmos_run >> planned
 
             for model in _chunk_order:
                 cosmos_run = cosmos_runs.get(model.name)
