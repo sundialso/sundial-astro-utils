@@ -42,6 +42,9 @@ def build_chunked_model_graph(
     test_tasks: dict[str, Any] = {}
     models_by_key = {m.node_key: m for m in order}
 
+    def _chunked_vars(prep: dict[str, Any]) -> dict[str, Any]:
+        return dict(prep.get("chunked_vars") or prep.get("vars") or {})
+
     def _invoke(
         extra_vars: dict[str, Any],
         model_name: str,
@@ -103,7 +106,7 @@ def build_chunked_model_graph(
         """Run one mapped chunk window."""
         skip_chunked_run(context, model_name=model_name)
         prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-        base_vars = dict(prep.get("vars") or {})
+        base_vars = _chunked_vars(prep)
         ti = context["ti"]
         chunk_id = chunk_spec["chunk_id"]
         logger.info("Running chunk %s for model %s", chunk_id, model_name)
@@ -119,7 +122,7 @@ def build_chunked_model_graph(
         """Run one incremental pass when the run plan is single."""
         skip_chunked_incremental(context, model_name=model_name)
         prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-        base_vars = dict(prep.get("vars") or {})
+        base_vars = _chunked_vars(prep)
         base_vars["chunk_key"] = "full"
         base_vars["run_group_id"] = context["dag_run"].run_id
         _invoke(
@@ -151,6 +154,9 @@ def build_chunked_model_graph(
                 select=[model.name],
                 vars=(
                     "{{ ti.xcom_pull(task_ids='"
+                    + PREPARE_TASK_ID
+                    + "').get('chunked_vars') "
+                    "or ti.xcom_pull(task_ids='"
                     + PREPARE_TASK_ID
                     + "')['vars'] }}"
                 ),

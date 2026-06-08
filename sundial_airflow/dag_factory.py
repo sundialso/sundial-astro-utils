@@ -41,6 +41,7 @@ from sundial_airflow.backfill.manifest_parser import (
 )
 from sundial_airflow.chunking.graph import build_chunked_model_graph
 from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.target import ensure_chunk_target
 from sundial_airflow.chunking.watermarks import fetch_watermark_ends
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
@@ -133,6 +134,8 @@ def make_dbt_dag(
     chunking_config_path: str | Path | None = None,
     warehouse_conn_id: str | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
+    chunk_target_dataset_or_schema: str | None = None,
+    chunk_target_bq_location: str | None = None,
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -355,6 +358,14 @@ def make_dbt_dag(
 
             run_plan: dict = {}
             if _chunked_names:
+                if chunk_target_dataset_or_schema:
+                    ensure_chunk_target(
+                        warehouse=warehouse,
+                        conn_id=warehouse_conn_id,
+                        dbt_vars=dbt_vars,
+                        target=chunk_target_dataset_or_schema,
+                        bq_location=chunk_target_bq_location,
+                    )
                 exec_raw = dbt_vars.get("execution_ts") or _dt.date.today().isoformat()
                 execution_date = _dt.date.fromisoformat(str(exec_raw)[:10])
                 plan_models = _chunk_models
@@ -366,10 +377,13 @@ def make_dbt_dag(
                 watermark_models = [
                     m.name for m in plan_models.values() if m.kind == CHUNKED
                 ]
+                watermark_vars = dict(dbt_vars)
+                if chunk_target_dataset_or_schema:
+                    watermark_vars[vars_field] = chunk_target_dataset_or_schema
                 watermarks = fetch_watermark_ends(
                     warehouse=warehouse,
                     conn_id=warehouse_conn_id,
-                    dbt_vars=dbt_vars,
+                    dbt_vars=watermark_vars,
                     model_names=watermark_models,
                 )
                 plans = build_run_plan(
@@ -380,9 +394,14 @@ def make_dbt_dag(
                 )
                 run_plan = serialize_run_plan(plans)
 
+            chunked_vars = dict(dbt_vars)
+            if chunk_target_dataset_or_schema:
+                chunked_vars[vars_field] = chunk_target_dataset_or_schema
+
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
+                "chunked_vars": chunked_vars,
                 # Selects the warehouse adapter in the dbt_completions listener.
                 "warehouse": warehouse,
                 "full_refresh": backfill_mode == "full",
@@ -476,13 +495,19 @@ def make_dbt_dag(
         chunk_groups: dict[str, Any] = {}
         chunk_tests: dict[str, Any] = {}
 
+        chunk_profile_config = (
+            profile_config_factory("dev", chunk_target_dataset_or_schema)
+            if chunk_target_dataset_or_schema
+            else profile_config
+        )
+
         if _chunk_order:
             chunk_groups, chunk_tests = build_chunked_model_graph(
                 order=_chunk_order,
                 project_path_str=project_path_str,
                 dbt_executable=dbt_executable,
                 dbt_profile_name=dbt_profile_name,
-                profile_config=profile_config,
+                profile_config=chunk_profile_config,
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
                 upstream_task=dbt_args,
