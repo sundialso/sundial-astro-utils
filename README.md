@@ -167,8 +167,10 @@ auditing entirely.
   - *Chunked* (opt-in): N static `chunk_<YYYY-MM>` tasks computed at DAG
     parse time from the model's `start_ts(<col>, <lookback>, '<first_ts>')`
     anchor up to today, divided by `chunk_size` months in
-    `chunking_config.json`. Tenants pass `backfill_chunk_id` into dbt
-    vars so parallel chunk runs use distinct `__dbt_tmp` table names.
+    `chunking_config.json`. The factory passes `backfill_chunk_id` (and
+    `chunk_key`) in dbt vars; `sundial_dbt_shared.make_temp_relation`
+    suffixes `__dbt_tmp` per chunk so parallel BigQuery `insert_overwrite`
+    runs do not collide.
 - **Strict allowlist.** A model becomes chunked iff (1) it has an
   enabled entry in `chunking_config.json` with a positive `chunk_size`
   AND (2) its SQL contains a `start_ts(...)` call. Anything else runs
@@ -191,17 +193,16 @@ Each tenant repo also needs:
 | Path | Purpose |
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
-| `macros/start_ts.sql` + `macros/end_ts.sql` | Temporal window macros. The factory injects `backfill_start_ts` / `backfill_end_ts` dbt vars that these macros consume. |
+| `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros (or tenant copies). The factory injects `backfill_start_ts` / `backfill_end_ts`. |
+| `dbt_project.yml` `+post-hook` | BigQuery chunked backfill: `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs). Requires `sundial_dbt_shared` with `backfill_tmp_relation.sql`. |
 | `macros/backfill_coverage.sql` | `dbt run-operation` for previewing chunk eligibility. |
 | `macros/backfill_report.sql` + `macros/backfill_warehouse_report.sql` | *Optional* — ad-hoc reporting macros run manually against `BACKFILL_AUDIT`. Not invoked by the DAG. |
 | `dags/backfill_<tenant>.py` | ~30-line file that calls `make_backfill_dag`. |
 | A dedicated compute resource (Snowflake warehouse / BigQuery reservation or project) | Sized for the backfill workload; **never reuse production compute**. |
 
-The macros are currently copy-pasted across tenant repos. A planned
-follow-up is to ship them as a dbt package (`sundial-dbt-utils`) so
-tenants get them via `packages.yml`.
-
-See `<tenant>_dbt/BACKFILL.md` in your tenant repo for the operator-side runbook.
+Shared backfill dbt macros (`backfill_tmp_relation`, incremental windows,
+completions) live in the `sundial_dbt_shared` package inside this repo;
+tenants install them via `packages.yml`.
 
 ## Releasing
 

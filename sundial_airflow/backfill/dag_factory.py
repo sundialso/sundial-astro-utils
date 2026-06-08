@@ -39,6 +39,30 @@ _DEFAULT_ARGS: dict[str, Any] = {
 }
 
 
+def _run_group_id(context: dict[str, Any]) -> str:
+    """Stable run-group id for dbt_completions lock rows."""
+    ti = context["ti"]
+    return f"{context['dag_run'].run_id}:{ti.task_id}"
+
+
+def _backfill_context_vars(
+    *,
+    tenant: str,
+    run_context: str,
+    run_context_tag: str,
+    run_group_id: str,
+    chunk_key: str = "full",
+) -> dict[str, Any]:
+    """Shared dbt vars for backfill runs (lock isolation, no watermark writes)."""
+    return {
+        "chunk_key": chunk_key,
+        "run_group_id": run_group_id,
+        "record_incremental_window": False,
+        "run_context": run_context,
+        "run_context_tag": run_context_tag,
+    }
+
+
 def make_backfill_dag(
     *,
     dag_id: str,
@@ -287,8 +311,13 @@ def make_backfill_dag(
                     start_var: chunk_start_str,
                     end_var: chunk_end_str,
                     "backfill_chunk_id": chunk_id,
-                    "run_context": "chunked_backfill",
-                    "run_context_tag": f"{tenant}_chunked_backfill",
+                    **_backfill_context_vars(
+                        tenant=tenant,
+                        run_context="chunked_backfill",
+                        run_context_tag=f"{tenant}_chunked_backfill",
+                        run_group_id=_run_group_id(context),
+                        chunk_key=chunk_id,
+                    ),
                 },
             )
             if warehouse_conn_id:
@@ -323,10 +352,12 @@ def make_backfill_dag(
             started_at = _dt.datetime.now(_dt.timezone.utc)
             _dbt_run(
                 model_name,
-                extra_vars={
-                    "run_context": "backfill_upstream_full_refresh",
-                    "run_context_tag": f"{tenant}_backfill_upstream",
-                },
+                extra_vars=_backfill_context_vars(
+                    tenant=tenant,
+                    run_context="backfill_upstream_full_refresh",
+                    run_context_tag=f"{tenant}_backfill_upstream",
+                    run_group_id=_run_group_id(context),
+                ),
             )
             if warehouse_conn_id:
                 writer = _audit_writer()
