@@ -43,9 +43,6 @@ def build_chunked_model_graph(
     plan_tasks: dict[str, Any] = {}
     models_by_key = {m.node_key: m for m in order}
 
-    def _chunked_vars(prep: dict[str, Any]) -> dict[str, Any]:
-        return dict(prep.get("chunked_vars") or prep.get("vars") or {})
-
     def _invoke(
         extra_vars: dict[str, Any],
         model_name: str,
@@ -135,7 +132,7 @@ def build_chunked_model_graph(
             )
             skip_chunked_run(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            base_vars = _chunked_vars(prep)
+            base_vars = dict(prep.get("vars") or {})
             ti = context["ti"]
             base_vars[start_var] = chunk_start
             base_vars[end_var] = chunk_end
@@ -150,7 +147,7 @@ def build_chunked_model_graph(
             logger.info("Starting run_incremental for model=%s", model_name)
             skip_chunked_incremental(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            base_vars = _chunked_vars(prep)
+            base_vars = dict(prep.get("vars") or {})
             base_vars["chunk_key"] = "full"
             base_vars["run_group_id"] = context["dag_run"].run_id
             _invoke(
@@ -180,9 +177,6 @@ def build_chunked_model_graph(
                 select=[model.name],
                 vars=(
                     "{{ ti.xcom_pull(task_ids='"
-                    + PREPARE_TASK_ID
-                    + "').get('chunked_vars') "
-                    "or ti.xcom_pull(task_ids='"
                     + PREPARE_TASK_ID
                     + "')['vars'] }}"
                 ),
