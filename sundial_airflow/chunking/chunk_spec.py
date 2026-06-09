@@ -1,9 +1,9 @@
-"""Chunk window helpers for dynamic task mapping."""
+"""Helpers for mapped chunk tasks."""
 from __future__ import annotations
 
 
 def as_timestamp(value: str) -> str:
-    """Normalize a run-plan date string to a dbt-friendly timestamp literal."""
+    """Format a date string for dbt vars."""
     text = str(value).strip()
     if not text:
         return text
@@ -13,7 +13,7 @@ def as_timestamp(value: str) -> str:
 
 
 def chunk_expand_kwargs(chunks: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Shape plan chunks for ``expand_kwargs`` and readable map indexes."""
+    """Shape chunks for expand_kwargs."""
     return [
         {
             "chunk_id": c["chunk_id"],

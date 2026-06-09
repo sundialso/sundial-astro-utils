@@ -1,12 +1,22 @@
-"""Chunked run planning for unified dbt DAGs."""
+"""Runtime chunk planning."""
+from sundial_airflow.chunking.manifest_parser import (
+    CHUNKED,
+    BackfillModel,
+    load_backfill_models,
+    load_chunking_config,
+    topological_order,
+)
 from sundial_airflow.chunking.run_plan import ModelRunPlan, RunDisposition, build_run_plan
-from sundial_airflow.chunking.target import ensure_chunk_target
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 
 __all__ = [
+    "CHUNKED",
+    "BackfillModel",
     "ModelRunPlan",
     "RunDisposition",
     "build_run_plan",
-    "ensure_chunk_target",
     "fetch_partition_watermarks",
+    "load_backfill_models",
+    "load_chunking_config",
+    "topological_order",
 ]

@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the shared incremental-window macros (start_ts / end_ts /
-execution_ts) in sundial_dbt_shared/macros/incremental.sql.
-
-These render the ACTUAL macro source through Jinja for both warehouses, stubbing
-the dbt builtins (var / is_incremental / this / adapter.dispatch / return) and the
-sundial_dbt_shared.read_watermark + record_window_end helpers. They assert the
-generated SQL has the right dialect + window semantics — they do NOT hit a
-warehouse.
-
-IMPORTANT: keep in sync with incremental.sql + adapters/{bigquery,snowflake}.sql.
-
-Run:  python3 tests/test_incremental_macros.py
-"""
+"""Tests for incremental window macros."""
 from __future__ import annotations
 
 import os
@@ -41,7 +29,7 @@ TMPL = _load_template()
 
 
 class _Relation(str):
-    """Mimics dbt's `this`: renders as the FQN, but exposes `.name`."""
+    """dbt ``this`` stub."""
     def __new__(cls, fqn, name):
         obj = super().__new__(cls, fqn)
         obj.name = name
@@ -49,12 +37,7 @@ class _Relation(str):
 
 
 def module(prefix, vars_=None, resolved="2026-06-05 23:59:59"):
-    """Build the rendered macro module for one adapter (`bigquery`/`snowflake`).
-
-    Stubs run_query to return `resolved` as the resolved start_ts literal, and
-    tracks the call count so the memoisation can be asserted. `model` is a real
-    dict so the per-render memo (model.get / model.update) works.
-    """
+    """Build a rendered macro module for one adapter."""
     vars_ = vars_ or {}
     calls = {"n": 0, "last_sql": None}
 

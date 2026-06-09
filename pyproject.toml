@@ -19,9 +19,8 @@ dependencies = [
 ]
 
 # Warehouse providers are soft imports (the listener no-ops with a warning
-# if the matching provider is absent; the backfill audit-table writer is
-# only invoked when ``snowflake_conn_id`` is passed). Install the one(s)
-# your deployment uses, e.g. ``pip install sundial-airflow-utils[snowflake]``.
+# if the matching provider is absent). Install the one(s) your deployment
+# uses, e.g. ``pip install sundial-airflow-utils[snowflake]``.
 [project.optional-dependencies]
 bigquery = ["apache-airflow-providers-google"]
 snowflake = ["apache-airflow-providers-snowflake"]

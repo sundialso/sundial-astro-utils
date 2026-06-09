@@ -1,9 +1,4 @@
-"""Pre-execute hooks shared across Sundial dbt DAGs.
-
-These callbacks live on every Cosmos task in a tenant DAG and are responsible
-for honouring the run-time DAG params (``skip_tests``, ``empty``, ``select``,
-``exclude``) without us having to materialise different task graphs per run.
-"""
+"""Pre-execute hooks for Sundial dbt DAGs."""
 from __future__ import annotations
 
 from functools import partial
@@ -15,11 +10,7 @@ PREPARE_TASK_ID = "prepare_dbt_args"
 
 
 def skip_tests_if_disabled(context) -> None:
-    """``pre_execute`` hook for source-test tasks.
-
-    Skips when the DAG was triggered with ``skip_tests=True`` or
-    ``empty=True``.
-    """
+    """Skip source tests when skip_tests or empty is set."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Tests skipped (skip_tests or empty mode)")
@@ -44,26 +35,12 @@ def _skip_source_test(dependent_models: frozenset[str], context) -> None:
 
 
 def make_source_test_skip_hook(dependent_models: Iterable[str]):
-    """Build a ``pre_execute`` hook for a source-test task.
-
-    Skips when ``skip_tests`` / ``empty`` is set, or when a model selection
-    is active and none of ``dependent_models`` were selected.
-    """
+    """Build a source-test skip hook."""
     return partial(_skip_source_test, frozenset(dependent_models))
 
 
 def skip_unselected(context) -> None:
-    """``pre_execute`` hook for Cosmos model tasks.
-
-    Three responsibilities:
-
-    1. Inject ``--empty`` into ``dbt_cmd_flags`` when ``empty=True`` so dbt
-       runs each model with ``LIMIT 0``.
-    2. Skip test tasks when ``skip_tests`` / ``empty`` is set.
-    3. Skip model / test tasks whose model is not in the selection set
-       precomputed by ``prepare_dbt_args`` (so ``select`` / ``exclude`` work
-       without re-rendering the task graph).
-    """
+    """Skip Cosmos tasks outside the resolved selection."""
     ti = context["ti"]
     params = context.get("params", {})
     task_leaf = ti.task_id.split(".")[-1]
@@ -99,13 +76,13 @@ def skip_unselected(context) -> None:
 
 
 def _chunked_run_plan(context, model_name: str) -> dict | None:
-    """Load the run-plan entry for one chunked model."""
+    """Load run-plan entry for one model."""
     prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
     return (prep.get("run_plan") or {}).get(model_name)
 
 
 def skip_chunked_run(context, model_name: str) -> None:
-    """Skip a mapped chunk run when tests/empty mode is on or model is unselected."""
+    """Skip chunk run when unselected or tests/empty mode."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Skipped (skip_tests or empty mode)")
@@ -120,7 +97,7 @@ def skip_chunked_run(context, model_name: str) -> None:
 
 
 def skip_chunked_incremental(context, model_name: str) -> None:
-    """Skip incremental run when the plan selected chunked mode."""
+    """Skip incremental run when plan is chunked."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Skipped (skip_tests or empty mode)")
@@ -141,7 +118,7 @@ def skip_chunked_incremental(context, model_name: str) -> None:
 
 
 def skip_chunked_model_test(context, model_name: str) -> None:
-    """Skip chunked-model tests when tests are off or the model is unselected."""
+    """Skip chunked-model test when unselected or tests/empty mode."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Tests skipped (skip_tests or empty mode)")

@@ -1,4 +1,4 @@
-"""Parse manifest.json and chunking config into a backfill graph."""
+"""Parse manifest and chunking config."""
 from __future__ import annotations
 
 import json
@@ -34,8 +34,6 @@ _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 @dataclass
 class BackfillModel:
-    """One dbt model in the backfill DAG."""
-
     node_key: str
     name: str
     kind: str
@@ -48,8 +46,6 @@ class BackfillModel:
 
 @dataclass(frozen=True)
 class ChunkingConfigEntry:
-    """One chunking_config.json entry."""
-
     model_name: str
     chunking_enabled: bool
     chunk_size: Optional[int] = None
@@ -58,7 +54,7 @@ class ChunkingConfigEntry:
 def load_chunking_config(
     config_path: str | Path | None,
 ) -> dict[str, ChunkingConfigEntry]:
-    """Load chunking_config.json as {model_name: entry}."""
+    """Load chunking_config.json."""
     if config_path is None:
         return {}
     path = Path(config_path)
@@ -98,7 +94,7 @@ def load_backfill_models(
     manifest_path: str | Path,
     chunking_config: dict[str, ChunkingConfigEntry] | None = None,
 ) -> dict[str, BackfillModel]:
-    """Load eligible manifest models and apply chunking config."""
+    """Load manifest models and apply chunking config."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     models: dict[str, BackfillModel] = {}
     opted_out = 0
@@ -139,7 +135,7 @@ def load_backfill_models(
 def topological_order(
     models: dict[str, BackfillModel],
 ) -> list[BackfillModel]:
-    """Return models in upstream-first topological order."""
+    """Return models in topological order."""
     remaining = set(models.keys())
     completed: set[str] = set()
     ordered: list[BackfillModel] = []
@@ -158,7 +154,7 @@ def topological_order(
         )
         if not ready:
             raise ValueError(
-                "Cycle in backfill graph. Stuck models: "
+                "Cycle in chunked model graph. Stuck models: "
                 f"{[models[k].name for k in remaining]}"
             )
         for k in ready:
@@ -168,28 +164,13 @@ def topological_order(
     return ordered
 
 
-def compute_static_chunks(
-    models: dict[str, BackfillModel],
-    today: date,
-) -> dict[str, list[tuple[date, date, str]]]:
-    """Return static (start, end, chunk_id) windows per chunked model."""
-    out: dict[str, list[tuple[date, date, str]]] = {}
-    for m in models.values():
-        if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
-            continue
-        out[m.name] = chunk_windows_from_anchor(
-            m.first_timestamp, m.chunk_months, m.first_timestamp, today,
-        )
-    return out
-
-
 def chunk_windows_from_anchor(
     anchor: date,
     chunk_months: int,
     range_start: date,
     range_end: date,
 ) -> list[tuple[date, date, str]]:
-    """Return aligned chunk windows overlapping ``[range_start, range_end)``."""
+    """Return chunk windows in the given date range."""
     if range_end <= range_start or chunk_months < 1:
         return []
     out: list[tuple[date, date, str]] = []
@@ -209,7 +190,7 @@ def _is_eligible(node: dict) -> bool:
 
 
 def _extract_partition_column(raw_sql: str) -> Optional[str]:
-    """Return the partition column from the first ``start_ts()`` call."""
+    """Parse partition column from start_ts()."""
     sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
     sql = _LINE_COMMENT_RE.sub("", sql)
     match = _START_TS_PARTITION_RE.search(sql)
@@ -217,7 +198,7 @@ def _extract_partition_column(raw_sql: str) -> Optional[str]:
 
 
 def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
-    """Return the earliest start_ts() anchor date from model SQL."""
+    """Parse anchor date from start_ts()."""
     sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
     sql = _LINE_COMMENT_RE.sub("", sql)
     parsed: list[date] = []
@@ -232,7 +213,7 @@ def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
 
 
 def _parse_config_entry(item: object, idx: int) -> Optional[ChunkingConfigEntry]:
-    """Parse one chunking config entry."""
+    """Parse one chunking config row."""
     if not isinstance(item, dict):
         logger.warning(
             "Chunking config entry #%d is not an object — skipped.", idx,
@@ -275,7 +256,7 @@ def _apply_chunking_config(
     models: dict[str, BackfillModel],
     config: dict[str, ChunkingConfigEntry],
 ) -> int:
-    """Promote configured models to CHUNKED."""
+    """Mark configured models as chunked."""
     by_name = {m.name: m for m in models.values()}
     promoted = 0
     for cfg_name, entry in config.items():
@@ -318,7 +299,7 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Build contiguous month windows from first_timestamp through today."""
+    """Build month windows from anchor through today."""
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"

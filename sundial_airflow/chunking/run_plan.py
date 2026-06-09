@@ -1,4 +1,4 @@
-"""Per-model chunk vs single-run decisions for a DAG run."""
+"""Chunk vs single-run planning."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from typing import Literal
 
 from dateutil.relativedelta import relativedelta
 
-from sundial_airflow.backfill.manifest_parser import (
+from sundial_airflow.chunking.manifest_parser import (
     CHUNKED,
     BackfillModel,
     chunk_windows_from_anchor,
@@ -18,8 +18,6 @@ RunDisposition = Literal["single", "chunked"]
 
 @dataclass(frozen=True)
 class ChunkWindow:
-    """One active chunk window for this run."""
-
     chunk_id: str
     start: date
     end: date
@@ -27,8 +25,6 @@ class ChunkWindow:
 
 @dataclass(frozen=True)
 class ModelRunPlan:
-    """Resolved run shape for one chunked model."""
-
     model_name: str
     disposition: RunDisposition
     chunks: tuple[ChunkWindow, ...] = ()
@@ -42,7 +38,7 @@ def build_run_plan(
     execution_ts: date,
     today: date | None = None,
 ) -> dict[str, ModelRunPlan]:
-    """Build the per-model run plan for chunked models."""
+    """Build per-model run plans."""
     today = today or date.today()
     upper = min(execution_ts, today)
     plans: dict[str, ModelRunPlan] = {}
@@ -109,7 +105,7 @@ def _as_date(value: datetime | date) -> date:
 
 
 def _month_span(start: date, end: date) -> int:
-    """Return the month span between two dates (partial months count as one)."""
+    """Month span between two dates."""
     if end <= start:
         return 0
     delta = relativedelta(end, start)
@@ -132,7 +128,7 @@ def _log_plan(plan: ModelRunPlan) -> None:
 
 
 def serialize_run_plan(plans: dict[str, ModelRunPlan]) -> dict[str, dict]:
-    """Convert run plans to JSON-safe dicts for XCom."""
+    """Serialize run plans for XCom."""
     return {
         name: {
             "disposition": plan.disposition,

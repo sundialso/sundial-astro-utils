@@ -1,4 +1,4 @@
-"""Batch watermark reads from model partition columns."""
+"""Read partition watermarks from model tables."""
 from __future__ import annotations
 
 import logging
@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sundial_airflow.backfill.manifest_parser import BackfillModel
+from sundial_airflow.chunking.manifest_parser import BackfillModel
 from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ def _validate_ident(name: str, label: str) -> str:
 
 
 def partition_watermark_sql(table_fqn: str, partition_column: str) -> str:
-    """Build a MAX(partition_column) query for one model table."""
+    """Build MAX(partition_column) SQL."""
     col = _validate_ident(partition_column, "partition column")
     return f"SELECT MAX({col}) FROM {table_fqn}"
 
@@ -35,7 +35,7 @@ def fetch_partition_watermarks(
     dbt_vars: dict[str, Any],
     models: list[BackfillModel],
 ) -> dict[str, datetime | None]:
-    """Return the latest partition value per chunked model from its target table."""
+    """Fetch latest partition value per model."""
     adapter = get_adapter(warehouse)
     if adapter is None:
         logger.warning("No warehouse adapter for %r; watermarks unavailable.", warehouse)

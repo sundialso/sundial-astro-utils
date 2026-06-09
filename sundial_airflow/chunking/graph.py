@@ -1,4 +1,4 @@
-"""Chunked model task groups for unified dbt DAGs."""
+"""Chunked model TaskGroups for unified dbt DAGs."""
 from __future__ import annotations
 
 import json
@@ -13,7 +13,7 @@ from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 from cosmos.operators.local import DbtTestLocalOperator
 
-from sundial_airflow.backfill.manifest_parser import CHUNKED, BackfillModel
+from sundial_airflow.chunking.manifest_parser import CHUNKED, BackfillModel
 from sundial_airflow.chunking.chunk_spec import chunk_expand_kwargs
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
@@ -37,11 +37,7 @@ def build_chunked_model_graph(
     upstream_task: Any,
     parent_group: Any | None = None,
 ) -> tuple[dict[str, TaskGroup], dict[str, Any], dict[str, Any]]:
-    """Build chunked model TaskGroups with dynamically mapped chunk tasks.
-
-    When ``parent_group`` is set (typically the Cosmos ``DbtTaskGroup``), each
-    model group is nested under it alongside the standard Cosmos model tasks.
-    """
+    """Build TaskGroups for chunked models."""
     start_var, end_var = chunk_var_keys
     model_groups: dict[str, TaskGroup] = {}
     test_tasks: dict[str, Any] = {}
@@ -89,11 +85,9 @@ def build_chunked_model_graph(
             )
 
     def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any]:
-        """Create fresh TaskFlow tasks for one model (avoid shared-decorator bugs)."""
-
         @task(task_id="plan_chunks")
         def plan_chunks(**context: Any) -> list[dict[str, str]]:
-            """Return active chunk windows from the run plan."""
+            """Read chunk windows from the run plan."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             plan = (prep.get("run_plan") or {}).get(model_name)
             if not plan:
@@ -127,7 +121,7 @@ def build_chunked_model_graph(
             chunk_end: str,
             **context: Any,
         ) -> None:
-            """Run one mapped chunk window."""
+            """Run one chunk window."""
             logger.info(
                 "Starting run_chunk model=%s chunk=%s window=%s..%s",
                 model_name,
@@ -148,7 +142,7 @@ def build_chunked_model_graph(
 
         @task(task_id="run_incremental", trigger_rule="none_failed")
         def run_incremental(**context: Any) -> None:
-            """Run one incremental pass when the run plan is single."""
+            """Run one incremental pass."""
             logger.info("Starting run_incremental for model=%s", model_name)
             skip_chunked_incremental(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}

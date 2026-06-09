@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for chunk expand-kwargs helpers."""
+"""Tests for chunk expand-kwargs."""
 from __future__ import annotations
 
 import importlib.util
