@@ -180,8 +180,10 @@ class IncrementalMacroTests(unittest.TestCase):
         self.assertEqual(mod._logged["start_values"], ["2026-06-05 23:59:59"])
 
     def test_start_ts_backfill_override(self):
-        out = norm(module("snowflake", {"backfill_start_ts": "2026-02-01"}).start_ts("event_ts", 7, "2021-01-01"))
+        mod = module("snowflake", {"backfill_start_ts": "2026-02-01"})
+        out = norm(mod.start_ts("event_ts", 7, "2021-01-01"))
         self.assertEqual(out, "CAST('2026-02-01' AS TIMESTAMP_NTZ)")
+        self.assertEqual(mod._logged["start_values"], ["2026-02-01"])
 
     # ---- partial-backfill validation gating ---------------------------
     def test_normal_run_does_not_validate_backfill(self):
