@@ -498,6 +498,7 @@ def make_dbt_dag(
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
                 upstream_task=dbt_args,
+                parent_group=dbt_models,
             )
             models_by_key = {m.node_key: m for m in _chunk_order}
 

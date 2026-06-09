@@ -35,8 +35,13 @@ def build_chunked_model_graph(
     profile_config_factory: Callable[[str, str | None], Any],
     chunk_var_keys: tuple[str, str],
     upstream_task: Any,
+    parent_group: Any | None = None,
 ) -> tuple[dict[str, TaskGroup], dict[str, Any], dict[str, Any]]:
-    """Build chunked model TaskGroups with dynamically mapped chunk tasks."""
+    """Build chunked model TaskGroups with dynamically mapped chunk tasks.
+
+    When ``parent_group`` is set (typically the Cosmos ``DbtTaskGroup``), each
+    model group is nested under it alongside the standard Cosmos model tasks.
+    """
     start_var, end_var = chunk_var_keys
     model_groups: dict[str, TaskGroup] = {}
     test_tasks: dict[str, Any] = {}
@@ -166,7 +171,7 @@ def build_chunked_model_graph(
         if model.kind != CHUNKED:
             continue
 
-        with TaskGroup(group_id=model.name) as tg:
+        with TaskGroup(group_id=model.name, parent_group=parent_group) as tg:
             planned, mapped_chunks, incremental = _make_model_tasks(model.name)
 
             test_task = DbtTestLocalOperator(
