@@ -43,6 +43,28 @@ class ChunkKwargsTests(unittest.TestCase):
         self.assertEqual(out[0]["chunk_start"], "2024-01-01T00:00:00")
         self.assertEqual(out[0]["chunk_end"], "2024-07-01T00:00:00")
 
+    def test_run_expand_kwargs_single_returns_empty(self):
+        self.assertEqual(
+            chunk_spec.run_expand_kwargs({"disposition": "single", "chunks": []}),
+            [],
+        )
+
+    def test_build_chunk_units_for_all_models(self):
+        units = chunk_spec.build_chunk_units(
+            {
+                "m_a": {
+                    "disposition": "chunked",
+                    "chunks": [
+                        {"chunk_id": "2024-01", "start": "2024-01-01", "end": "2024-07-01"},
+                    ],
+                },
+                "m_b": {"disposition": "single", "chunks": []},
+            }
+        )
+        self.assertEqual(len(units["m_a"]), 1)
+        self.assertEqual(units["m_a"][0]["chunk_id"], "2024-01")
+        self.assertEqual(units["m_b"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

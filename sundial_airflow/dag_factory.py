@@ -41,6 +41,7 @@ from sundial_airflow.backfill.manifest_parser import (
 )
 from sundial_airflow.chunking.graph import build_chunked_model_graph
 from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
@@ -391,6 +392,8 @@ def make_dbt_dag(
                         len(plan.get("chunks") or []),
                     )
 
+            chunk_units = build_chunk_units(run_plan) if run_plan else {}
+
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
@@ -401,6 +404,7 @@ def make_dbt_dag(
                 "run_context": run_context,
                 "run_context_tag": run_context_tag,
                 "run_plan": run_plan,
+                "chunk_units": chunk_units,
             }
 
         dbt_args = prepare_dbt_args()
@@ -424,7 +428,7 @@ def make_dbt_dag(
                         + PREPARE_TASK_ID
                         + "')['vars'] }}"
                     ),
-                    install_deps=True,
+                    install_deps=False,
                     pre_execute=make_source_test_skip_hook(dependents),
                 )
 
@@ -452,7 +456,7 @@ def make_dbt_dag(
                     + PREPARE_TASK_ID
                     + "')['full_refresh'] }}"
                 ),
-                "install_deps": True,
+                "install_deps": False,
                 "pre_execute": skip_unselected,
                 # ``none_failed`` lets a model run when its upstream source
                 # test was *skipped* (skip_tests / empty mode) but still

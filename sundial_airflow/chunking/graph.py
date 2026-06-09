@@ -14,7 +14,6 @@ from airflow.utils.task_group import TaskGroup
 from cosmos.operators.local import DbtTestLocalOperator
 
 from sundial_airflow.backfill.manifest_parser import CHUNKED, BackfillModel
-from sundial_airflow.chunking.chunk_spec import chunk_expand_kwargs
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
@@ -39,13 +38,16 @@ def build_chunked_model_graph(
 ) -> tuple[dict[str, TaskGroup], dict[str, Any], dict[str, Any]]:
     """Build chunked model TaskGroups with dynamically mapped chunk tasks.
 
+    Chunk windows are planned once in ``prepare_dbt_args`` (``chunk_units`` in
+    XCom). Each model only has a thin selector task that reads that shared plan.
+
     When ``parent_group`` is set (typically the Cosmos ``DbtTaskGroup``), each
     model group is nested under it alongside the standard Cosmos model tasks.
     """
     start_var, end_var = chunk_var_keys
     model_groups: dict[str, TaskGroup] = {}
     test_tasks: dict[str, Any] = {}
-    plan_tasks: dict[str, Any] = {}
+    run_entry_tasks: dict[str, Any] = {}
     models_by_key = {m.node_key: m for m in order}
 
     def _invoke(
@@ -91,30 +93,26 @@ def build_chunked_model_graph(
     def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any]:
         """Create fresh TaskFlow tasks for one model (avoid shared-decorator bugs)."""
 
-        @task(task_id="plan_chunks")
-        def plan_chunks(**context: Any) -> list[dict[str, str]]:
-            """Return active chunk windows from the run plan."""
+        @task(task_id="chunk_units")
+        def chunk_units(**context: Any) -> list[dict[str, str]]:
+            """Read this model's mapped chunk kwargs from the shared prepare plan."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            plan = (prep.get("run_plan") or {}).get(model_name)
-            if not plan:
-                logger.warning("No run plan for %r in prepare xcom.", model_name)
-                return []
-            disposition = plan.get("disposition")
-            chunks = list(plan.get("chunks") or [])
-            if disposition != "chunked":
+            units = (prep.get("chunk_units") or {}).get(model_name, [])
+            if units:
                 logger.info(
-                    "plan_chunks %r: disposition=%s → 0 mapped tasks (use run_incremental)",
+                    "chunk_units %r: %d chunk(s): %s",
                     model_name,
-                    disposition,
+                    len(units),
+                    ", ".join(u["chunk_id"] for u in units),
                 )
-                return []
-            logger.info(
-                "plan_chunks %r: %d chunk(s): %s",
-                model_name,
-                len(chunks),
-                ", ".join(c["chunk_id"] for c in chunks),
-            )
-            return chunk_expand_kwargs(chunks)
+            else:
+                plan = (prep.get("run_plan") or {}).get(model_name) or {}
+                logger.info(
+                    "chunk_units %r: 0 mapped tasks (disposition=%s)",
+                    model_name,
+                    plan.get("disposition", "missing"),
+                )
+            return units
 
         @task(
             task_id="run_chunk",
@@ -161,18 +159,18 @@ def build_chunked_model_graph(
                 full_refresh=bool(prep.get("full_refresh")),
             )
 
-        planned = plan_chunks()
-        mapped = run_chunk.expand_kwargs(planned)
+        units = chunk_units()
+        mapped = run_chunk.expand_kwargs(units)
         incremental = run_incremental()
-        planned >> incremental
-        return planned, mapped, incremental
+        units >> incremental
+        return units, mapped, incremental
 
     for model in order:
         if model.kind != CHUNKED:
             continue
 
         with TaskGroup(group_id=model.name, parent_group=parent_group) as tg:
-            planned, mapped_chunks, incremental = _make_model_tasks(model.name)
+            units, mapped_chunks, incremental = _make_model_tasks(model.name)
 
             test_task = DbtTestLocalOperator(
                 task_id="test",
@@ -185,7 +183,7 @@ def build_chunked_model_graph(
                     + PREPARE_TASK_ID
                     + "')['vars'] }}"
                 ),
-                install_deps=True,
+                install_deps=False,
                 trigger_rule="none_failed_min_one_success",
                 pre_execute=partial(skip_chunked_model_test, model_name=model.name),
             )
@@ -200,12 +198,12 @@ def build_chunked_model_graph(
         if upstreams:
             for up in upstreams:
                 if up in test_tasks:
-                    test_tasks[up] >> planned
+                    test_tasks[up] >> units
         else:
-            upstream_task >> planned
+            upstream_task >> units
 
         model_groups[model.name] = tg
         test_tasks[model.name] = test_task
-        plan_tasks[model.name] = planned
+        run_entry_tasks[model.name] = units
 
-    return model_groups, test_tasks, plan_tasks
+    return model_groups, test_tasks, run_entry_tasks

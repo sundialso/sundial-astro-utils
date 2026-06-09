@@ -22,3 +22,17 @@ def chunk_expand_kwargs(chunks: list[dict[str, str]]) -> list[dict[str, str]]:
         }
         for c in chunks
     ]
+
+
+def run_expand_kwargs(plan: dict | None) -> list[dict[str, str]]:
+    """Build mapped ``run_chunk`` kwargs for one model's serialized run plan."""
+    if not plan:
+        return []
+    if plan.get("disposition") == "chunked":
+        return chunk_expand_kwargs(plan.get("chunks") or [])
+    return []
+
+
+def build_chunk_units(run_plan: dict[str, dict]) -> dict[str, list[dict[str, str]]]:
+    """Precompute per-model ``expand_kwargs`` lists for all chunked models."""
+    return {name: run_expand_kwargs(plan) for name, plan in run_plan.items()}
