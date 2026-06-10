@@ -113,6 +113,20 @@ class RunPlanTests(unittest.TestCase):
         )
         self.assertEqual(plans[model.name].disposition, "single")
 
+    def test_run_plan_uses_mapped_chunks(self) -> None:
+        self.assertTrue(
+            run_plan.run_plan_uses_mapped_chunks(
+                {"orders": {"disposition": "chunked", "chunks": [{"chunk_id": "2024-01"}]}},
+                "orders",
+            )
+        )
+        self.assertFalse(
+            run_plan.run_plan_uses_mapped_chunks(
+                {"orders": {"disposition": "single", "chunks": []}},
+                "orders",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

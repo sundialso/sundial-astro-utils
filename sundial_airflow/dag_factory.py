@@ -40,9 +40,21 @@ from sundial_airflow.backfill.manifest_parser import (
     topological_order,
 )
 from sundial_airflow.chunking.graph import build_chunked_model_graph
-from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.run_plan import (
+    build_run_plan,
+    run_plan_needs_chunked_compute,
+    serialize_run_plan,
+)
 from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
+from sundial_airflow.chunking.snowflake_compute import (
+    BOOST_SNOWFLAKE_TASK_ID,
+    ORIGINAL_SIZE_XCOM_KEY,
+    SnowflakeComputeConfig,
+    boost_snowflake_warehouse,
+    make_snowflake_failure_callback,
+    make_snowflake_restore_callback,
+)
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
@@ -54,6 +66,7 @@ from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
 )
+from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +146,9 @@ def make_dbt_dag(
     recursive_tests: bool = True,
     chunking_config_path: str | Path | None = None,
     warehouse_conn_id: str | None = None,
+    snowflake_warehouse_name: str | None = None,
+    snowflake_warehouse_size_chunked: str | None = None,
+    snowflake_warehouse_size_normal: str | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
 ):
     """Build and register a fully-wired Sundial dbt DAG.
@@ -226,6 +242,38 @@ def make_dbt_dag(
                 "Chunking config parse failed for DAG %r: %s", dag_id, exc,
             )
 
+    snowflake_compute: SnowflakeComputeConfig | None = None
+    snowflake_compute_conn_id: str | None = None
+    if (
+        warehouse == "snowflake"
+        and snowflake_warehouse_name
+        and snowflake_warehouse_size_chunked
+    ):
+        snowflake_adapter = get_adapter("snowflake")
+        snowflake_compute_conn_id = warehouse_conn_id or (
+            snowflake_adapter.resolve_conn_id() if snowflake_adapter else None
+        )
+        if snowflake_compute_conn_id:
+            snowflake_compute = SnowflakeComputeConfig(
+                warehouse_name=snowflake_warehouse_name,
+                chunked_size=snowflake_warehouse_size_chunked,
+                normal_size=snowflake_warehouse_size_normal,
+                conn_id=snowflake_compute_conn_id,
+            )
+
+    dag_on_success = None
+    dag_on_failure: Any = dag_failure_alert
+    if snowflake_compute and snowflake_compute_conn_id:
+        dag_on_success = make_snowflake_restore_callback(
+            snowflake_compute,
+            snowflake_compute_conn_id,
+        )
+        dag_on_failure = make_snowflake_failure_callback(
+            snowflake_compute,
+            snowflake_compute_conn_id,
+            dag_failure_alert,
+        )
+
     @dag(
         dag_id=dag_id,
         start_date=start_date,
@@ -236,7 +284,8 @@ def make_dbt_dag(
         render_template_as_native_obj=True,
         default_args=merged_default_args,
         params=params,
-        on_failure_callback=dag_failure_alert,
+        on_success_callback=dag_on_success,
+        on_failure_callback=dag_on_failure,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID)
@@ -393,6 +442,7 @@ def make_dbt_dag(
                     )
 
             chunk_units = build_chunk_units(run_plan) if run_plan else {}
+            chunked_compute = run_plan_needs_chunked_compute(run_plan)
 
             return {
                 param_field: target_value,
@@ -405,6 +455,7 @@ def make_dbt_dag(
                 "run_context_tag": run_context_tag,
                 "run_plan": run_plan,
                 "chunk_units": chunk_units,
+                "chunked_compute": chunked_compute,
             }
 
         dbt_args = prepare_dbt_args()
@@ -465,6 +516,29 @@ def make_dbt_dag(
             },
         )
 
+        compute_gate: Any = dbt_args
+        if snowflake_compute and snowflake_compute_conn_id:
+            _compute_config = snowflake_compute
+            _compute_conn_id = snowflake_compute_conn_id
+
+            @task(task_id=BOOST_SNOWFLAKE_TASK_ID)
+            def boost_snowflake_compute(**context):
+                """Upsize Snowflake warehouse for mapped chunk runs."""
+                prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+                original = boost_snowflake_warehouse(
+                    config=_compute_config,
+                    conn_id=_compute_conn_id,
+                    needs_boost=bool(prep.get("chunked_compute")),
+                    context=context,
+                )
+                if original is not None:
+                    context["ti"].xcom_push(
+                        key=ORIGINAL_SIZE_XCOM_KEY,
+                        value=original,
+                    )
+
+            compute_gate = boost_snowflake_compute()
+
         # Optional pre-tasks (e.g. ami_dbt's S3 -> Snowflake EMR ingest) run
         # serially before ``prepare_dbt_args``. ``pre_tasks`` items are
         # zero-arg factories that build the TaskFlow task instance.
@@ -474,17 +548,9 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        # Per-source fan-out (no global gate):
-        #
-        #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
-        #                     └─ <models with no tested source> (run after prepare)
-        #
-        # A failing ``test_s_t`` only flips ``upstream_failed`` on the models
-        # that consume that source; sibling branches are unaffected. Models
-        # with no source dependency (or whose sources have no tests) just run
-        # after ``prepare_dbt_args``.
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        dbt_args >> compute_gate
+        compute_gate >> source_test_group
+        compute_gate >> dbt_models
 
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
@@ -501,7 +567,7 @@ def make_dbt_dag(
                 profile_config=profile_config,
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
-                upstream_task=dbt_args,
+                upstream_task=compute_gate,
                 parent_group=dbt_models,
             )
             models_by_key = {m.node_key: m for m in _chunk_order}

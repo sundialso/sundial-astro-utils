@@ -90,28 +90,45 @@ def build_chunked_model_graph(
                 f"dbt run failed for {model_name} (exit={result.returncode})"
             )
 
-    def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any]:
+    def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any, Any]:
         """Create fresh TaskFlow tasks for one model (avoid shared-decorator bugs)."""
+
+        @task.branch(task_id="route_run")
+        def route_run(**context: Any) -> str:
+            """Choose mapped chunks vs one incremental pass."""
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            run_plan = prep.get("run_plan") or {}
+            plan = run_plan.get(model_name) or {}
+            prefix = context["ti"].task_id.rsplit(".", 1)[0]
+            if plan.get("disposition") == "chunked" and plan.get("chunks"):
+                target = f"{prefix}.chunk_units"
+                logger.info(
+                    "route_run %r: disposition=chunked chunks=%d -> %s",
+                    model_name,
+                    len(plan.get("chunks") or []),
+                    target,
+                )
+                return target
+            target = f"{prefix}.run_incremental"
+            logger.info(
+                "route_run %r: disposition=%s -> %s",
+                model_name,
+                plan.get("disposition", "missing"),
+                target,
+            )
+            return target
 
         @task(task_id="chunk_units")
         def chunk_units(**context: Any) -> list[dict[str, str]]:
-            """Read this model's mapped chunk kwargs from the shared prepare plan."""
+            """Read mapped chunk kwargs from prepare_dbt_args."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             units = (prep.get("chunk_units") or {}).get(model_name, [])
-            if units:
-                logger.info(
-                    "chunk_units %r: %d chunk(s): %s",
-                    model_name,
-                    len(units),
-                    ", ".join(u["chunk_id"] for u in units),
-                )
-            else:
-                plan = (prep.get("run_plan") or {}).get(model_name) or {}
-                logger.info(
-                    "chunk_units %r: 0 mapped tasks (disposition=%s)",
-                    model_name,
-                    plan.get("disposition", "missing"),
-                )
+            logger.info(
+                "chunk_units %r: %d chunk(s): %s",
+                model_name,
+                len(units),
+                ", ".join(u["chunk_id"] for u in units) or "(none)",
+            )
             return units
 
         @task(
@@ -159,18 +176,19 @@ def build_chunked_model_graph(
                 full_refresh=bool(prep.get("full_refresh")),
             )
 
+        router = route_run()
         units = chunk_units()
         mapped = run_chunk.expand_kwargs(units)
         incremental = run_incremental()
-        units >> incremental
-        return units, mapped, incremental
+        router >> [units, incremental]
+        return router, units, mapped, incremental
 
     for model in order:
         if model.kind != CHUNKED:
             continue
 
         with TaskGroup(group_id=model.name, parent_group=parent_group) as tg:
-            units, mapped_chunks, incremental = _make_model_tasks(model.name)
+            router, units, mapped_chunks, incremental = _make_model_tasks(model.name)
 
             test_task = DbtTestLocalOperator(
                 task_id="test",
@@ -198,12 +216,12 @@ def build_chunked_model_graph(
         if upstreams:
             for up in upstreams:
                 if up in test_tasks:
-                    test_tasks[up] >> units
+                    test_tasks[up] >> router
         else:
-            upstream_task >> units
+            upstream_task >> router
 
         model_groups[model.name] = tg
         test_tasks[model.name] = test_task
-        run_entry_tasks[model.name] = units
+        run_entry_tasks[model.name] = router
 
     return model_groups, test_tasks, run_entry_tasks

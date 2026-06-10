@@ -147,3 +147,17 @@ def serialize_run_plan(plans: dict[str, ModelRunPlan]) -> dict[str, dict]:
         }
         for name, plan in plans.items()
     }
+
+
+def run_plan_needs_chunked_compute(run_plan: dict[str, dict]) -> bool:
+    """Return True when any model will run mapped chunks."""
+    return any(
+        plan.get("disposition") == "chunked" and plan.get("chunks")
+        for plan in run_plan.values()
+    )
+
+
+def run_plan_uses_mapped_chunks(run_plan: dict[str, dict], model_name: str) -> bool:
+    """Return True when one model should take the mapped chunk path."""
+    plan = run_plan.get(model_name) or {}
+    return plan.get("disposition") == "chunked" and bool(plan.get("chunks"))
