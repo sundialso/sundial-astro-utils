@@ -84,7 +84,7 @@ def build_chunked_model_graph(
             )
 
     def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any]:
-        @task(task_id="chunk_units")
+        @task(task_id="chunk_units", trigger_rule="none_failed")
         def chunk_units(**context: Any) -> list[dict[str, str]]:
             """Read mapped chunk kwargs from prepare_dbt_args."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
