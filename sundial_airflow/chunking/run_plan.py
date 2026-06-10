@@ -156,8 +156,3 @@ def run_plan_needs_chunked_compute(run_plan: dict[str, dict]) -> bool:
         for plan in run_plan.values()
     )
 
-
-def run_plan_uses_mapped_chunks(run_plan: dict[str, dict], model_name: str) -> bool:
-    """Return True when one model should take the mapped chunk path."""
-    plan = run_plan.get(model_name) or {}
-    return plan.get("disposition") == "chunked" and bool(plan.get("chunks"))
