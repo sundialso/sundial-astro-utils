@@ -103,7 +103,7 @@ class RunPlanTests(unittest.TestCase):
         self.assertEqual(plan.disposition, "chunked")
         self.assertGreaterEqual(plan.chunks[0].start, date(2020, 6, 1))
 
-    def test_partial_mode_is_single(self) -> None:
+    def test_partial_without_window_is_single(self) -> None:
         model = _chunked_model()
         plans = build_run_plan(
             models={model.node_key: model},
@@ -112,6 +112,34 @@ class RunPlanTests(unittest.TestCase):
             execution_ts=date(2024, 6, 1),
         )
         self.assertEqual(plans[model.name].disposition, "single")
+
+    def test_partial_small_window_is_single(self) -> None:
+        model = _chunked_model(chunk_months=6)
+        plans = build_run_plan(
+            models={model.node_key: model},
+            watermarks={},
+            backfill_mode="partial",
+            execution_ts=date(2024, 6, 1),
+            window_start=date(2024, 1, 1),
+            window_end=date(2024, 4, 1),
+        )
+        self.assertEqual(plans[model.name].disposition, "single")
+
+    def test_partial_large_window_chunks(self) -> None:
+        model = _chunked_model(chunk_months=6)
+        plans = build_run_plan(
+            models={model.node_key: model},
+            watermarks={},
+            backfill_mode="partial",
+            execution_ts=date(2024, 6, 1),
+            window_start=date(2021, 1, 1),
+            window_end=date(2022, 6, 1),
+        )
+        plan = plans[model.name]
+        self.assertEqual(plan.disposition, "chunked")
+        self.assertGreater(len(plan.chunks), 1)
+        self.assertGreaterEqual(plan.chunks[0].start, date(2021, 1, 1))
+        self.assertLessEqual(plan.chunks[-1].end, date(2022, 6, 1))
 
 
 if __name__ == "__main__":

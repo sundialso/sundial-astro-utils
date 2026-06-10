@@ -378,11 +378,21 @@ def make_dbt_dag(
                     dbt_vars=dbt_vars,
                     models=watermark_models,
                 )
+                window_start = None
+                window_end = None
+                if backfill_mode == "partial":
+                    ws = dbt_vars.get("backfill_start_ts")
+                    we = dbt_vars.get("backfill_end_ts")
+                    if ws and we:
+                        window_start = _dt.date.fromisoformat(str(ws)[:10])
+                        window_end = _dt.date.fromisoformat(str(we)[:10])
                 plans = build_run_plan(
                     models=plan_models,
                     watermarks=watermarks,
                     backfill_mode=backfill_mode,
                     execution_ts=execution_date,
+                    window_start=window_start,
+                    window_end=window_end,
                 )
                 run_plan = serialize_run_plan(plans)
                 for name, wm in watermarks.items():

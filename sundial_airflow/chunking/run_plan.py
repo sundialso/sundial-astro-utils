@@ -41,6 +41,8 @@ def build_run_plan(
     backfill_mode: str,
     execution_ts: date,
     today: date | None = None,
+    window_start: date | datetime | None = None,
+    window_end: date | datetime | None = None,
 ) -> dict[str, ModelRunPlan]:
     """Build the per-model run plan for chunked models."""
     today = today or date.today()
@@ -58,6 +60,8 @@ def build_run_plan(
             watermark=watermarks.get(model.name),
             backfill_mode=backfill_mode,
             upper=upper,
+            window_start=window_start,
+            window_end=window_end,
         )
         plans[model.name] = plan
         _log_plan(plan)
@@ -71,13 +75,21 @@ def _plan_for_model(
     watermark: datetime | None,
     backfill_mode: str,
     upper: date,
+    window_start: date | datetime | None = None,
+    window_end: date | datetime | None = None,
 ) -> ModelRunPlan:
     anchor = model.first_timestamp
     chunk_months = model.chunk_months
     assert anchor is not None and chunk_months is not None
 
     if backfill_mode == "partial":
-        return ModelRunPlan(model.name, "single")
+        return _plan_partial(
+            model=model,
+            anchor=anchor,
+            chunk_months=chunk_months,
+            window_start=window_start,
+            window_end=window_end,
+        )
 
     if backfill_mode == "full" or watermark is None:
         chunks = _to_windows(
@@ -92,6 +104,35 @@ def _plan_for_model(
     chunks = _to_windows(
         chunk_windows_from_anchor(anchor, chunk_months, range_start, upper),
     )
+    return ModelRunPlan(model.name, "chunked", chunks)
+
+
+def _plan_partial(
+    *,
+    model: BackfillModel,
+    anchor: date,
+    chunk_months: int,
+    window_start: date | datetime | None,
+    window_end: date | datetime | None,
+) -> ModelRunPlan:
+    """Plan an explicit ``[start_ts, end_ts]`` partial backfill window.
+
+    Windows at or under ``chunk_months`` run once; larger windows fan out into
+    anchor-aligned chunks so chunk_keys match the full-backfill cadence.
+    """
+    if window_start is None or window_end is None:
+        return ModelRunPlan(model.name, "single")
+
+    range_start = max(_as_date(window_start), _as_date(anchor))
+    range_end = _as_date(window_end)
+    if range_end <= range_start or _month_span(range_start, range_end) <= chunk_months:
+        return ModelRunPlan(model.name, "single")
+
+    chunks = _to_windows(
+        chunk_windows_from_anchor(anchor, chunk_months, range_start, range_end),
+    )
+    if not chunks:
+        return ModelRunPlan(model.name, "single")
     return ModelRunPlan(model.name, "chunked", chunks)
 
 
