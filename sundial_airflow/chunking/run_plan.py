@@ -148,11 +148,3 @@ def serialize_run_plan(plans: dict[str, ModelRunPlan]) -> dict[str, dict]:
         for name, plan in plans.items()
     }
 
-
-def run_plan_needs_chunked_compute(run_plan: dict[str, dict]) -> bool:
-    """Return True when any model will run mapped chunks."""
-    return any(
-        plan.get("disposition") == "chunked" and plan.get("chunks")
-        for plan in run_plan.values()
-    )
-
