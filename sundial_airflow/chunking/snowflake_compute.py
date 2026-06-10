@@ -64,13 +64,14 @@ def _log_prefix(context: dict[str, Any] | None) -> str:
 
 def describe_warehouse_size(*, conn_id: str, warehouse_name: str) -> str | None:
     """Return the current warehouse size, or None if the warehouse is missing."""
-    _run_snowflake(
+    # SHOW WAREHOUSES and its RESULT_SCAN must run on the SAME session, otherwise
+    # LAST_QUERY_ID() resolves against the wrong query and the columns vanish.
+    rows = _run_snowflake_session(
         conn_id,
-        f"SHOW WAREHOUSES LIKE {_sql_literal(warehouse_name)}",
-    )
-    rows = _run_snowflake(
-        conn_id,
-        "SELECT \"name\", \"size\" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))",
+        [
+            f"SHOW WAREHOUSES LIKE {_sql_literal(warehouse_name)}",
+            'SELECT "name", "size" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))',
+        ],
     )
     if not rows:
         return None
@@ -273,7 +274,7 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _run_snowflake(conn_id: str, sql: str) -> list[tuple[Any, ...]]:
+def _snowflake_hook(conn_id: str):
     try:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
     except ImportError as exc:
@@ -281,6 +282,23 @@ def _run_snowflake(conn_id: str, sql: str) -> list[tuple[Any, ...]]:
             "apache-airflow-providers-snowflake is required for warehouse resize."
         ) from exc
 
-    hook = SnowflakeHook(snowflake_conn_id=conn_id)
-    rows = hook.get_records(sql)
+    return SnowflakeHook(snowflake_conn_id=conn_id)
+
+
+def _run_snowflake(conn_id: str, sql: str) -> list[tuple[Any, ...]]:
+    rows = _snowflake_hook(conn_id).get_records(sql)
+    return rows or []
+
+
+def _run_snowflake_session(conn_id: str, sqls: list[str]) -> list[tuple[Any, ...]]:
+    """Run statements on one session and return the last statement's rows.
+
+    Required for SHOW WAREHOUSES + RESULT_SCAN(LAST_QUERY_ID()), which only
+    works when both statements share a single Snowflake session.
+    """
+    rows = _snowflake_hook(conn_id).run(
+        sqls,
+        handler=lambda cursor: cursor.fetchall(),
+        return_last=True,
+    )
     return rows or []

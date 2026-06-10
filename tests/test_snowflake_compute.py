@@ -86,14 +86,13 @@ class SnowflakeComputeValidationTests(unittest.TestCase):
             )
 
     @patch.object(snowflake_compute, "_run_snowflake")
-    def test_boosts_and_returns_original_size(self, mock_run) -> None:
-        mock_run.side_effect = [
-            None,
+    @patch.object(snowflake_compute, "_run_snowflake_session")
+    def test_boosts_and_returns_original_size(self, mock_session, mock_run) -> None:
+        mock_session.side_effect = [
             [("DBT_WH", "X-SMALL")],
-            None,
-            None,
             [("DBT_WH", "LARGE")],
         ]
+        mock_run.return_value = None
         config = SnowflakeComputeConfig(
             warehouse_name="DBT_WH",
             chunked_size="LARGE",
@@ -104,11 +103,13 @@ class SnowflakeComputeValidationTests(unittest.TestCase):
             needs_boost=True,
         )
         self.assertEqual(original, "X-SMALL")
-        self.assertEqual(mock_run.call_count, 5)
-        self.assertIn("ALTER WAREHOUSE", mock_run.call_args_list[2][0][1])
+        self.assertEqual(mock_session.call_count, 2)
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertIn("ALTER WAREHOUSE", mock_run.call_args_list[0][0][1])
 
+    @patch.object(snowflake_compute, "_run_snowflake_session")
     @patch.object(snowflake_compute, "_run_snowflake")
-    def test_skips_when_no_chunked_compute(self, mock_run) -> None:
+    def test_skips_when_no_chunked_compute(self, mock_run, mock_session) -> None:
         config = SnowflakeComputeConfig(
             warehouse_name="DBT_WH",
             chunked_size="LARGE",
@@ -122,6 +123,7 @@ class SnowflakeComputeValidationTests(unittest.TestCase):
                 needs_boost=False,
             )
         mock_run.assert_not_called()
+        mock_session.assert_not_called()
 
 
 if __name__ == "__main__":
