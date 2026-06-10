@@ -548,7 +548,8 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        dbt_args >> compute_gate
+        if compute_gate is not dbt_args:
+            dbt_args >> compute_gate
         compute_gate >> source_test_group
         compute_gate >> dbt_models
 
