@@ -27,8 +27,8 @@ def _load_module(qualified: str, path: Path):
 
 
 manifest_parser = _load_module(
-    "sundial_airflow.backfill.manifest_parser",
-    ROOT / "sundial_airflow/backfill/manifest_parser.py",
+    "sundial_airflow.chunking.manifest_parser",
+    ROOT / "sundial_airflow/chunking/manifest_parser.py",
 )
 run_plan = _load_module(
     "sundial_airflow.chunking.run_plan",

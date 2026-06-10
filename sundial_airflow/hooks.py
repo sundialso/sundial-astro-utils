@@ -1,9 +1,5 @@
-"""Pre-execute hooks shared across Sundial dbt DAGs.
-
-These callbacks live on every Cosmos task in a tenant DAG and are responsible
-for honouring the run-time DAG params (``skip_tests``, ``empty``, ``select``,
-``exclude``) without us having to materialise different task graphs per run.
-"""
+"""Pre-execute hooks that honour run-time DAG params (``skip_tests``, ``empty``,
+``select``, ``exclude``) without re-rendering the task graph per run."""
 from __future__ import annotations
 
 from functools import partial
@@ -53,16 +49,9 @@ def make_source_test_skip_hook(dependent_models: Iterable[str]):
 
 
 def skip_unselected(context) -> None:
-    """``pre_execute`` hook for Cosmos model tasks.
-
-    Three responsibilities:
-
-    1. Inject ``--empty`` into ``dbt_cmd_flags`` when ``empty=True`` so dbt
-       runs each model with ``LIMIT 0``.
-    2. Skip test tasks when ``skip_tests`` / ``empty`` is set.
-    3. Skip model / test tasks whose model is not in the selection set
-       precomputed by ``prepare_dbt_args`` (so ``select`` / ``exclude`` work
-       without re-rendering the task graph).
+    """``pre_execute`` hook for Cosmos model tasks: inject ``--empty`` in empty
+    mode, skip tests when ``skip_tests``/``empty`` is set, and skip models
+    outside the resolved ``select``/``exclude`` set.
     """
     ti = context["ti"]
     params = context.get("params", {})

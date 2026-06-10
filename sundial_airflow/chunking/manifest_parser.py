@@ -1,4 +1,4 @@
-"""Parse manifest.json and chunking config into a backfill graph."""
+"""Parse manifest.json and chunking config into the chunked-model graph."""
 from __future__ import annotations
 
 import json

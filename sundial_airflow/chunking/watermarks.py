@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sundial_airflow.backfill.manifest_parser import BackfillModel
+from sundial_airflow.chunking.manifest_parser import BackfillModel
 from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)

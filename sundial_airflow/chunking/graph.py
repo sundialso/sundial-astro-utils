@@ -13,7 +13,7 @@ from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 from cosmos.operators.local import DbtTestLocalOperator
 
-from sundial_airflow.backfill.manifest_parser import CHUNKED, BackfillModel
+from sundial_airflow.chunking.manifest_parser import CHUNKED, BackfillModel
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,

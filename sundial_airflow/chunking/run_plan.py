@@ -7,7 +7,7 @@ from typing import Literal
 
 from dateutil.relativedelta import relativedelta
 
-from sundial_airflow.backfill.manifest_parser import (
+from sundial_airflow.chunking.manifest_parser import (
     CHUNKED,
     BackfillModel,
     chunk_windows_from_anchor,
