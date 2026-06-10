@@ -112,7 +112,7 @@ def make_dbt_dag(
     default_args: dict[str, Any] | None = None,
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
-    max_active_tasks: int = 4,
+    max_active_tasks: int = 8,
     catchup: bool = False,
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
