@@ -40,6 +40,8 @@ watermarks = _load_module(
 
 _extract_partition_column = manifest_parser._extract_partition_column
 partition_watermark_sql = watermarks.partition_watermark_sql
+partition_watermarks_batch_sql = watermarks.partition_watermarks_batch_sql
+_WatermarkQuery = watermarks._WatermarkQuery
 _parse_watermark = watermarks._parse_watermark
 
 
@@ -71,6 +73,38 @@ class PartitionWatermarkSqlTests(unittest.TestCase):
     def test_rejects_unsafe_partition_column(self):
         with self.assertRaises(ValueError):
             partition_watermark_sql("db.schema.table", "daily_cohort_date; DROP TABLE x")
+
+
+class PartitionWatermarksBatchSqlTests(unittest.TestCase):
+    def test_builds_union_all_query(self):
+        sql = partition_watermarks_batch_sql(
+            [
+                _WatermarkQuery(
+                    "orders",
+                    "DB.SCHEMA.orders",
+                    "event_ts",
+                ),
+                _WatermarkQuery(
+                    "line_items",
+                    "DB.SCHEMA.line_items",
+                    "created_at",
+                ),
+            ]
+        )
+        self.assertIn(
+            "SELECT 'orders' AS model_name, MAX(event_ts) AS watermark FROM DB.SCHEMA.orders",
+            sql,
+        )
+        self.assertIn(
+            "SELECT 'line_items' AS model_name, MAX(created_at) AS watermark "
+            "FROM DB.SCHEMA.line_items",
+            sql,
+        )
+        self.assertIn("UNION ALL", sql)
+
+    def test_rejects_empty_batch(self):
+        with self.assertRaises(ValueError):
+            partition_watermarks_batch_sql([])
 
 
 class ParseWatermarkTests(unittest.TestCase):
