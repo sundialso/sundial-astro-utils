@@ -43,10 +43,9 @@
 {#    models:                                                         #}
 {#      <project>:                                                    #}
 {#        # acquire_run_lock() REPLACES log_model_status('started') as #}
-{#        # the pre-hook: it writes the same run-aware 'started' row    #}
-{#        # AND enforces the cross-run lock. Using log_model_status     #}
-{#        # here instead leaves the lock inert and writes 'started'     #}
-{#        # rows with a NULL heartbeat that crash-reclaim can't sweep.  #}
+{#        # the pre-hook: it always writes the run-aware 'started' row     #}
+{#        # (watermarks + log_run_results depend on this). Cross-run lock  #}
+{#        # is gated by enable_dbt_run_lock (default false, TODO: on).      #}
 {#        +pre-hook:  ["{{ sundial_dbt_shared.acquire_run_lock() }}"]            #}
 {#        +post-hook: ["{{ sundial_dbt_shared.log_model_status('succeeded') }}"] #}
 {#      # Incremental models additionally validate backfill bounds as   #}
@@ -532,18 +531,23 @@
 {#  Write-first-then-look + single warehouse clock ⇒ at least one run        #}
 {#  always sees the other and exactly the earliest proceeds (no double run,  #}
 {#  no mutual lockout).                                                     #}
+{#                                                                    #}
+{#  FEATURE FLAG: enable_dbt_run_lock (default false). Lock steps 1+3 off;  #}
+{#  step 2 ('started' row) always runs. TODO: re-enable when stable.        #}
 {# ------------------------------------------------------------------ #}
 {% macro acquire_run_lock() %}
+  {%- set lock_enabled = var('enable_dbt_run_lock', false) -%}
   {%- if execute -%}
     {%- set rg = var('run_group_id', invocation_id) -%}
     {%- set ck = var('chunk_key', 'full') -%}
-    {%- set ttl = var('dbt_run_lock_ttl_minutes', 60) | int -%}
     {%- set tbl = sundial_dbt_shared.dbt_completions_table() -%}
     {%- set terminal = "('succeeded','failed','locked_out','crashed')" -%}
 
+    {%- if lock_enabled -%}
     {# 1) CRASH RECLAIM (the only use of heartbeat_at): any 'started' for this
        model whose heartbeat is older than the TTL and which never reached a
        terminal is swept to 'crashed', so the lock logic below sees it freed. #}
+    {%- set ttl = var('dbt_run_lock_ttl_minutes', 60) | int -%}
     {%- set reclaim_sql -%}
       MERGE INTO {{ tbl }} T
       USING (
@@ -565,8 +569,10 @@
         VALUES (S.model_name, S.execution_ts, 'crashed', S.run_group_id, S.chunk_key, CURRENT_TIMESTAMP())
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(reclaim_sql)) %}
+    {%- endif -%}
 
-    {# 2) Write my 'started' row. Matched on the live lifecycle row for
+    {# 2) Write my 'started' row (always — watermarks + completions depend on it).
+       Matched on the live lifecycle row for
        (model, run_group, chunk) — there is at most one, either 'started' or
        'locked_out' (the lockout in step 3 flips the SAME row rather than adding
        one), so this MERGE can never match two:
@@ -599,6 +605,7 @@
     {%- endset -%}
     {% do run_query(sundial_dbt_shared.with_merge_retry(merge_sql)) %}
 
+    {%- if lock_enabled -%}
     {# 3) Look — started/terminal ONLY (no heartbeat): a foreign run_group that
        HOLDS M (a 'started' chunk with no terminal) and has priority over me. #}
     {%- set verify_sql -%}
@@ -650,8 +657,9 @@
           "dbt_run_lock: model '" ~ this.name ~ "' is locked out — run_group '" ~ winner
           ~ "' holds it. Recorded status='locked_out' (not a model failure).") }}
     {%- endif -%}
+    {%- endif -%}
   {%- endif -%}
-  SELECT 1 AS lock_acquired
+  SELECT 1 AS run_started
 {% endmacro %}
 
 {# ------------------------------------------------------------------ #}

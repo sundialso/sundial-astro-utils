@@ -227,6 +227,9 @@ def make_dbt_dag(
                 or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
             )
 
+            # TODO: re-enable cross-run lock when stable.
+            dbt_vars["enable_dbt_run_lock"] = False
+
             # run_group_id ties every task/chunk of THIS DAG run together: the
             # dbt run-lock treats them as one logical run (teammates), while a
             # different run (or orchestrator) is a stranger that backs off. All
