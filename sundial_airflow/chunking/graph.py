@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
@@ -16,12 +17,12 @@ from cosmos.operators.local import DbtTestLocalOperator
 from sundial_airflow.backfill.manifest_parser import CHUNKED, BackfillModel
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
-    skip_chunked_incremental,
     skip_chunked_model_test,
-    skip_chunked_run,
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_CHUNK_WORKERS = 32
 
 
 def build_chunked_model_graph(
@@ -36,14 +37,7 @@ def build_chunked_model_graph(
     upstream_task: Any,
     parent_group: Any | None = None,
 ) -> tuple[dict[str, TaskGroup], dict[str, Any], dict[str, Any]]:
-    """Build chunked model TaskGroups with dynamically mapped chunk tasks.
-
-    Chunk windows are planned once in ``prepare_dbt_args`` (``chunk_units`` in
-    XCom). Each model only has a thin selector task that reads that shared plan.
-
-    When ``parent_group`` is set (typically the Cosmos ``DbtTaskGroup``), each
-    model group is nested under it alongside the standard Cosmos model tasks.
-    """
+    """Build TaskGroups for chunked models."""
     start_var, end_var = chunk_var_keys
     model_groups: dict[str, TaskGroup] = {}
     test_tasks: dict[str, Any] = {}
@@ -90,105 +84,87 @@ def build_chunked_model_graph(
                 f"dbt run failed for {model_name} (exit={result.returncode})"
             )
 
-    def _make_model_tasks(model_name: str) -> tuple[Any, Any, Any, Any]:
-        """Create fresh TaskFlow tasks for one model (avoid shared-decorator bugs)."""
-
-        @task.branch(task_id="route_run")
-        def route_run(**context: Any) -> str:
-            """Choose mapped chunks vs one incremental pass."""
+    def _make_model_tasks(model_name: str) -> tuple[Any, Any]:
+        @task(task_id="run", trigger_rule="none_failed")
+        def run(**context: Any) -> None:
+            """Run one incremental pass or parallel chunk windows."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            params = context.get("params", {})
+            if params.get("skip_tests") or params.get("empty"):
+                from airflow.exceptions import AirflowSkipException
+
+                raise AirflowSkipException("Skipped (skip_tests or empty mode)")
+
+            selected_models = prep.get("selected_models")
+            if selected_models is not None and model_name not in selected_models:
+                from airflow.exceptions import AirflowSkipException
+
+                raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
             run_plan = prep.get("run_plan") or {}
-            plan = run_plan.get(model_name) or {}
-            prefix = context["ti"].task_id.rsplit(".", 1)[0]
-            if plan.get("disposition") == "chunked" and plan.get("chunks"):
-                target = f"{prefix}.chunk_units"
-                logger.info(
-                    "route_run %r: disposition=chunked chunks=%d -> %s",
-                    model_name,
-                    len(plan.get("chunks") or []),
-                    target,
-                )
-                return target
-            target = f"{prefix}.run_incremental"
-            logger.info(
-                "route_run %r: disposition=%s -> %s",
-                model_name,
-                plan.get("disposition", "missing"),
-                target,
-            )
-            return target
+            plan = run_plan.get(model_name)
+            if plan is None:
+                from airflow.exceptions import AirflowSkipException
 
-        @task(task_id="chunk_units")
-        def chunk_units(**context: Any) -> list[dict[str, str]]:
-            """Read mapped chunk kwargs from prepare_dbt_args."""
-            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+                raise AirflowSkipException(f"No run plan for '{model_name}'")
+
+            base_vars = dict(prep.get("vars") or {})
             units = (prep.get("chunk_units") or {}).get(model_name, [])
-            logger.info(
-                "chunk_units %r: %d chunk(s): %s",
-                model_name,
-                len(units),
-                ", ".join(u["chunk_id"] for u in units) or "(none)",
-            )
-            return units
+            disposition = plan.get("disposition")
 
-        @task(
-            task_id="run_chunk",
-            trigger_rule="none_failed",
-            map_index_template="{{ chunk_id }}",
-        )
-        def run_chunk(
-            chunk_id: str,
-            chunk_start: str,
-            chunk_end: str,
-            **context: Any,
-        ) -> None:
-            """Run one mapped chunk window."""
-            logger.info(
-                "Starting run_chunk model=%s chunk=%s window=%s..%s",
-                model_name,
-                chunk_id,
-                chunk_start,
-                chunk_end,
-            )
-            skip_chunked_run(context, model_name=model_name)
-            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            base_vars = dict(prep.get("vars") or {})
-            ti = context["ti"]
-            base_vars[start_var] = chunk_start
-            base_vars[end_var] = chunk_end
-            base_vars["backfill_chunk_id"] = chunk_id
-            base_vars["chunk_key"] = chunk_id
-            base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
-            _invoke(base_vars, model_name)
+            if disposition == "chunked" and units:
+                logger.info(
+                    "run %r: chunked path with %d chunk(s): %s",
+                    model_name,
+                    len(units),
+                    ", ".join(u["chunk_id"] for u in units),
+                )
 
-        @task(task_id="run_incremental", trigger_rule="none_failed")
-        def run_incremental(**context: Any) -> None:
-            """Run one incremental pass when the run plan is single."""
-            logger.info("Starting run_incremental for model=%s", model_name)
-            skip_chunked_incremental(context, model_name=model_name)
-            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            base_vars = dict(prep.get("vars") or {})
-            base_vars["chunk_key"] = "full"
-            base_vars["run_group_id"] = context["dag_run"].run_id
+                def _run_chunk(unit: dict[str, str]) -> None:
+                    chunk_id = unit["chunk_id"]
+                    chunk_vars = dict(base_vars)
+                    chunk_vars[start_var] = unit["chunk_start"]
+                    chunk_vars[end_var] = unit["chunk_end"]
+                    chunk_vars["backfill_chunk_id"] = chunk_id
+                    chunk_vars["chunk_key"] = chunk_id
+                    chunk_vars["run_group_id"] = (
+                        f"{context['dag_run'].run_id}:{model_name}:{chunk_id}"
+                    )
+                    logger.info(
+                        "run %r chunk=%s window=%s..%s",
+                        model_name,
+                        chunk_id,
+                        unit["chunk_start"],
+                        unit["chunk_end"],
+                    )
+                    _invoke(chunk_vars, model_name)
+
+                workers = min(len(units), _MAX_CHUNK_WORKERS)
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_run_chunk, unit) for unit in units]
+                    for future in as_completed(futures):
+                        future.result()
+                return
+
+            logger.info("run %r: incremental path (disposition=%s)", model_name, disposition)
+            incremental_vars = dict(base_vars)
+            incremental_vars["chunk_key"] = "full"
+            incremental_vars["run_group_id"] = context["dag_run"].run_id
             _invoke(
-                base_vars,
+                incremental_vars,
                 model_name,
                 full_refresh=bool(prep.get("full_refresh")),
             )
 
-        router = route_run()
-        units = chunk_units()
-        mapped = run_chunk.expand_kwargs(units)
-        incremental = run_incremental()
-        router >> [units, incremental]
-        return router, units, mapped, incremental
+        run_task = run()
+        return run_task, run_task
 
     for model in order:
         if model.kind != CHUNKED:
             continue
 
         with TaskGroup(group_id=model.name, parent_group=parent_group) as tg:
-            router, units, mapped_chunks, incremental = _make_model_tasks(model.name)
+            run_task, _ = _make_model_tasks(model.name)
 
             test_task = DbtTestLocalOperator(
                 task_id="test",
@@ -202,11 +178,10 @@ def build_chunked_model_graph(
                     + "')['vars'] }}"
                 ),
                 install_deps=False,
-                trigger_rule="none_failed_min_one_success",
+                trigger_rule="none_failed",
                 pre_execute=partial(skip_chunked_model_test, model_name=model.name),
             )
-            mapped_chunks >> test_task
-            incremental >> test_task
+            run_task >> test_task
 
         upstreams = [
             models_by_key[k].name
@@ -216,12 +191,12 @@ def build_chunked_model_graph(
         if upstreams:
             for up in upstreams:
                 if up in test_tasks:
-                    test_tasks[up] >> router
+                    test_tasks[up] >> run_task
         else:
-            upstream_task >> router
+            upstream_task >> run_task
 
         model_groups[model.name] = tg
         test_tasks[model.name] = test_task
-        run_entry_tasks[model.name] = router
+        run_entry_tasks[model.name] = run_task
 
     return model_groups, test_tasks, run_entry_tasks
