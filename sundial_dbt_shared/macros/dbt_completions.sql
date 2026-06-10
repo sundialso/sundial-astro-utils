@@ -547,7 +547,7 @@
     {# 1) CRASH RECLAIM (the only use of heartbeat_at): any 'started' for this
        model whose heartbeat is older than the TTL and which never reached a
        terminal is swept to 'crashed', so the lock logic below sees it freed. #}
-    {%- set ttl = var('dbt_run_lock_ttl_minutes', 60) | int -%}
+    {%- set ttl = var('dbt_run_lock_ttl_minutes', 240) | int -%}
     {%- set reclaim_sql -%}
       MERGE INTO {{ tbl }} T
       USING (
