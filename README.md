@@ -11,6 +11,7 @@ its own connection IDs, schedule, and dbt project files.
 | Module | Purpose |
 | --- | --- |
 | `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG, including runtime chunking. |
+| `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Pre-chunking rollback factory frozen at `f43ceabf` (Cosmos-only, no chunk task groups). |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
