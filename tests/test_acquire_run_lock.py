@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Unit tests for the cross-run lock (acquire_run_lock).
+"""Unit tests for acquire_run_lock (cross-run lock + feature flag).
 
-The lock is realized purely on the per-(model, run_group, chunk) 'started' row +
-terminal rows — no separate lock table. acquire_run_lock does, in order:
+The lock is realized on the per-(model, run_group, chunk) 'started' row +
+terminal rows — no separate lock table. With enable_dbt_run_lock=true,
+acquire_run_lock does, in order:
   1. reclaim : sweep stale 'started' rows (heartbeat older than TTL, no terminal)
                to a 'crashed' terminal, freeing a crashed run's lock.
   2. write   : upsert MY 'started' row (revive my own 'locked_out' on retry).
@@ -11,8 +12,8 @@ terminal rows — no separate lock table. acquire_run_lock does, in order:
                smaller run_group_id). If found -> I lose: flip my row to
                'locked_out' and raise.
 
-Write-first-then-look + a single warehouse clock ⇒ at least one run sees the
-other and EXACTLY the earliest proceeds (no double-run, no mutual lockout).
+With enable_dbt_run_lock=false (default), only step 2 runs — completions
+entries still work, but there is no reclaim, lockout, or error.
 
 These tests embed the macro's actual MERGE / verify SQL on DuckDB, substituting
 only CURRENT_TIMESTAMP() with a controllable timestamp so races/ties are
@@ -39,7 +40,7 @@ def ts(hh, mm=0):
     return f"2026-06-05 {hh:02d}:{mm:02d}:00"
 
 
-class LockTestCase(unittest.TestCase):
+class AcquireRunLockTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.con = duckdb.connect(":memory:")
         self.con.execute(
@@ -154,12 +155,26 @@ class LockTestCase(unittest.TestCase):
         )
 
     # -- high-level driver ------------------------------------------------
-    def acquire(self, rg, now, ck="full", reclaim=False, ttl=240):
-        """Run the full pre-hook. Returns None if the lock is acquired, else the
-        winning foreign run_group_id (the macro would raise here -> 'locked_out')."""
-        if reclaim:
+    def acquire(
+        self,
+        rg,
+        now,
+        ck="full",
+        *,
+        reclaim=False,
+        ttl=240,
+        lock_enabled=True,
+    ):
+        """Mirror acquire_run_lock. lock_enabled maps to enable_dbt_run_lock.
+
+        Returns None if the lock is acquired (or locking is disabled), else the
+        winning foreign run_group_id (the macro would raise -> 'locked_out').
+        """
+        if lock_enabled and reclaim:
             self._reclaim(now, ttl)
         self._write_started(rg, ck, now)
+        if not lock_enabled:
+            return None
         winner = self._look(rg)
         if winner is not None:
             self._lockout(rg, ck, now)
@@ -181,7 +196,8 @@ class LockTestCase(unittest.TestCase):
         ).fetchall()
         return [r[0] for r in rows]
 
-    # -- tests ------------------------------------------------------------
+
+class LockEnabledTestCase(AcquireRunLockTestCase):
     def test_uncontended_acquires(self):
         self.assertIsNone(self.acquire("R1", ts(10)))
         self.assertEqual(self.statuses("R1"), ["started"])
@@ -254,6 +270,34 @@ class LockTestCase(unittest.TestCase):
         self.assertEqual(winner, "R1")                          # R2 locked out
         self.assertNotIn("crashed", self.statuses("R1"))
         self.assertEqual(self.statuses("R2"), ["locked_out"])
+
+
+class LockDisabledTestCase(AcquireRunLockTestCase):
+    def test_writes_started_row(self):
+        self.assertIsNone(self.acquire("R1", ts(10), lock_enabled=False))
+        self.assertEqual(self.statuses("R1"), ["started"])
+
+    def test_no_lockout_when_holder_running(self):
+        self.assertIsNone(self.acquire("R1", ts(10), lock_enabled=True))
+        self.assertIsNone(self.acquire("R2", ts(10, 5), lock_enabled=False))
+        self.assertEqual(self.statuses("R1"), ["started"])
+        self.assertEqual(self.statuses("R2"), ["started"])
+
+    def test_concurrent_runs_all_proceed(self):
+        self.assertIsNone(self.acquire("R1", ts(10), lock_enabled=False))
+        self.assertIsNone(self.acquire("R2", ts(10, 5), lock_enabled=False))
+        self.assertIsNone(self.acquire("R3", ts(10, 9), lock_enabled=False))
+        self.assertEqual(self.statuses("R1"), ["started"])
+        self.assertEqual(self.statuses("R2"), ["started"])
+        self.assertEqual(self.statuses("R3"), ["started"])
+
+    def test_skips_reclaim_even_when_stale(self):
+        self._write_started("R1", "full", ts(10))
+        self.assertIsNone(
+            self.acquire("R2", ts(15), reclaim=True, ttl=240, lock_enabled=False)
+        )
+        self.assertEqual(self.statuses("R1"), ["started"])  # not swept to crashed
+        self.assertEqual(self.statuses("R2"), ["started"])
 
 
 if __name__ == "__main__":

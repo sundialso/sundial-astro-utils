@@ -1,8 +1,19 @@
-"""``make_dbt_dag``: the single entry point each tenant uses to build its DAG.
+"""``make_dbt_dag`` — single entry point each tenant uses to build its DAG.
 
-Wires the standard params, ``prepare_dbt_args``, per-source tests (each scoped
-to its own consumers), the Cosmos ``DbtTaskGroup``, runtime chunking, and the
-Slack failure alert, keeping tenant DAG files to ~25 lines.
+The factory absorbs every bit of plumbing that's currently duplicated across
+the tenant DAGs:
+
+- standard ``params`` set (backfill, select/exclude, skip_tests, ...)
+- ``prepare_dbt_args`` task (``--vars`` blob + ``dbt ls`` selection resolution)
+- per-source-table ``DbtTestLocalOperator``s, each wired *directly* to the
+  models that consume that source (no global ``source_tests_gate`` — a single
+  failing source test only blocks its own subtree, not the whole pipeline)
+- the Cosmos ``DbtTaskGroup``
+- ``report_data_processed`` task (BigQuery / Snowflake variant)
+- Slack failure alert wired into ``default_args``
+
+Tenant DAG files reduce to ~25 lines: a single ``make_dbt_dag(...)`` call
+configured with their connection IDs / dataset name / schedule.
 """
 from __future__ import annotations
 
@@ -22,18 +33,14 @@ from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
 from cosmos.constants import TestBehavior
 from cosmos.operators.local import DbtTestLocalOperator
 
-from sundial_airflow.chunking.manifest_parser import (
+from sundial_airflow.backfill.manifest_parser import (
     CHUNKED,
     load_backfill_models,
     load_chunking_config,
     topological_order,
 )
 from sundial_airflow.chunking.graph import build_chunked_model_graph
-from sundial_airflow.chunking.run_plan import (
-    build_run_plan,
-    serialize_run_plan,
-)
-from sundial_airflow.chunking.chunk_spec import build_chunk_units
+from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
@@ -69,8 +76,14 @@ def _param_field_name(warehouse: Warehouse) -> str:
 def _collect_run_tasks(group: Any) -> dict[str, Any]:
     """Walk a Cosmos ``DbtTaskGroup`` and return ``{model_name: run_task}``.
 
-    Handles both Cosmos layouts (``<model>.run`` sub-group and flat
-    ``<model>_run``); non-model leaves (seeds, snapshots, tests) are ignored.
+    Handles both rendering layouts Cosmos can produce:
+
+    - sub-group form: ``<group>.<model>.run`` / ``<group>.<model>.test``
+      (the default with ``TestBehavior.AFTER_EACH``)
+    - flat form: ``<group>.<model>_run`` / ``<group>.<model>_test``
+
+    Seeds, snapshots, and singular tests are ignored — they have leaf names
+    other than ``run``/``*_run``.
     """
     out: dict[str, Any] = {}
 
@@ -112,7 +125,7 @@ def make_dbt_dag(
     default_args: dict[str, Any] | None = None,
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
-    max_active_tasks: int = 8,
+    max_active_tasks: int = 4,
     catchup: bool = False,
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
@@ -123,22 +136,54 @@ def make_dbt_dag(
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
-    See ``README.md`` for a usage example. Most parameters are self-describing;
-    the less obvious ones:
+    See ``README.md`` for an end-to-end usage example. All keyword arguments
+    are required unless documented otherwise.
 
+    Parameters
+    ----------
+    dag_id:
+        Airflow DAG id
+    tenant:
+        Short tenant slug; used in the Slack alert and the
+        ``run_context_tag`` (``"<tenant>_normal"``, etc).
     warehouse:
-        ``"bigquery"`` or ``"snowflake"``; picks the ``target_dataset`` vs
-        ``target_schema`` var key.
+        ``"bigquery"`` or ``"snowflake"``. Controls the ``target_dataset``
+        vs ``target_schema`` var key passed to dbt.
+    dbt_project_path:
+        Absolute path to the dbt project (the directory containing
+        ``dbt_project.yml``).
+    dbt_profile_name:
+        Profile name as it appears in ``profiles.yml``; used by ``dbt ls``
+        when resolving model selection.
+    venv_execution_config:
+        Cosmos ``ExecutionConfig`` pointing at the dbt venv.
     profile_config_factory:
-        ``(target, dataset_or_schema) -> ProfileConfig``, kept tenant-side so
-        warehouse-specific profile mapping stays out of the SDK.
+        Callable ``(target, dataset_or_schema) -> ProfileConfig``. Tenants
+        keep this in their ``include/constants.py`` so warehouse-specific
+        profile-mapping details (BigQuery vs Snowflake) stay tenant-side.
+    default_dataset_or_schema:
+        The default dataset (BigQuery) or schema (Snowflake) for this tenant.
+        Must match the schema/dataset in the tenant's dbt profile (the value
+        passed to ``profile_config_factory``). Flows into dbt as
+        ``target_dataset`` / ``target_schema`` and drives watermark queries,
+        Cosmos runs, and chunked model runs.
     default_project:
-        Warehouse project/database dbt writes to; forwarded via XCom so the
-        completions listener can locate ``dbt_completions``. Optional.
-    chunking_config_path:
-        Enables runtime chunking when set (see the README's Chunking section).
+        BigQuery project where dbt writes (same value dbt uses for
+        ``var('target_project')``). Passed through ``dbt_vars`` in XCom so the
+        DbtCompletionsListener can locate the ``dbt_completions`` table on a
+        manual UI state change. Optional; the listener no-ops without it.
+    default_args:
+        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory wires
+        ``dag_failure_alert`` as the DAG-level ``on_failure_callback`` so it
+        fires once per failed DAG run rather than on every failed task.
+    extra_tags:
+        Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
     pre_tasks:
-        Zero-arg task factories run serially before ``prepare_dbt_args``.
+        Optional list of zero-arg callables that return TaskFlow tasks; they
+        run before ``prepare_dbt_args``.
+    max_active_tasks, catchup, target_choices, sources_yml_candidates,
+    recursive_tests:
+        Tuning knobs with sensible defaults; see the implementation.
     """
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
@@ -213,6 +258,9 @@ def make_dbt_dag(
                 params.get("execution_ts")
                 or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
             )
+
+            # TODO: re-enable cross-run lock when stable.
+            dbt_vars["enable_dbt_run_lock"] = False
 
             # run_group_id ties this run's tasks together for the dbt run-lock;
             # per-chunk fan-out overrides chunk_key per task.
@@ -329,21 +377,11 @@ def make_dbt_dag(
                     dbt_vars=dbt_vars,
                     models=watermark_models,
                 )
-                window_start = None
-                window_end = None
-                if backfill_mode == "partial":
-                    ws = dbt_vars.get("backfill_start_ts")
-                    we = dbt_vars.get("backfill_end_ts")
-                    if ws and we:
-                        window_start = _dt.date.fromisoformat(str(ws)[:10])
-                        window_end = _dt.date.fromisoformat(str(we)[:10])
                 plans = build_run_plan(
                     models=plan_models,
                     watermarks=watermarks,
                     backfill_mode=backfill_mode,
                     execution_ts=execution_date,
-                    window_start=window_start,
-                    window_end=window_end,
                 )
                 run_plan = serialize_run_plan(plans)
                 for name, wm in watermarks.items():
@@ -356,8 +394,6 @@ def make_dbt_dag(
                         len(plan.get("chunks") or []),
                     )
 
-            chunk_units = build_chunk_units(run_plan) if run_plan else {}
-
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
@@ -368,7 +404,6 @@ def make_dbt_dag(
                 "run_context": run_context,
                 "run_context_tag": run_context_tag,
                 "run_plan": run_plan,
-                "chunk_units": chunk_units,
             }
 
         dbt_args = prepare_dbt_args()
@@ -392,7 +427,7 @@ def make_dbt_dag(
                         + PREPARE_TASK_ID
                         + "')['vars'] }}"
                     ),
-                    install_deps=False,
+                    install_deps=True,
                     pre_execute=make_source_test_skip_hook(dependents),
                 )
 
@@ -429,13 +464,24 @@ def make_dbt_dag(
             },
         )
 
-        # Optional pre-tasks run serially before ``prepare_dbt_args``.
+        # Optional pre-tasks (e.g. ami_dbt's S3 -> Snowflake EMR ingest) run
+        # serially before ``prepare_dbt_args``. ``pre_tasks`` items are
+        # zero-arg factories that build the TaskFlow task instance.
         pre_task_chain = [factory() for factory in pre_tasks or []]
         for prev, nxt in zip(pre_task_chain, pre_task_chain[1:]):
             prev >> nxt
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
+        # Per-source fan-out (no global gate):
+        #
+        #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
+        #                     └─ <models with no tested source> (run after prepare)
+        #
+        # A failing ``test_s_t`` only flips ``upstream_failed`` on the models
+        # that consume that source; sibling branches are unaffected. Models
+        # with no source dependency (or whose sources have no tests) just run
+        # after ``prepare_dbt_args``.
         dbt_args >> source_test_group
         dbt_args >> dbt_models
 
