@@ -382,6 +382,12 @@ def make_dbt_dag(
                     watermarks=watermarks,
                     backfill_mode=backfill_mode,
                     execution_ts=execution_date,
+                    window_start=dbt_vars.get("backfill_start_ts")
+                    if backfill_mode == "partial"
+                    else None,
+                    window_end=dbt_vars.get("backfill_end_ts")
+                    if backfill_mode == "partial"
+                    else None,
                 )
                 run_plan = serialize_run_plan(plans)
                 for name, wm in watermarks.items():

@@ -141,6 +141,20 @@ class RunPlanTests(unittest.TestCase):
         self.assertGreaterEqual(plan.chunks[0].start, date(2021, 1, 1))
         self.assertLessEqual(plan.chunks[-1].end, date(2022, 6, 1))
 
+    def test_upper_bound_is_execution_ts_not_capped_at_today(self) -> None:
+        """Chunk planning ends at execution_ts (end_ts), not calendar today."""
+        model = _chunked_model(first="2020-01-01", chunk_months=6)
+        future_end = date(2099, 1, 1)
+        plans = build_run_plan(
+            models={model.node_key: model},
+            watermarks={},
+            backfill_mode="full",
+            execution_ts=future_end,
+        )
+        plan = plans[model.name]
+        self.assertEqual(plan.disposition, "chunked")
+        self.assertEqual(plan.chunks[-1].end, future_end)
+
 
 if __name__ == "__main__":
     unittest.main()

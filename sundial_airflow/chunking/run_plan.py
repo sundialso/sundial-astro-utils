@@ -40,13 +40,11 @@ def build_run_plan(
     watermarks: dict[str, datetime | None],
     backfill_mode: str,
     execution_ts: date,
-    today: date | None = None,
     window_start: date | datetime | None = None,
     window_end: date | datetime | None = None,
 ) -> dict[str, ModelRunPlan]:
     """Build the per-model run plan for chunked models."""
-    today = today or date.today()
-    upper = min(execution_ts, today)
+    upper = execution_ts
     plans: dict[str, ModelRunPlan] = {}
 
     for model in models.values():
