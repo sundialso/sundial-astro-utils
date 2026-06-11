@@ -10,8 +10,10 @@ its own connection IDs, schedule, and dbt project files.
 
 | Module | Purpose |
 | --- | --- |
-| `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG, including runtime chunking. |
-| `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Pre-chunking rollback factory frozen at `f43ceabf` (Cosmos-only, no chunk task groups). |
+| `sundial_airflow.create_dag.create_dag` | Chunking-enabled entry point for tenants rolling out chunking. |
+| `sundial_airflow.dag_factory.make_dbt_dag` | Cosmos-only factory (no chunk task groups) for all other tenants. |
+| `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
+| `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -35,7 +37,9 @@ In a DAG file:
 from datetime import timedelta
 from pendulum import datetime
 
+from sundial_airflow.create_dag import create_dag
 from sundial_airflow.dag_factory import make_dbt_dag
+from sundial_airflow.feature_flags import is_chunking_enabled, resolve_dag_schedules
 
 from include.constants import (
     DBT_BQ_DATASET,
@@ -44,11 +48,12 @@ from include.constants import (
     venv_execution_config,
 )
 
-dag = make_dbt_dag(
-    dag_id="dbt_example_client",
+DAG_SCHEDULE = "0 8 * * *"
+create_schedule, legacy_schedule = resolve_dag_schedules(DAG_SCHEDULE)
+
+_COMMON = dict(
     tenant="example_client",
     start_date=datetime(2025, 4, 22),
-    schedule="0 8 * * *",
     warehouse="bigquery",
     dbt_project_path=dbt_project_path,
     dbt_profile_name="example_client_dbt",
@@ -60,6 +65,19 @@ dag = make_dbt_dag(
         "retry_delay": timedelta(minutes=5),
         "execution_timeout": timedelta(hours=3),
     },
+)
+
+dag = create_dag(
+    dag_id="dbt_example_client",
+    schedule=create_schedule,
+    chunking_config_path=dbt_project_path.parent / "include" / "chunking_config.json",
+    **_COMMON,
+)
+
+legacy_dag = make_dbt_dag(
+    dag_id="dbt_example_client_legacy",
+    schedule=legacy_schedule,
+    **_COMMON,
 )
 ```
 
@@ -87,7 +105,11 @@ That overrides the `git+https://...` URL from `requirements.txt` until you run
 
 ## Chunking
 
-Chunking is built into `make_dbt_dag` — there is no separate backfill DAG.
+Chunking is built into `create_dag` — there is no separate backfill DAG.
+Tenants without chunking keep using `dag_factory.make_dbt_dag` unchanged.
+For gradual rollout, toggle per deployment with `SUNDIAL_CHUNKING_ENABLED=true`
+and use `resolve_dag_schedules()` so only one of `create_dag` / `make_dbt_dag`
+is scheduled at a time.
 Pass `chunking_config_path` and the factory reads `target/manifest.json`,
 classifies each eligible model as **chunked** (per the tenant's
 `chunking_config.json`) or **full-refresh**, and decides at run time whether
