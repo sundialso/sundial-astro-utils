@@ -141,6 +141,28 @@ class RunPlanTests(unittest.TestCase):
         self.assertGreaterEqual(plan.chunks[0].start, date(2021, 1, 1))
         self.assertLessEqual(plan.chunks[-1].end, date(2022, 6, 1))
 
+    def test_partial_window_accepts_iso_strings(self) -> None:
+        """Airflow params arrive as ISO date strings, not date objects."""
+        model = BackfillModel(
+            node_key="model.picsart_dbt.daily_growth_accounting_web",
+            name="daily_growth_accounting_web",
+            kind=CHUNKED,
+            first_timestamp=date(2022, 1, 1),
+            depends_on=[],
+            chunk_months=6,
+        )
+        plans = build_run_plan(
+            models={model.node_key: model},
+            watermarks={model.name: datetime(2026, 6, 8)},
+            backfill_mode="partial",
+            execution_ts=date(2026, 6, 11),
+            window_start="2025-11-01",
+            window_end="2026-06-01",
+        )
+        plan = plans[model.name]
+        self.assertEqual(plan.disposition, "chunked")
+        self.assertEqual(len(plan.chunks), 2)
+
     def test_upper_bound_is_execution_ts_not_capped_at_today(self) -> None:
         """Chunk planning ends at execution_ts (end_ts), not calendar today."""
         model = _chunked_model(first="2020-01-01", chunk_months=6)

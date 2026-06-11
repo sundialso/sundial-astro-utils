@@ -143,8 +143,12 @@ def _to_windows(
     )
 
 
-def _as_date(value: datetime | date) -> date:
-    return value.date() if isinstance(value, datetime) else value
+def _as_date(value: datetime | date | str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 def _month_span(start: date, end: date) -> int:
