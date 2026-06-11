@@ -39,6 +39,7 @@ from sundial_airflow.chunking.manifest_parser import (
     load_chunking_config,
     topological_order,
 )
+from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.graph import build_chunked_model_graph
 from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
@@ -400,6 +401,8 @@ def make_dbt_dag(
                         len(plan.get("chunks") or []),
                     )
 
+            chunk_units = build_chunk_units(run_plan) if run_plan else {}
+
             return {
                 param_field: target_value,
                 "vars": dbt_vars,
@@ -410,6 +413,7 @@ def make_dbt_dag(
                 "run_context": run_context,
                 "run_context_tag": run_context_tag,
                 "run_plan": run_plan,
+                "chunk_units": chunk_units,
             }
 
         dbt_args = prepare_dbt_args()
