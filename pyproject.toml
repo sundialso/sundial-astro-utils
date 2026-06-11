@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sundial-airflow-utils"
-version = "0.1.0"
+version = "0.4.0"
 description = "Shared Airflow + Astronomer Cosmos utilities for Sundial dbt tenants."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,14 +15,16 @@ dependencies = [
     "apache-airflow>=2.8",
     "apache-airflow-providers-slack",
     "PyYAML>=6.0",
+    "python-dateutil>=2.8",
 ]
 
-# Warehouse providers are soft imports (the listener no-ops with a warning if
-# the matching provider is absent), so they're optional extras. Install the
-# one(s) your deployment uses, e.g. ``pip install sundial-airflow-utils[snowflake]``.
+# Warehouse providers are soft imports (the listener no-ops with a warning
+# if the matching provider is absent). Install the one(s) your deployment
+# uses, e.g. ``pip install sundial-airflow-utils[snowflake]``.
 [project.optional-dependencies]
 bigquery = ["apache-airflow-providers-google"]
 snowflake = ["apache-airflow-providers-snowflake"]
+dev = ["pytest>=7"]
 
 [project.urls]
 Homepage = "https://github.com/sundial-astro-sdk/sundial-astro-utils"
@@ -32,3 +34,6 @@ sundial_dbt_completions = "sundial_airflow.listeners:SundialDbtCompletionsPlugin
 
 [tool.setuptools.packages.find]
 include = ["sundial_airflow*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

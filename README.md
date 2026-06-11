@@ -10,7 +10,7 @@ its own connection IDs, schedule, and dbt project files.
 
 | Module | Purpose |
 | --- | --- |
-| `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG. |
+| `sundial_airflow.dag_factory.make_dbt_dag` | The single entry point each tenant calls to build a fully wired Cosmos DAG, including runtime chunking. |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -83,6 +83,42 @@ pip install -e ~/Documents/sundial-airflow-utils
 
 That overrides the `git+https://...` URL from `requirements.txt` until you run
 `pip install -r requirements.txt --force-reinstall` again.
+
+## Chunking
+
+Chunking is built into `make_dbt_dag` — there is no separate backfill DAG.
+Pass `chunking_config_path` and the factory reads `target/manifest.json`,
+classifies each eligible model as **chunked** (per the tenant's
+`chunking_config.json`) or **full-refresh**, and decides at run time whether
+each chunked model runs as a single incremental pass or fans out into mapped
+`chunk_<YYYY-MM>` tasks.
+
+The disposition depends on the run:
+
+- **Daily / incremental** (`backfill_mode=none`): single pass, unless the gap
+  between the model's watermark and today exceeds `chunk_size` months — then it
+  chunks from the watermark.
+- **Full backfill** (`backfill_mode=full`): always chunks from the model's
+  `first_timestamp` anchor up to today.
+- **Partial backfill** (`backfill_mode=partial` + `start_ts`/`end_ts`): single
+  pass when the window is ≤ `chunk_size`; otherwise chunks the requested window
+  on the anchor-aligned grid.
+
+Chunk windows are anchored to each model's `first_timestamp` and stepped by
+`chunk_size` months, so the same calendar range always maps to the same
+`chunk_key` (idempotent re-runs).
+
+### Tenant-side artifacts
+
+| Path | Purpose |
+| --- | --- |
+| `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
+| `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
+| `dbt_project.yml` `+post-hook` | BigQuery chunked runs: `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs). Requires `sundial_dbt_shared` with `backfill_tmp_relation.sql`. |
+
+Shared chunking dbt macros (`backfill_tmp_relation`, incremental windows,
+completions) live in the `sundial_dbt_shared` package inside this repo;
+tenants install them via `packages.yml`.
 
 ## Releasing
 
