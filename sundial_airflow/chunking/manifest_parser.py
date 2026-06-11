@@ -101,14 +101,9 @@ def load_backfill_models(
     """Load eligible manifest models and apply chunking config."""
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     models: dict[str, BackfillModel] = {}
-    opted_out = 0
 
     for node_key, node in manifest.get("nodes", {}).items():
         if not _is_eligible(node):
-            continue
-        meta = (node.get("config") or {}).get("meta") or {}
-        if meta.get("backfill_disabled") is True:
-            opted_out += 1
             continue
         raw_sql = node.get("raw_code") or node.get("raw_sql") or ""
         models[node_key] = BackfillModel(
@@ -129,9 +124,9 @@ def load_backfill_models(
     chunked = sum(1 for m in models.values() if m.kind == CHUNKED)
     logger.info(
         "Discovered %d eligible model(s) from %s "
-        "(%d chunked + %d full-refresh; %d opted out; %d promoted via config).",
+        "(%d chunked + %d full-refresh; %d promoted via config).",
         len(models), manifest_path, chunked, len(models) - chunked,
-        opted_out, promoted,
+        promoted,
     )
     return models
 
