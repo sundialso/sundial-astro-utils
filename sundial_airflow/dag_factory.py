@@ -33,7 +33,7 @@ from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
 from cosmos.constants import TestBehavior
 from cosmos.operators.local import DbtTestLocalOperator
 
-from sundial_airflow.backfill.manifest_parser import (
+from sundial_airflow.chunking.manifest_parser import (
     CHUNKED,
     load_backfill_models,
     load_chunking_config,
