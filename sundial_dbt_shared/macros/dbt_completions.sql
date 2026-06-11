@@ -830,17 +830,13 @@
 {#                                                                    #}
 {#  Wire as the FIRST pre-hook (before acquire_run_lock) on incremental  #}
 {#  models, or call from the tenant's start_ts, passing the model's      #}
-{#  first_timestamp. No-op unless run_context is 'partial_backfill' AND  #}
-{#  both backfill vars are set. Forward chunking also passes backfill     #}
-{#  bounds but uses run_context 'normal' or 'full_backfill', so it is    #}
-{#  intentionally allowed to extend beyond the watermark. Raises (the    #}
+{#  first_timestamp. No-op unless both backfill vars are set. Raises (the #}
 {#  run fails) on a violation — matching sundial rejecting the backfill   #}
 {#  state. Bounds are evaluated on the warehouse (CAST to the 'datetime' #}
 {#  type) so no Python date parsing is needed.                           #}
 {# ------------------------------------------------------------------ #}
 {% macro validate_partial_backfill(model_name, first_timestamp=none) %}
   {%- if execute
-        and var('run_context', none) == 'partial_backfill'
         and var('backfill_start_ts', none) is not none
         and var('backfill_end_ts', none) is not none -%}
     {%- set dt = sundial_dbt_shared.completions_col_type('datetime') -%}

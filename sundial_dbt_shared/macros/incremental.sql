@@ -18,10 +18,10 @@
 {#      final fallback = first_timestamp. Resume from watermark + 1s     #}
 {#      (that second was already processed), then back off `lookback`    #}
 {#      days for late data, floored at first_timestamp.                  #}
-{#    - UPPER bound (end_ts) = execution_ts - (lag days) - 1s, recorded  #}
-{#      via record_window_end → becomes the next run's watermark.        #}
-{#    - LOWER bound is recorded via record_window_start_value on the      #}
-{#      resolved incremental literal OR the backfill_start_ts override.  #}
+{#    - UPPER bound (end_ts) = execution_ts - (lag days) - 1s, and it is #}
+{#      recorded via record_window_end → becomes the next run's          #}
+{#      watermark. (start_ts does NOT record — end-only, to minimise     #}
+{#      writes to the completions table.)                               #}
 {#    - backfill overrides: vars `backfill_start_ts` / `backfill_end_ts`.#}
 {#                                                                      #}
 {#  Tenant requirement: the dbt_completions lock/watermark wiring must   #}
@@ -70,17 +70,15 @@
    in one model render issue ONE resolving query, not N. #}
 {% macro start_ts(timestamp_column, lookback_value, first_timestamp) %}
   {%- if var('backfill_start_ts', none) is not none -%}
-    {# Validate bounds only when the orchestrator set run_context to
-       partial_backfill (manual reprocess of already-covered history).
-       Forward chunking also passes backfill_start_ts but uses run_context
-       normal/full_backfill, so it may extend beyond the watermark. #}
-    {%- if var('run_context', none) == 'partial_backfill' -%}
-      {%- if execute and (model is none or model.get('__sundial_backfill_validated__') is none) -%}
-        {%- if model is not none -%}{%- do model.update({'__sundial_backfill_validated__': true}) -%}{%- endif -%}
-        {%- do sundial_dbt_shared.validate_partial_backfill(this.name, first_timestamp) -%}
-      {%- endif -%}
+    {# Validate backfill bounds ONLY on a partial-backfill run (this branch is
+       reached only when backfill_start_ts is set), so normal runs do no extra
+       work at all. validate_partial_backfill itself no-ops unless BOTH backfill
+       vars are set, and it raises on an invalid range / one beyond the watermark.
+       Memoised per model so the N start_ts() calls validate once. #}
+    {%- if execute and (model is none or model.get('__sundial_backfill_validated__') is none) -%}
+      {%- if model is not none -%}{%- do model.update({'__sundial_backfill_validated__': true}) -%}{%- endif -%}
+      {%- do sundial_dbt_shared.validate_partial_backfill(this.name, first_timestamp) -%}
     {%- endif -%}
-    {%- do sundial_dbt_shared.record_window_start_value(var('backfill_start_ts')) -%}
     {{ sundial_dbt_shared.incr_cast_ts(var('backfill_start_ts')) }}
   {%- elif is_incremental() -%}
     {{ sundial_dbt_shared.incr_cast_ts(sundial_dbt_shared._resolve_start_ts(timestamp_column, lookback_value, first_timestamp)) }}
