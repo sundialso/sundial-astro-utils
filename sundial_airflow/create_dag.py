@@ -224,10 +224,12 @@ def create_dag(
             _chunk_models = load_backfill_models(manifest_path, _chunk_config)
             _chunk_order = topological_order(_chunk_models) if _chunk_models else []
             _chunked_names = [m.name for m in _chunk_order if m.kind == CHUNKED]
-        except Exception as exc:
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             logger.warning(
                 "Chunking config parse failed for DAG %r: %s", dag_id, exc,
             )
+        except Exception:
+            raise
 
     @dag(
         dag_id=dag_id,
