@@ -180,8 +180,10 @@ class IncrementalMacroTests(unittest.TestCase):
         self.assertEqual(mod._logged["start_values"], ["2026-06-05 23:59:59"])
 
     def test_start_ts_backfill_override(self):
-        out = norm(module("snowflake", {"backfill_start_ts": "2026-02-01"}).start_ts("event_ts", 7, "2021-01-01"))
+        mod = module("snowflake", {"backfill_start_ts": "2026-02-01"})
+        out = norm(mod.start_ts("event_ts", 7, "2021-01-01"))
         self.assertEqual(out, "CAST('2026-02-01' AS TIMESTAMP_NTZ)")
+        self.assertEqual(mod._logged["start_values"], ["2026-02-01"])
 
     # ---- partial-backfill validation gating ---------------------------
     def test_normal_run_does_not_validate_backfill(self):
@@ -190,10 +192,30 @@ class IncrementalMacroTests(unittest.TestCase):
         mod.start_ts("event_ts", 7, "2021-01-01")
         self.assertEqual(mod._logged["validated"], [])
 
-    def test_backfill_run_validates_once(self):
-        # On a backfill run, validate_partial_backfill is called once (memoised),
-        # with the model name + first_timestamp (so all three checks apply).
-        mod = module("bigquery", {"backfill_start_ts": "2026-02-01"})
+    def test_chunk_backfill_vars_do_not_validate(self):
+        # Forward chunking passes backfill_start_ts but run_context is not
+        # partial_backfill — watermark-beyond checks must not run.
+        mod = module(
+            "bigquery",
+            {
+                "backfill_start_ts": "2026-02-01",
+                "backfill_end_ts": "2026-06-09",
+                "run_context": "normal",
+            },
+        )
+        mod.start_ts("event_ts", 7, "2021-01-01")
+        self.assertEqual(mod._logged["validated"], [])
+
+    def test_partial_backfill_run_validates_once(self):
+        # Only explicit partial_backfill runs validate bounds (memoised once).
+        mod = module(
+            "bigquery",
+            {
+                "backfill_start_ts": "2026-02-01",
+                "backfill_end_ts": "2026-03-01",
+                "run_context": "partial_backfill",
+            },
+        )
         mod.start_ts("event_ts", 7, "2021-01-01")
         mod.start_ts("event_ts", 7, "2021-01-01")
         self.assertEqual(mod._logged["validated"], [("my_model", "2021-01-01")])
