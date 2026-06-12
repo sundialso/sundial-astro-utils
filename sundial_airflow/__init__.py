@@ -3,7 +3,10 @@
 Tenant DAG files should import from this top-level module rather than the
 private submodules so we can rearrange internals without breaking them.
 """
+from sundial_airflow.create_dag import create_dag
 from sundial_airflow.dag_factory import make_dbt_dag
+from sundial_airflow.dag_factory_legacy import make_dbt_dag_legacy
+from sundial_airflow.feature_flags import is_chunking_enabled, resolve_dag_schedules
 from sundial_airflow.listeners import (
     DbtCompletionsListener,
     SundialDbtCompletionsPlugin,
@@ -12,7 +15,11 @@ from sundial_airflow.slack_alerts import dag_failure_alert
 from sundial_airflow.warehouses import WarehouseAdapter, get_adapter, register
 
 __all__ = [
+    "create_dag",
     "make_dbt_dag",
+    "make_dbt_dag_legacy",
+    "is_chunking_enabled",
+    "resolve_dag_schedules",
     "dag_failure_alert",
     "DbtCompletionsListener",
     "SundialDbtCompletionsPlugin",
