@@ -111,11 +111,7 @@ def make_dbt_dag(
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
 ):
-    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups).
-
-    Signature and behaviour match the pre-chunking factory frozen at commit
-    ``f43ceabf8149c0aa4ede9094fe04f6b64086bfc0``.
-    """
+    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups)."""
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
 

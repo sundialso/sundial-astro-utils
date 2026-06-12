@@ -244,6 +244,7 @@ def create_dag(
     def _build():
         @task(task_id=PREPARE_TASK_ID)
         def prepare_dbt_args(**context):
+            start_var, end_var = chunk_var_keys
             params = context["params"]
             dbt_vars: dict[str, Any] = {}
 
@@ -278,8 +279,8 @@ def create_dag(
                     raise ValueError(
                         "backfill_mode=partial requires both start_ts and end_ts"
                     )
-                dbt_vars["backfill_start_ts"] = start
-                dbt_vars["backfill_end_ts"] = end
+                dbt_vars[start_var] = start
+                dbt_vars[end_var] = end
 
             run_context = "normal"
             if backfill_mode == "full":
@@ -383,10 +384,10 @@ def create_dag(
                     watermarks=watermarks,
                     backfill_mode=backfill_mode,
                     execution_ts=execution_date,
-                    window_start=dbt_vars.get("backfill_start_ts")
+                    window_start=dbt_vars.get(start_var)
                     if backfill_mode == "partial"
                     else None,
-                    window_end=dbt_vars.get("backfill_end_ts")
+                    window_end=dbt_vars.get(end_var)
                     if backfill_mode == "partial"
                     else None,
                 )
