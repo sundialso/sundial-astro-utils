@@ -22,6 +22,7 @@ from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
 from cosmos.constants import TestBehavior
 from cosmos.operators.local import DbtTestLocalOperator
 
+from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
@@ -219,6 +220,13 @@ def make_dbt_dag(
                     profile_path,
                     profile_env,
                 ):
+                    env = {**os.environ, **profile_env}
+                    # Packages declared in packages.yml must be installed
+                    # before `dbt ls` will compile the project. The scheduled
+                    # path skips this block entirely (Cosmos installs deps per
+                    # model task via install_deps=True), so deps are only
+                    # needed here, on the select/exclude path.
+                    ensure_dbt_deps(dbt_executable, project_path_str, env=env)
                     cmd = [
                         dbt_executable,
                         "--quiet",
@@ -241,7 +249,6 @@ def make_dbt_dag(
                     if exclude_param:
                         cmd.extend(["--exclude", exclude_param])
 
-                    env = {**os.environ, **profile_env}
                     result = subprocess.run(
                         cmd,
                         capture_output=True,
