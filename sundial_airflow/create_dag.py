@@ -317,12 +317,28 @@ def create_dag(
                     profile_env,
                 ):
                     env = {**os.environ, **profile_env}
-                    # Packages declared in packages.yml must be installed
-                    # before `dbt ls` will compile the project. The scheduled
-                    # path skips this block entirely (Cosmos installs deps per
-                    # model task via install_deps=True), so deps are only
-                    # needed here, on the select/exclude path.
-                    ensure_dbt_deps(dbt_executable, project_path_str, env=env)
+                    # `dbt ls` compiles the project, which fails when
+                    # packages.yml declares packages not installed in
+                    # dbt_packages/. The scheduled path skips this block
+                    # entirely (Cosmos installs deps per model task via
+                    # install_deps=True), so deps are only needed here, on the
+                    # select/exclude path. Run `dbt deps` first to make this
+                    # path self-sufficient for tenants that don't bake deps
+                    # into their image. Degrade gracefully: if deps fails
+                    # (e.g. a transient network error resolving a git package),
+                    # fall through to `dbt ls`, which still compiles when
+                    # dbt_packages/ is already populated (baked image) and
+                    # otherwise fails with its own descriptive error.
+                    try:
+                        ensure_dbt_deps(
+                            dbt_executable, project_path_str, env=env
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "dbt deps failed; proceeding to dbt ls in case "
+                            "dbt_packages/ is already populated.",
+                            exc_info=True,
+                        )
                     cmd = [
                         dbt_executable,
                         "--quiet",
