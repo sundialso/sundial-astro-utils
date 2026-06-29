@@ -34,7 +34,15 @@
   {%- if this is none -%}
     {{ return('') }}
   {%- endif -%}
-  {%- set tmp = sundial_dbt_shared.default__make_temp_relation(this) -%}
-  {{ log('Dropping backfill temp table ' ~ tmp, info=true) }}
-  {%- do adapter.drop_relation(tmp) -%}
+  {# Snowflake incremental drops tmp_relation before post_hooks; nothing left to drop. #}
+  {%- if target.type == 'snowflake' -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set tmp = sundial_dbt_shared.default__make_temp_relation(this).incorporate(type='table') -%}
+  {%- set existing = adapter.get_relation(tmp.database, tmp.schema, tmp.identifier) -%}
+  {%- if existing is none -%}
+    {{ return('') }}
+  {%- endif -%}
+  {{ log('Dropping backfill temp table ' ~ existing, info=true) }}
+  {%- do adapter.drop_relation(existing) -%}
 {% endmacro %}

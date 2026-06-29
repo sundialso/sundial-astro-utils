@@ -142,7 +142,7 @@ below).
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
 | `dbt_project.yml` `dispatch` | Route ``dbt.make_temp_relation`` to ``sundial_dbt_shared.default__make_temp_relation``. |
-| `dbt_project.yml` `+post-hook` | ``drop_backfill_tmp_table()`` after chunked runs (no-op otherwise). |
+| `dbt_project.yml` `+post-hook` | ``drop_backfill_tmp_table()`` for BigQuery chunked runs (no-op on Snowflake and daily runs). |
 
 Example tenant `dbt_project.yml` wiring:
 
