@@ -127,9 +127,13 @@ The disposition depends on the run:
   pass when the window is ≤ `chunk_size`; otherwise chunks the requested window
   on the anchor-aligned grid.
 
-Chunk windows are anchored to each model's `first_timestamp` and stepped by
-`chunk_size` months, so the same calendar range always maps to the same
-`chunk_key` (idempotent re-runs).
+Chunk windows use a half-open month grid ``[start, end)`` anchored at
+``first_timestamp``.  dbt receives inclusive bounds ``[start, end - 1 day]``;
+the same range always maps to the same ``chunk_key``.
+
+Parallel chunk runs suffix staging tables as ``__dbt_tmp__<YYYYMMDD>`` when
+``backfill_start_ts`` and ``backfill_chunk_id`` are set (requires ``dispatch``
+below).
 
 ### Tenant-side artifacts
 
@@ -137,7 +141,22 @@ Chunk windows are anchored to each model's `first_timestamp` and stepped by
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
-| `dbt_project.yml` `+post-hook` | BigQuery chunked runs: `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs). Requires `sundial_dbt_shared` with `backfill_tmp_relation.sql`. |
+| `dbt_project.yml` `dispatch` | Route ``dbt.make_temp_relation`` to ``sundial_dbt_shared.default__make_temp_relation``. |
+| `dbt_project.yml` `+post-hook` | ``drop_backfill_tmp_table()`` for BigQuery chunked runs (no-op on Snowflake and daily runs). |
+
+Example tenant `dbt_project.yml` wiring:
+
+```yaml
+dispatch:
+  - macro_namespace: dbt
+    search_order: ['your_dbt_project', 'sundial_dbt_shared', 'dbt']
+
+models:
+  your_dbt_project:
+    +post-hook:
+    - "{{ sundial_dbt_shared.log_model_status('succeeded') }}"
+    - "{{ sundial_dbt_shared.drop_backfill_tmp_table() }}"
+```
 
 Shared chunking dbt macros (`backfill_tmp_relation`, incremental windows,
 completions) live in the `sundial_dbt_shared` package inside this repo;

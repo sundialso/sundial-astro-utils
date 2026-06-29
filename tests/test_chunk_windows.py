@@ -6,7 +6,7 @@ import importlib.util
 import sys
 import types
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +47,15 @@ class ChunkWindowTests(unittest.TestCase):
         )
         self.assertEqual(len(windows), 1)
         self.assertEqual(windows[0][0], date(2020, 7, 1))
+
+    def test_adjacent_chunks_are_non_overlapping_inclusive_windows(self) -> None:
+        windows = chunk_windows_from_anchor(
+            date(2020, 1, 1), 6, date(2020, 1, 1), date(2021, 1, 1),
+        )
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0], (date(2020, 1, 1), date(2020, 6, 30), "2020-01"))
+        self.assertEqual(windows[1], (date(2020, 7, 1), date(2020, 12, 31), "2020-07"))
+        self.assertEqual(windows[1][0], windows[0][1] + timedelta(days=1))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -167,7 +167,7 @@ def compute_static_chunks(
     models: dict[str, BackfillModel],
     today: date,
 ) -> dict[str, list[tuple[date, date, str]]]:
-    """Return static (start, end, chunk_id) windows per chunked model."""
+    """Return inclusive (start, end, chunk_id) windows per chunked model."""
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
         if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
@@ -184,16 +184,19 @@ def chunk_windows_from_anchor(
     range_start: date,
     range_end: date,
 ) -> list[tuple[date, date, str]]:
-    """Return aligned chunk windows overlapping ``[range_start, range_end)``."""
+    """Clip anchor-aligned chunks to ``[range_start, range_end)``; return inclusive end dates."""
     if range_end <= range_start or chunk_months < 1:
         return []
     out: list[tuple[date, date, str]] = []
-    for start, end in _generate_chunks(anchor, chunk_months, range_end):
-        if start >= range_end or end <= range_start:
+    for grid_start, grid_end in _generate_chunks(anchor, chunk_months, range_end):
+        if grid_start >= range_end or grid_end <= range_start:
             continue
-        win_start = max(start, range_start)
-        win_end = min(end, range_end)
-        out.append((win_start, win_end, start.strftime("%Y-%m")))
+        win_start = max(grid_start, range_start)
+        win_end_exclusive = min(grid_end, range_end)
+        if win_end_exclusive <= win_start:
+            continue
+        win_end_inclusive = win_end_exclusive - timedelta(days=1)
+        out.append((win_start, win_end_inclusive, grid_start.strftime("%Y-%m")))
     return out
 
 
@@ -313,7 +316,7 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Build contiguous month windows from first_timestamp through today."""
+    """Yield half-open ``[start, end)`` month windows from anchor while ``start < today``."""
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"
