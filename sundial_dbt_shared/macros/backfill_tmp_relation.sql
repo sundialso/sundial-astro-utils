@@ -1,4 +1,4 @@
-{# Parallel chunked backfill: unique __dbt_tmp per chunk (backfill_start_ts var). #}
+{# Suffix __dbt_tmp with chunk start date when backfill vars are set. #}
 
 {% macro backfill_tmp_suffix(base_suffix='__dbt_tmp') %}
   {%- set chunk_start = var('backfill_start_ts', none) -%}
@@ -10,7 +10,6 @@
 {% endmacro %}
 
 
-{# dbt 1.x adapter.dispatch('make_temp_relation', 'dbt') resolves default__make_temp_relation. #}
 {% macro default__make_temp_relation(base_relation, suffix='__dbt_tmp') %}
   {%- set suffix = sundial_dbt_shared.backfill_tmp_suffix(suffix) -%}
   {%- set temp_identifier = base_relation.identifier ~ suffix -%}

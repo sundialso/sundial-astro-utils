@@ -127,15 +127,13 @@ The disposition depends on the run:
   pass when the window is ≤ `chunk_size`; otherwise chunks the requested window
   on the anchor-aligned grid.
 
-Chunk windows are anchored to each model's `first_timestamp` and stepped by
-`chunk_size` months on a half-open grid ``[start, end)``.  They are emitted to
-dbt as inclusive ``[start, end - 1 day]`` so standard ``BETWEEN`` filters do
-not overlap at boundaries (e.g. ``[Jan 1, Jun 30]`` then ``[Jul 1, Dec 31]``).
-The same calendar range always maps to the same `chunk_key` (idempotent re-runs).
+Chunk windows use a half-open month grid ``[start, end)`` anchored at
+``first_timestamp``.  dbt receives inclusive bounds ``[start, end - 1 day]``;
+the same range always maps to the same ``chunk_key``.
 
-Chunked parallel runs need unique staging tables per chunk. Wire
-``make_temp_relation`` via ``dispatch`` (see below); each chunk passes
-``backfill_start_ts`` and gets a temp suffix like ``__dbt_tmp__20200702``.
+Parallel chunk runs suffix staging tables as ``__dbt_tmp__<YYYYMMDD>`` when
+``backfill_start_ts`` and ``backfill_chunk_id`` are set (requires ``dispatch``
+below).
 
 ### Tenant-side artifacts
 
@@ -143,8 +141,8 @@ Chunked parallel runs need unique staging tables per chunk. Wire
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
-| `dbt_project.yml` `dispatch` | Route `dbt.make_temp_relation` through `sundial_dbt_shared` (`default__make_temp_relation`) so chunked runs suffix temps with the chunk start date. |
-| `dbt_project.yml` `+post-hook` | `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` after chunked runs (no-op on daily runs). |
+| `dbt_project.yml` `dispatch` | Route ``dbt.make_temp_relation`` to ``sundial_dbt_shared.default__make_temp_relation``. |
+| `dbt_project.yml` `+post-hook` | ``drop_backfill_tmp_table()`` after chunked runs (no-op otherwise). |
 
 Example tenant `dbt_project.yml` wiring:
 

@@ -49,7 +49,6 @@ class ChunkWindowTests(unittest.TestCase):
         self.assertEqual(windows[0][0], date(2020, 7, 1))
 
     def test_adjacent_chunks_are_non_overlapping_inclusive_windows(self) -> None:
-        """Half-open grid [Jan,Jul) [Jul,Jan) → inclusive [Jan 1,Jun 30] [Jul 1,Dec 31]."""
         windows = chunk_windows_from_anchor(
             date(2020, 1, 1), 6, date(2020, 1, 1), date(2021, 1, 1),
         )

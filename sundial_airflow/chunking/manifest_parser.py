@@ -167,7 +167,7 @@ def compute_static_chunks(
     models: dict[str, BackfillModel],
     today: date,
 ) -> dict[str, list[tuple[date, date, str]]]:
-    """Return static (start, end, chunk_id) windows per chunked model."""
+    """Return inclusive (start, end, chunk_id) windows per chunked model."""
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
         if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
@@ -184,15 +184,7 @@ def chunk_windows_from_anchor(
     range_start: date,
     range_end: date,
 ) -> list[tuple[date, date, str]]:
-    """Return anchor-aligned chunk windows as inclusive ``[start, end]`` dates.
-
-    The internal grid from :func:`_generate_chunks` is half-open
-    ``[grid_start, grid_end)`` — ``grid_end`` is the first day of the *next*
-    chunk.  dbt models filter with inclusive ``BETWEEN`` / ``<=``, so each
-    emitted window uses ``grid_end - 1 day`` as the last included day.  Adjacent
-    chunks therefore meet at boundaries without overlapping (e.g. ``[Jan 1,
-    Jun 30]`` then ``[Jul 1, Dec 31]``).
-    """
+    """Clip anchor-aligned chunks to ``[range_start, range_end)``; return inclusive end dates."""
     if range_end <= range_start or chunk_months < 1:
         return []
     out: list[tuple[date, date, str]] = []
@@ -324,12 +316,7 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Build contiguous half-open month windows ``[start, end)`` up to ``today``.
-
-    ``end`` is exclusive: the first day of the next chunk equals the previous
-    chunk's ``end``.  Callers that need inclusive dbt bounds subtract one day
-    from ``end``.
-    """
+    """Yield half-open ``[start, end)`` month windows from anchor while ``start < today``."""
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"

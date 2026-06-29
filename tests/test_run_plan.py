@@ -164,7 +164,7 @@ class RunPlanTests(unittest.TestCase):
         self.assertEqual(len(plan.chunks), 2)
 
     def test_upper_bound_is_execution_ts_not_capped_at_today(self) -> None:
-        """Grid is half-open through execution_ts; last inclusive day is day before."""
+        """Last chunk end is the day before execution_ts."""
         model = _chunked_model(first="2020-01-01", chunk_months=6)
         future_end = date(2099, 1, 1)
         plans = build_run_plan(
