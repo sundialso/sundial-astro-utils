@@ -6,7 +6,7 @@ import importlib.util
 import sys
 import types
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,7 +164,7 @@ class RunPlanTests(unittest.TestCase):
         self.assertEqual(len(plan.chunks), 2)
 
     def test_upper_bound_is_execution_ts_not_capped_at_today(self) -> None:
-        """Chunk planning ends at execution_ts (end_ts), not calendar today."""
+        """Grid is half-open through execution_ts; last inclusive day is day before."""
         model = _chunked_model(first="2020-01-01", chunk_months=6)
         future_end = date(2099, 1, 1)
         plans = build_run_plan(
@@ -175,7 +175,7 @@ class RunPlanTests(unittest.TestCase):
         )
         plan = plans[model.name]
         self.assertEqual(plan.disposition, "chunked")
-        self.assertEqual(plan.chunks[-1].end, future_end)
+        self.assertEqual(plan.chunks[-1].end, future_end - timedelta(days=1))
 
 
 if __name__ == "__main__":

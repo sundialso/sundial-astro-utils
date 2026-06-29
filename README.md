@@ -128,8 +128,14 @@ The disposition depends on the run:
   on the anchor-aligned grid.
 
 Chunk windows are anchored to each model's `first_timestamp` and stepped by
-`chunk_size` months, so the same calendar range always maps to the same
-`chunk_key` (idempotent re-runs).
+`chunk_size` months on a half-open grid ``[start, end)``.  They are emitted to
+dbt as inclusive ``[start, end - 1 day]`` so standard ``BETWEEN`` filters do
+not overlap at boundaries (e.g. ``[Jan 1, Jun 30]`` then ``[Jul 1, Dec 31]``).
+The same calendar range always maps to the same `chunk_key` (idempotent re-runs).
+
+Chunked parallel runs need unique staging tables per chunk. Wire
+``make_temp_relation`` via ``dispatch`` (see below); each chunk passes
+``backfill_start_ts`` and gets a temp suffix like ``__dbt_tmp__20200702``.
 
 ### Tenant-side artifacts
 
@@ -137,7 +143,22 @@ Chunk windows are anchored to each model's `first_timestamp` and stepped by
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
-| `dbt_project.yml` `+post-hook` | BigQuery chunked runs: `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs). Requires `sundial_dbt_shared` with `backfill_tmp_relation.sql`. |
+| `dbt_project.yml` `dispatch` | Route `dbt.make_temp_relation` through `sundial_dbt_shared` so chunked runs suffix temps with the chunk start date. |
+| `dbt_project.yml` `+post-hook` | `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` after chunked runs (no-op on daily runs). |
+
+Example tenant `dbt_project.yml` wiring:
+
+```yaml
+dispatch:
+  - macro_namespace: dbt
+    search_order: ['your_dbt_project', 'sundial_dbt_shared', 'dbt']
+
+models:
+  your_dbt_project:
+    +post-hook:
+    - "{{ sundial_dbt_shared.log_model_status('succeeded') }}"
+    - "{{ sundial_dbt_shared.drop_backfill_tmp_table() }}"
+```
 
 Shared chunking dbt macros (`backfill_tmp_relation`, incremental windows,
 completions) live in the `sundial_dbt_shared` package inside this repo;

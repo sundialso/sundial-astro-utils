@@ -5,7 +5,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -184,16 +184,27 @@ def chunk_windows_from_anchor(
     range_start: date,
     range_end: date,
 ) -> list[tuple[date, date, str]]:
-    """Return aligned chunk windows overlapping ``[range_start, range_end)``."""
+    """Return anchor-aligned chunk windows as inclusive ``[start, end]`` dates.
+
+    The internal grid from :func:`_generate_chunks` is half-open
+    ``[grid_start, grid_end)`` — ``grid_end`` is the first day of the *next*
+    chunk.  dbt models filter with inclusive ``BETWEEN`` / ``<=``, so each
+    emitted window uses ``grid_end - 1 day`` as the last included day.  Adjacent
+    chunks therefore meet at boundaries without overlapping (e.g. ``[Jan 1,
+    Jun 30]`` then ``[Jul 1, Dec 31]``).
+    """
     if range_end <= range_start or chunk_months < 1:
         return []
     out: list[tuple[date, date, str]] = []
-    for start, end in _generate_chunks(anchor, chunk_months, range_end):
-        if start >= range_end or end <= range_start:
+    for grid_start, grid_end in _generate_chunks(anchor, chunk_months, range_end):
+        if grid_start >= range_end or grid_end <= range_start:
             continue
-        win_start = max(start, range_start)
-        win_end = min(end, range_end)
-        out.append((win_start, win_end, start.strftime("%Y-%m")))
+        win_start = max(grid_start, range_start)
+        win_end_exclusive = min(grid_end, range_end)
+        if win_end_exclusive <= win_start:
+            continue
+        win_end_inclusive = win_end_exclusive - timedelta(days=1)
+        out.append((win_start, win_end_inclusive, grid_start.strftime("%Y-%m")))
     return out
 
 
@@ -313,7 +324,12 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Build contiguous month windows from first_timestamp through today."""
+    """Build contiguous half-open month windows ``[start, end)`` up to ``today``.
+
+    ``end`` is exclusive: the first day of the next chunk equals the previous
+    chunk's ``end``.  Callers that need inclusive dbt bounds subtract one day
+    from ``end``.
+    """
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"

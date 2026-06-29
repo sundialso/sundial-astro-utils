@@ -1,9 +1,10 @@
-{# Parallel chunked backfill: unique __dbt_tmp per chunk (backfill_chunk_id var). #}
+{# Parallel chunked backfill: unique __dbt_tmp per chunk (backfill_start_ts var). #}
 
 {% macro backfill_tmp_suffix(base_suffix='__dbt_tmp') %}
-  {%- set chunk_id = var('backfill_chunk_id', none) -%}
-  {%- if chunk_id is not none -%}
-    {{ return(base_suffix ~ '__' ~ (chunk_id | replace('-', ''))) }}
+  {%- set chunk_start = var('backfill_start_ts', none) -%}
+  {%- if chunk_start is not none and var('backfill_chunk_id', none) is not none -%}
+    {%- set day = (chunk_start | string)[:10] | replace('-', '') -%}
+    {{ return(base_suffix ~ '__' ~ day) }}
   {%- endif -%}
   {{ return(base_suffix) }}
 {% endmacro %}
