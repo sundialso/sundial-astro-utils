@@ -10,9 +10,18 @@
 {% endmacro %}
 
 
-{% macro make_temp_relation(base_relation, suffix='__dbt_tmp') %}
+{# dbt 1.x adapter.dispatch('make_temp_relation', 'dbt') resolves default__make_temp_relation. #}
+{% macro default__make_temp_relation(base_relation, suffix='__dbt_tmp') %}
   {%- set suffix = sundial_dbt_shared.backfill_tmp_suffix(suffix) -%}
-  {{ return(adapter.dispatch('make_temp_relation', 'dbt')(base_relation, suffix)) }}
+  {%- set temp_identifier = base_relation.identifier ~ suffix -%}
+  {%- set temp_relation = base_relation.incorporate(
+                              path={"identifier": temp_identifier}) -%}
+  {{ return(temp_relation) }}
+{% endmacro %}
+
+
+{% macro make_temp_relation(base_relation, suffix='__dbt_tmp') %}
+  {{ return(sundial_dbt_shared.default__make_temp_relation(base_relation, suffix)) }}
 {% endmacro %}
 
 
@@ -26,7 +35,7 @@
   {%- if this is none -%}
     {{ return('') }}
   {%- endif -%}
-  {%- set tmp = sundial_dbt_shared.make_temp_relation(this) -%}
+  {%- set tmp = sundial_dbt_shared.default__make_temp_relation(this) -%}
   {{ log('Dropping backfill temp table ' ~ tmp, info=true) }}
   {%- do adapter.drop_relation(tmp) -%}
 {% endmacro %}

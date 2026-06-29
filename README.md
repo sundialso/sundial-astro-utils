@@ -143,7 +143,7 @@ Chunked parallel runs need unique staging tables per chunk. Wire
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
-| `dbt_project.yml` `dispatch` | Route `dbt.make_temp_relation` through `sundial_dbt_shared` so chunked runs suffix temps with the chunk start date. |
+| `dbt_project.yml` `dispatch` | Route `dbt.make_temp_relation` through `sundial_dbt_shared` (`default__make_temp_relation`) so chunked runs suffix temps with the chunk start date. |
 | `dbt_project.yml` `+post-hook` | `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` after chunked runs (no-op on daily runs). |
 
 Example tenant `dbt_project.yml` wiring:
