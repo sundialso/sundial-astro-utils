@@ -110,6 +110,25 @@ def _validate_backfill_params(
         )
 
 
+def _format_chunk_windows(chunks: list[dict], edge: int = 2) -> str:
+    """Pretty multi-line listing of chunk windows (first ``edge`` + last ``edge``)."""
+    if not chunks:
+        return "    (no chunk windows)"
+
+    def _line(chunk: dict) -> str:
+        return (
+            f"    {chunk.get('chunk_id'):<10} "
+            f"{chunk.get('start')}  ->  {chunk.get('end')}"
+        )
+
+    if len(chunks) <= edge * 2:
+        return "\n".join(_line(c) for c in chunks)
+
+    head = [_line(c) for c in chunks[:edge]]
+    tail = [_line(c) for c in chunks[-edge:]]
+    return "\n".join(head + [f"    ... {len(chunks) - edge * 2} more ..."] + tail)
+
+
 def _collect_run_tasks(group: Any) -> dict[str, Any]:
     """Walk a Cosmos ``DbtTaskGroup`` and return ``{model_name: run_task}``.
 
@@ -455,14 +474,15 @@ def create_dag(
                     else None,
                 )
                 run_plan = serialize_run_plan(plans)
-                for name, wm in watermarks.items():
-                    plan = run_plan.get(name, {})
+                for name, plan in run_plan.items():
+                    chunks = plan.get("chunks") or []
                     logger.info(
-                        "Run plan summary: %s watermark=%s disposition=%s chunks=%d",
+                        "Run plan summary: %s watermark=%s disposition=%s chunks=%d\n%s",
                         name,
-                        wm,
+                        watermarks.get(name),
                         plan.get("disposition"),
-                        len(plan.get("chunks") or []),
+                        len(chunks),
+                        _format_chunk_windows(chunks),
                     )
 
             chunk_units = build_chunk_units(run_plan) if run_plan else {}
