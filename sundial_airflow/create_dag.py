@@ -75,6 +75,41 @@ def _param_field_name(warehouse: Warehouse) -> str:
     return "dataset" if warehouse == "bigquery" else "schema"
 
 
+def _validate_backfill_params(
+    *, backfill_mode: str, start_ts: Any, end_ts: Any, execution_ts: Any,
+) -> None:
+    """Validate the run-window params against the selected ``backfill_mode``."""
+    has_start = bool(start_ts)
+    has_end = bool(end_ts)
+
+    if backfill_mode == "partial":
+        if not (has_start and has_end):
+            raise ValueError(
+                "backfill_mode=partial requires both start_ts and end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if str(start_ts) >= str(end_ts):
+            raise ValueError(
+                "backfill_mode=partial requires start_ts < end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if execution_ts:
+            raise ValueError(
+                "backfill_mode=partial does not accept execution_ts "
+                f"(got execution_ts={execution_ts!r}); the window is defined "
+                "by start_ts and end_ts."
+            )
+        return
+
+    if has_start or has_end:
+        raise ValueError(
+            f"backfill_mode={backfill_mode!r} does not accept start_ts/end_ts "
+            f"(got start_ts={start_ts!r}, end_ts={end_ts!r}). "
+            "Use backfill_mode=partial for an explicit window, otherwise leave "
+            "start_ts/end_ts blank and rely on execution_ts."
+        )
+
+
 def _collect_run_tasks(group: Any) -> dict[str, Any]:
     """Walk a Cosmos ``DbtTaskGroup`` and return ``{model_name: run_task}``.
 
@@ -275,15 +310,18 @@ def create_dag(
                 dbt_vars["run_group_id"] = run_id
 
             backfill_mode = params.get("backfill_mode", "none")
+            start_ts = params.get("start_ts")
+            end_ts = params.get("end_ts")
+
+            _validate_backfill_params(
+                backfill_mode=backfill_mode,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                execution_ts=params.get("execution_ts"),
+            )
             if backfill_mode == "partial":
-                start = params.get("start_ts")
-                end = params.get("end_ts")
-                if not start or not end:
-                    raise ValueError(
-                        "backfill_mode=partial requires both start_ts and end_ts"
-                    )
-                dbt_vars[start_var] = start
-                dbt_vars[end_var] = end
+                dbt_vars[start_var] = start_ts
+                dbt_vars[end_var] = end_ts
 
             run_context = "normal"
             if backfill_mode == "full":
