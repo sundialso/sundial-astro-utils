@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from dateutil.relativedelta import relativedelta
@@ -18,11 +18,11 @@ RunDisposition = Literal["single", "chunked"]
 
 @dataclass(frozen=True)
 class ChunkWindow:
-    """One active chunk window for this run."""
+    """One chunk window: ``start`` at midnight, ``end`` at the ``end_ts`` instant."""
 
     chunk_id: str
-    start: date
-    end: date
+    start: datetime
+    end: datetime
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,6 @@ def build_run_plan(
     window_end: date | datetime | None = None,
 ) -> dict[str, ModelRunPlan]:
     """Build the per-model run plan for chunked models."""
-    upper = execution_ts
     plans: dict[str, ModelRunPlan] = {}
 
     for model in models.values():
@@ -57,7 +56,7 @@ def build_run_plan(
             model=model,
             watermark=watermarks.get(model.name),
             backfill_mode=backfill_mode,
-            upper=upper,
+            execution_ts=execution_ts,
             window_start=window_start,
             window_end=window_end,
         )
@@ -67,15 +66,28 @@ def build_run_plan(
     return plans
 
 
+def compute_window_end(execution_ts: date, lag: int = 0) -> datetime:
+    """Mirror the ``end_ts()`` macro: ``execution_ts - lag days - 1s`` (inclusive)."""
+    base = datetime(execution_ts.year, execution_ts.month, execution_ts.day)
+    return base - timedelta(days=max(lag, 0)) - timedelta(seconds=1)
+
+
+def _window_bounds(execution_ts: date, lag: int) -> tuple[date, datetime]:
+    """``(exclusive chunk-gen date, inclusive end_ts)``; both from one end_ts."""
+    final_end = compute_window_end(execution_ts, lag)
+    return final_end.date() + timedelta(days=1), final_end
+
+
 def _plan_for_model(
     *,
     model: BackfillModel,
     watermark: datetime | None,
     backfill_mode: str,
-    upper: date,
+    execution_ts: date,
     window_start: date | datetime | None = None,
     window_end: date | datetime | None = None,
 ) -> ModelRunPlan:
+    """Dispatch to the per-mode processing-window planner."""
     anchor = model.first_timestamp
     chunk_months = model.chunk_months
     assert anchor is not None and chunk_months is not None
@@ -89,18 +101,74 @@ def _plan_for_model(
             window_end=window_end,
         )
 
-    if backfill_mode == "full" or watermark is None:
+    if backfill_mode == "full":
+        return _plan_full(
+            model=model,
+            anchor=anchor,
+            chunk_months=chunk_months,
+            execution_ts=execution_ts,
+            lag=model.lag,
+        )
+
+    return _plan_incremental(
+        model=model,
+        anchor=anchor,
+        chunk_months=chunk_months,
+        watermark=watermark,
+        execution_ts=execution_ts,
+        lag=model.lag,
+        lookback=model.lookback,
+    )
+
+
+def _plan_full(
+    *,
+    model: BackfillModel,
+    anchor: date,
+    chunk_months: int,
+    execution_ts: date,
+    lag: int,
+) -> ModelRunPlan:
+    """Full backfill: always chunk anchor → ``execution_ts - lag - 1s``."""
+    upper_date, final_end = _window_bounds(execution_ts, lag)
+    chunks = _to_windows(
+        chunk_windows_from_anchor(anchor, chunk_months, anchor, upper_date),
+        final_end=final_end,
+    )
+    return ModelRunPlan(model.name, "chunked", chunks)
+
+
+def _plan_incremental(
+    *,
+    model: BackfillModel,
+    anchor: date,
+    chunk_months: int,
+    watermark: datetime | None,
+    execution_ts: date,
+    lag: int,
+    lookback: int,
+) -> ModelRunPlan:
+    """Incremental: watermark → end_ts. No watermark or large gap chunks; a
+    gap <= ``chunk_months`` runs once (dbt computes the live window).
+    """
+    upper_date, final_end = _window_bounds(execution_ts, lag)
+
+    if watermark is None:
         chunks = _to_windows(
-            chunk_windows_from_anchor(anchor, chunk_months, anchor, upper),
+            chunk_windows_from_anchor(anchor, chunk_months, anchor, upper_date),
+            final_end=final_end,
         )
         return ModelRunPlan(model.name, "chunked", chunks)
 
-    range_start = _as_date(watermark)
-    if _month_span(range_start, upper) <= chunk_months:
+    first_start = _resume_start(watermark, anchor, lookback)
+    range_start = first_start.date()
+    if _month_span(range_start, upper_date) <= chunk_months:
         return ModelRunPlan(model.name, "single")
 
     chunks = _to_windows(
-        chunk_windows_from_anchor(anchor, chunk_months, range_start, upper),
+        chunk_windows_from_anchor(anchor, chunk_months, range_start, upper_date),
+        first_start=first_start,
+        final_end=final_end,
     )
     return ModelRunPlan(model.name, "chunked", chunks)
 
@@ -113,10 +181,8 @@ def _plan_partial(
     window_start: date | datetime | None,
     window_end: date | datetime | None,
 ) -> ModelRunPlan:
-    """Plan an explicit ``[start_ts, end_ts]`` partial backfill window.
-
-    Windows at or under ``chunk_months`` run once; larger windows fan out into
-    anchor-aligned chunks so chunk_keys match the full-backfill cadence.
+    """Partial backfill over ``[start_ts, end_ts]`` verbatim (matches the
+    non-chunking DAG); window <= ``chunk_months`` runs once.
     """
     if window_start is None or window_end is None:
         return ModelRunPlan(model.name, "single")
@@ -128,6 +194,8 @@ def _plan_partial(
 
     chunks = _to_windows(
         chunk_windows_from_anchor(anchor, chunk_months, range_start, range_end),
+        first_start=max(_as_datetime(window_start), _as_datetime(anchor)),
+        final_end=_as_datetime(window_end),
     )
     if not chunks:
         return ModelRunPlan(model.name, "single")
@@ -136,11 +204,37 @@ def _plan_partial(
 
 def _to_windows(
     raw: list[tuple[date, date, str]],
+    *,
+    first_start: datetime | None = None,
+    final_end: datetime | None = None,
 ) -> tuple[ChunkWindow, ...]:
-    return tuple(
-        ChunkWindow(chunk_id=chunk_id, start=start, end=end)
-        for start, end, chunk_id in raw
+    """Build non-overlapping ``ChunkWindow``s.
+
+    Starts are midnight; interior ends are the next boundary minus 1s (so
+    ``BETWEEN start AND end`` never double-counts the boundary instant).
+    ``first_start``/``final_end`` override the first start / last end with
+    precise instants.
+    """
+    last = len(raw) - 1
+    windows: list[ChunkWindow] = []
+    for i, (start, end, chunk_id) in enumerate(raw):
+        win_start = first_start if (first_start is not None and i == 0) else _as_datetime(start)
+        if final_end is not None and i == last:
+            win_end = final_end
+        else:
+            win_end = _as_datetime(end) - timedelta(seconds=1)
+        windows.append(ChunkWindow(chunk_id=chunk_id, start=win_start, end=win_end))
+    return tuple(windows)
+
+
+def _resume_start(watermark: datetime, anchor: date, lookback: int) -> datetime:
+    """Incremental lower bound, mirroring start_ts(): ``max(watermark + 1s - lookback, anchor)``."""
+    resume = (
+        _as_datetime(watermark)
+        + timedelta(seconds=1)
+        - timedelta(days=max(lookback, 0))
     )
+    return max(resume, _as_datetime(anchor))
 
 
 def _as_date(value: datetime | date | str) -> date:
@@ -149,6 +243,19 @@ def _as_date(value: datetime | date | str) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _as_datetime(value: datetime | date | str) -> datetime:
+    """Coerce a date/datetime/ISO string to a datetime (date → start of day)."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    text = str(value).strip().replace("Z", "").replace(" ", "T")
+    try:
+        return datetime.fromisoformat(text[:19])
+    except ValueError:
+        return datetime.fromisoformat(text[:10])
 
 
 def _month_span(start: date, end: date) -> int:

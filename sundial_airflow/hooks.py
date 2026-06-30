@@ -108,6 +108,31 @@ def skip_chunked_run(context, model_name: str) -> None:
         raise AirflowSkipException(f"No run plan for '{model_name}'")
 
 
+def skip_chunked_precreate(context, model_name: str) -> None:
+    """Skip the empty pre-create unless this model will fan out into chunks.
+
+    The pre-create only protects the parallel chunk fan-out (and rebuilds the
+    table on full backfill), so it is a no-op for single/disabled runs.
+    """
+    params = context.get("params", {})
+    if params.get("skip_tests") or params.get("empty"):
+        raise AirflowSkipException("Skipped (skip_tests or empty mode)")
+
+    prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+    selected_models = prep.get("selected_models")
+    if selected_models is not None and model_name not in selected_models:
+        raise AirflowSkipException(f"Model '{model_name}' not in selection")
+
+    plan = _chunked_run_plan(context, model_name)
+    if plan is None:
+        raise AirflowSkipException(f"No run plan for '{model_name}'")
+    if plan.get("disposition") != "chunked":
+        raise AirflowSkipException(
+            f"Pre-create skipped for '{model_name}' "
+            f"(disposition={plan.get('disposition')})"
+        )
+
+
 def skip_chunked_incremental(context, model_name: str) -> None:
     """Skip incremental run when the plan selected chunked mode."""
     params = context.get("params", {})

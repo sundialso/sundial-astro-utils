@@ -18,6 +18,7 @@ from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
     skip_chunked_model_test,
+    skip_chunked_precreate,
     skip_chunked_run,
 )
 
@@ -48,6 +49,7 @@ def build_chunked_model_graph(
         model_name: str,
         *,
         full_refresh: bool = False,
+        empty: bool = False,
     ) -> None:
         target_value = extra_vars.get("target_dataset") or extra_vars.get("target_schema")
         run_profile = profile_config_factory("dev", target_value)
@@ -71,6 +73,8 @@ def build_chunked_model_graph(
             ]
             if full_refresh:
                 cmd.append("--full-refresh")
+            if empty:
+                cmd.append("--empty")
             env = {**os.environ, **profile_env}
             result = subprocess.run(
                 cmd, capture_output=True, text=True, env=env, check=False,
@@ -104,6 +108,31 @@ def build_chunked_model_graph(
                     plan.get("disposition", "missing"),
                 )
             return units
+
+        @task(task_id="precreate_table", trigger_rule="none_failed")
+        def precreate_table(**context: Any) -> None:
+            """Build the (empty) target once before the parallel chunk fan-out.
+
+            Stops parallel first-build chunks from racing on CREATE OR REPLACE;
+            on full backfill it also --full-refreshes so the schema is rebuilt
+            and stale data purged (matching the non-chunking DAG). Window
+            recording is disabled so this never advances the watermark.
+            """
+            skip_chunked_precreate(context, model_name=model_name)
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            base_vars = dict(prep.get("vars") or {})
+            base_vars["chunk_key"] = "precreate"
+            base_vars["run_group_id"] = (
+                f"{context['dag_run'].run_id}:precreate:{model_name}"
+            )
+            base_vars["record_incremental_window"] = False
+            full_refresh = bool(prep.get("full_refresh"))
+            logger.info(
+                "Starting precreate_table model=%s full_refresh=%s (empty build)",
+                model_name,
+                full_refresh,
+            )
+            _invoke(base_vars, model_name, full_refresh=full_refresh, empty=True)
 
         @task(
             task_id="run_chunk",
@@ -151,8 +180,10 @@ def build_chunked_model_graph(
             )
 
         units = chunk_units()
+        precreate = precreate_table()
         mapped = run_chunk.expand_kwargs(units)
         incremental = run_incremental()
+        units >> precreate >> mapped
         units >> incremental
         return units, mapped, incremental
 
