@@ -137,11 +137,31 @@ Chunk windows are anchored to each model's `first_timestamp` and stepped by
 | --- | --- |
 | `include/chunking_config.json` | Per-tenant allowlist of `{model_name, chunking_enabled, chunk_size}` entries. **Tenant-specific** — stays in the dbt repo, never in this package. |
 | `macros/start_ts.sql` + `macros/end_ts.sql` | Thin shims to `sundial_dbt_shared` incremental macros. The factory injects `backfill_start_ts` / `backfill_end_ts` per chunk. |
-| `dbt_project.yml` `+post-hook` | BigQuery chunked runs: `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs). Requires `sundial_dbt_shared` with `backfill_tmp_relation.sql`. |
+| `dbt_project.yml` `dispatch` | **Required for parallel chunking** — routes `dbt.make_temp_relation` to `sundial_dbt_shared.default__make_temp_relation` so each chunk builds its own `<model>__dbt_tmp__<YYYYMMDD>` staging table instead of racing on a shared one. |
+| `dbt_project.yml` `+post-hook` | `{{ sundial_dbt_shared.drop_backfill_tmp_table() }}` (no-op on daily runs and on Snowflake, where the incremental materialization already drops its staging table). |
 
 Shared chunking dbt macros (`backfill_tmp_relation`, incremental windows,
 completions) live in the `sundial_dbt_shared` package inside this repo;
 tenants install them via `packages.yml`.
+
+Example tenant `dbt_project.yml` wiring:
+
+```yaml
+dispatch:
+  - macro_namespace: dbt
+    search_order: ['your_dbt_project', 'sundial_dbt_shared', 'dbt']
+
+models:
+  your_dbt_project:
+    +post-hook:
+      - "{{ sundial_dbt_shared.log_model_status('succeeded') }}"
+      - "{{ sundial_dbt_shared.drop_backfill_tmp_table() }}"
+```
+
+Without the `dispatch` entry, a package-level `make_temp_relation` does **not**
+reliably override dbt's built-in one, every chunk creates the same
+`<model>__dbt_tmp`, and parallel chunks deadlock on the staging table (the
+"waiting on transaction lock" symptom).
 
 ## Releasing
 
