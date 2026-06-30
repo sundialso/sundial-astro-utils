@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_BATCH_FALLBACK_WORKERS = 32
+# The table the dbt completions hooks MERGE into (what read_watermark reads).
+_COMPLETIONS_TABLE = "dbt_completions_raw"
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,39 @@ def partition_watermarks_batch_sql(queries: list[_WatermarkQuery]) -> str:
             f"SELECT {name} AS model_name, MAX({col}) AS watermark "
             f"FROM {query.table_fqn}"
         )
+    return "\nUNION ALL\n".join(parts)
+
+
+def read_watermark_sql(completions_fqn: str, model_name: str) -> str:
+    """Replicate the dbt ``read_watermark`` macro: ``MAX(end_ts)`` over the
+    model's COMPLETE run_groups (every 'started' chunk has a 'succeeded'
+    sibling). This is the same lower-bound source the incremental ``start_ts()``
+    macro uses at run time.
+    """
+    name = _sql_string_literal(model_name)
+    return (
+        f"SELECT MAX(w.end_ts) FROM {completions_fqn} w "
+        f"WHERE w.model_name = {name} AND w.status = 'started' "
+        f"AND w.end_ts IS NOT NULL "
+        f"AND NOT EXISTS ("
+        f"SELECT 1 FROM {completions_fqn} u "
+        f"WHERE u.model_name = w.model_name AND u.run_group_id = w.run_group_id "
+        f"AND u.status = 'started' AND NOT EXISTS ("
+        f"SELECT 1 FROM {completions_fqn} s "
+        f"WHERE s.model_name = u.model_name AND s.run_group_id = u.run_group_id "
+        f"AND s.chunk_key = u.chunk_key AND s.status = 'succeeded'))"
+    )
+
+
+def completion_watermarks_batch_sql(
+    completions_fqn: str, model_names: list[str]
+) -> str:
+    """One UNION ALL query returning each model's ``read_watermark`` value."""
+    parts = [
+        f"SELECT {_sql_string_literal(name)} AS model_name, "
+        f"({read_watermark_sql(completions_fqn, name)}) AS watermark"
+        for name in model_names
+    ]
     return "\nUNION ALL\n".join(parts)
 
 
@@ -126,11 +161,47 @@ def fetch_partition_watermarks(
             else:
                 raise
 
-    for query in queries:
+    # Align the planning watermark with the dbt read_watermark macro:
+    # COALESCE(read_watermark, MAX(partition_column)). read_watermark (MAX
+    # completed end_ts in dbt_completions_raw) is the exact lower bound the
+    # incremental start_ts() macro uses at run time, so chunked planning and
+    # execution can't diverge when completions and table data disagree (failed
+    # tests / retries / partial runs). Falls back to the partition MAX when the
+    # completions table doesn't exist yet (pre-first-run).
+    partition_only = dict(watermarks)
+    completions: dict[str, datetime | None] = {}
+    completions_fqn = adapter.build_table_fqn(dbt_vars, _COMPLETIONS_TABLE)
+    if completions_fqn:
+        try:
+            completions = _fetch_completion_watermarks(
+                warehouse=warehouse,
+                conn_id=conn_id,
+                completions_fqn=completions_fqn,
+                model_names=[query.model_name for query in queries],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Completion watermark query failed (%s); using partition MAX only.",
+                exc,
+            )
+        for name, completed in completions.items():
+            if completed is not None:
+                watermarks[name] = completed
+    else:
         logger.info(
-            "Partition watermark for %r: %s (table=%s, column=%s)",
-            query.model_name,
-            watermarks.get(query.model_name),
+            "Cannot resolve %s FQN; planning on partition MAX only.",
+            _COMPLETIONS_TABLE,
+        )
+
+    for query in queries:
+        name = query.model_name
+        logger.info(
+            "Planning watermark for %r: %s (read_watermark=%s, partition_max=%s, "
+            "table=%s, column=%s)",
+            name,
+            watermarks.get(name),
+            completions.get(name),
+            partition_only.get(name),
             query.table_fqn,
             query.partition_column,
         )
@@ -180,6 +251,29 @@ def _fetch_parallel(
             model_name, value = future.result()
             out[model_name] = value
     return out
+
+
+def _fetch_completion_watermarks(
+    *,
+    warehouse: str,
+    conn_id: str,
+    completions_fqn: str,
+    model_names: list[str],
+) -> dict[str, datetime | None]:
+    """Read each model's ``read_watermark`` value in one query. Returns ``{}``
+    when the completions table doesn't exist yet, so callers keep the partition
+    MAX (mirrors the macro's ``COALESCE(read_watermark, MAX(col))``).
+    """
+    if not model_names:
+        return {}
+    sql = completion_watermarks_batch_sql(completions_fqn, model_names)
+    if warehouse == "snowflake":
+        rows = _run_snowflake_query(conn_id, sql, allow_missing_table=True)
+    elif warehouse == "bigquery":
+        rows = _run_bigquery_query(conn_id, sql, allow_missing_table=True)
+    else:
+        return {}
+    return {str(row[0]): _parse_watermark(row[1]) for row in rows}
 
 
 def _fetch_one(
