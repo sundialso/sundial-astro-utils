@@ -237,6 +237,35 @@ class WatermarkTestCase(unittest.TestCase):
         self.add("started", None, "full", we=None)  # legacy NULL-run_group row
         self.assertEqual(self.watermark(), dt(6, 5))
 
+    def test_chunked_deferred_build_test_pass_advances_watermark(self):
+        # Chunk builds defer terminal status; the shared model test finalizes every
+        # deferred chunk_key in the run_group.
+        self.complete_run("PREV", {"full": dt(6, 4)})
+        self.add("started", "R", "2024-01", we=dt(6, 2))
+        self.add("started", "R", "2024-02", we=dt(6, 5))
+        self.assertEqual(self.watermark(), dt(6, 4))  # in-flight until test
+        self.add("succeeded", "R", "2024-01")
+        self.add("succeeded", "R", "2024-02")
+        self.assertEqual(self.watermark(), dt(6, 5))
+
+    def test_chunked_deferred_build_test_fail_holds_watermark(self):
+        self.complete_run("PREV", {"full": dt(6, 4)})
+        self.add("started", "R", "2024-01", we=dt(6, 2))
+        self.add("started", "R", "2024-02", we=dt(6, 5))
+        self.add("failed", "R", "2024-01")
+        self.add("failed", "R", "2024-02")
+        self.assertEqual(self.watermark(), dt(6, 4))
+
+    def test_chunked_build_failure_blocks_finalize_succeeded(self):
+        # One chunk failed at build time (immediate 'failed'); test pass must not
+        # write 'succeeded' for that chunk — run stays incomplete.
+        self.complete_run("PREV", {"full": dt(6, 4)})
+        self.add("started", "R", "A", we=dt(6, 2))
+        self.add("succeeded", "R", "A")
+        self.add("started", "R", "B", we=dt(6, 5))
+        self.add("failed", "R", "B")
+        self.assertEqual(self.watermark(), dt(6, 4))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

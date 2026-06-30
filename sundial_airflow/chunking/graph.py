@@ -112,8 +112,8 @@ def build_chunked_model_graph(
         )
         def run_chunk(
             chunk_id: str,
-            chunk_start: str,
-            chunk_end: str,
+            chunk_start: str | None = None,
+            chunk_end: str | None = None,
             **context: Any,
         ) -> None:
             """Run one chunk window."""
@@ -127,13 +127,20 @@ def build_chunked_model_graph(
             skip_chunked_run(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
-            ti = context["ti"]
-            base_vars[start_var] = chunk_start
-            base_vars[end_var] = chunk_end
+            for var, val in ((start_var, chunk_start), (end_var, chunk_end)):
+                if val is not None:
+                    base_vars[var] = val
+                else:
+                    base_vars.pop(var, None)
             base_vars["backfill_chunk_id"] = chunk_id
             base_vars["chunk_key"] = chunk_id
-            base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
-            _invoke(base_vars, model_name)
+            base_vars["run_group_id"] = context["dag_run"].run_id
+            base_vars["defer_chunk_terminal_status"] = True
+            _invoke(
+                base_vars,
+                model_name,
+                full_refresh=bool(prep.get("full_refresh")),
+            )
 
         @task(task_id="run_incremental", trigger_rule="none_failed")
         def run_incremental(**context: Any) -> None:
@@ -144,6 +151,7 @@ def build_chunked_model_graph(
             base_vars = dict(prep.get("vars") or {})
             base_vars["chunk_key"] = "full"
             base_vars["run_group_id"] = context["dag_run"].run_id
+            base_vars["defer_chunk_terminal_status"] = True
             _invoke(
                 base_vars,
                 model_name,
@@ -170,9 +178,11 @@ def build_chunked_model_graph(
                 dbt_executable_path=dbt_executable,
                 select=[model.name],
                 vars=(
-                    "{{ ti.xcom_pull(task_ids='"
+                    "{{ {**ti.xcom_pull(task_ids='"
                     + PREPARE_TASK_ID
-                    + "')['vars'] }}"
+                    + "')['vars'], "
+                    "'finalize_chunk_completions': True, "
+                    "'run_group_id': dag_run.run_id} }}"
                 ),
                 install_deps=False,
                 trigger_rule="none_failed_min_one_success",

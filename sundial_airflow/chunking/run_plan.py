@@ -7,31 +7,25 @@ from typing import Literal
 
 from dateutil.relativedelta import relativedelta
 
-from sundial_airflow.chunking.manifest_parser import (
-    CHUNKED,
-    BackfillModel,
-    chunk_windows_from_anchor,
+from sundial_airflow.chunking.manifest_parser import CHUNKED, BackfillModel
+from sundial_airflow.chunking.window import (
+    PlannedChunk,
+    RunWindow,
+    full_backfill_window,
+    incremental_window,
+    partial_backfill_window,
+    subdivide_window,
 )
 
 RunDisposition = Literal["single", "chunked"]
-
-
-@dataclass(frozen=True)
-class ChunkWindow:
-    """One active chunk window for this run."""
-
-    chunk_id: str
-    start: date
-    end: date
+ChunkWindow = PlannedChunk
 
 
 @dataclass(frozen=True)
 class ModelRunPlan:
-    """Resolved run shape for one chunked model."""
-
     model_name: str
     disposition: RunDisposition
-    chunks: tuple[ChunkWindow, ...] = ()
+    chunks: tuple[PlannedChunk, ...] = ()
 
 
 def build_run_plan(
@@ -40,30 +34,25 @@ def build_run_plan(
     watermarks: dict[str, datetime | None],
     backfill_mode: str,
     execution_ts: date,
-    window_start: date | datetime | None = None,
-    window_end: date | datetime | None = None,
+    window_start: date | datetime | str | None = None,
+    window_end: date | datetime | str | None = None,
 ) -> dict[str, ModelRunPlan]:
-    """Build the per-model run plan for chunked models."""
-    upper = execution_ts
     plans: dict[str, ModelRunPlan] = {}
-
     for model in models.values():
         if model.kind != CHUNKED:
             continue
         if model.first_timestamp is None or model.chunk_months is None:
             continue
-
         plan = _plan_for_model(
             model=model,
             watermark=watermarks.get(model.name),
             backfill_mode=backfill_mode,
-            upper=upper,
+            execution_ts=execution_ts,
             window_start=window_start,
             window_end=window_end,
         )
         plans[model.name] = plan
         _log_plan(plan)
-
     return plans
 
 
@@ -72,75 +61,109 @@ def _plan_for_model(
     model: BackfillModel,
     watermark: datetime | None,
     backfill_mode: str,
-    upper: date,
-    window_start: date | datetime | None = None,
-    window_end: date | datetime | None = None,
+    execution_ts: date,
+    window_start: date | datetime | str | None = None,
+    window_end: date | datetime | str | None = None,
 ) -> ModelRunPlan:
     anchor = model.first_timestamp
     chunk_months = model.chunk_months
     assert anchor is not None and chunk_months is not None
 
+    lag = model.lag or 0
     if backfill_mode == "partial":
-        return _plan_partial(
-            model=model,
-            anchor=anchor,
-            chunk_months=chunk_months,
-            window_start=window_start,
-            window_end=window_end,
+        return _plan_partial_backfill(
+            model.name, anchor, chunk_months, window_start, window_end,
         )
-
-    if backfill_mode == "full" or watermark is None:
-        chunks = _to_windows(
-            chunk_windows_from_anchor(anchor, chunk_months, anchor, upper),
+    if backfill_mode == "full":
+        return _plan_full_backfill(
+            model.name, anchor, chunk_months, execution_ts, lag=lag,
         )
-        return ModelRunPlan(model.name, "chunked", chunks)
-
-    range_start = _as_date(watermark)
-    if _month_span(range_start, upper) <= chunk_months:
-        return ModelRunPlan(model.name, "single")
-
-    chunks = _to_windows(
-        chunk_windows_from_anchor(anchor, chunk_months, range_start, upper),
+    return _plan_incremental(
+        model.name, anchor, chunk_months, execution_ts, watermark, lag=lag,
     )
-    return ModelRunPlan(model.name, "chunked", chunks)
 
 
-def _plan_partial(
-    *,
-    model: BackfillModel,
+def _plan_partial_backfill(
+    model_name: str,
     anchor: date,
     chunk_months: int,
-    window_start: date | datetime | None,
-    window_end: date | datetime | None,
+    window_start: date | datetime | str | None,
+    window_end: date | datetime | str | None,
 ) -> ModelRunPlan:
-    """Plan an explicit ``[start_ts, end_ts]`` partial backfill window.
-
-    Windows at or under ``chunk_months`` run once; larger windows fan out into
-    anchor-aligned chunks so chunk_keys match the full-backfill cadence.
-    """
     if window_start is None or window_end is None:
-        return ModelRunPlan(model.name, "single")
+        return ModelRunPlan(model_name, "single")
 
-    range_start = max(_as_date(window_start), _as_date(anchor))
-    range_end = _as_date(window_end)
-    if range_end <= range_start or _month_span(range_start, range_end) <= chunk_months:
-        return ModelRunPlan(model.name, "single")
+    clip_start = max(_as_date(window_start), anchor)
+    if _month_span(clip_start, _as_date(window_end)) <= chunk_months:
+        return ModelRunPlan(model_name, "single")
 
-    chunks = _to_windows(
-        chunk_windows_from_anchor(anchor, chunk_months, range_start, range_end),
+    return _chunk_or_single(
+        model_name,
+        anchor,
+        chunk_months,
+        clip_start,
+        partial_backfill_window(
+            partial_start=window_start,
+            partial_end=window_end,
+        ),
+    )
+
+
+def _plan_full_backfill(
+    model_name: str,
+    anchor: date,
+    chunk_months: int,
+    execution_ts: date,
+    *,
+    lag: int = 0,
+) -> ModelRunPlan:
+    return _chunk_or_single(
+        model_name,
+        anchor,
+        chunk_months,
+        anchor,
+        full_backfill_window(execution_ts=execution_ts, lag=lag),
+    )
+
+
+def _plan_incremental(
+    model_name: str,
+    anchor: date,
+    chunk_months: int,
+    execution_ts: date,
+    watermark: datetime | None,
+    *,
+    lag: int = 0,
+) -> ModelRunPlan:
+    clip_start = anchor if watermark is None else _as_date(watermark)
+    if watermark is not None and _month_span(clip_start, execution_ts) <= chunk_months:
+        return ModelRunPlan(model_name, "single")
+
+    return _chunk_or_single(
+        model_name,
+        anchor,
+        chunk_months,
+        clip_start,
+        incremental_window(execution_ts=execution_ts, lag=lag),
+    )
+
+
+def _chunk_or_single(
+    model_name: str,
+    anchor: date,
+    chunk_months: int,
+    clip_start: date,
+    window: RunWindow,
+) -> ModelRunPlan:
+    chunks = subdivide_window(
+        anchor=anchor,
+        chunk_months=chunk_months,
+        window=window,
+        clip_start=clip_start,
     )
     if not chunks:
-        return ModelRunPlan(model.name, "single")
-    return ModelRunPlan(model.name, "chunked", chunks)
-
-
-def _to_windows(
-    raw: list[tuple[date, date, str]],
-) -> tuple[ChunkWindow, ...]:
-    return tuple(
-        ChunkWindow(chunk_id=chunk_id, start=start, end=end)
-        for start, end, chunk_id in raw
-    )
+        return ModelRunPlan(model_name, "single")
+    return ModelRunPlan(model_name, "chunked", tuple(chunks))
 
 
 def _as_date(value: datetime | date | str) -> date:
@@ -152,7 +175,6 @@ def _as_date(value: datetime | date | str) -> date:
 
 
 def _month_span(start: date, end: date) -> int:
-    """Return the month span between two dates (partial months count as one)."""
     if end <= start:
         return 0
     delta = relativedelta(end, start)
@@ -175,7 +197,6 @@ def _log_plan(plan: ModelRunPlan) -> None:
 
 
 def serialize_run_plan(plans: dict[str, ModelRunPlan]) -> dict[str, dict]:
-    """Convert run plans to JSON-safe dicts for XCom."""
     return {
         name: {
             "disposition": plan.disposition,
@@ -184,10 +205,13 @@ def serialize_run_plan(plans: dict[str, ModelRunPlan]) -> dict[str, dict]:
                     "chunk_id": c.chunk_id,
                     "start": c.start.isoformat(),
                     "end": c.end.isoformat(),
+                    "omit_start_override": c.omit_start_override,
+                    "omit_end_override": c.omit_end_override,
+                    "start_ts": c.start_ts,
+                    "end_ts": c.end_ts,
                 }
                 for c in plan.chunks
             ],
         }
         for name, plan in plans.items()
     }
-

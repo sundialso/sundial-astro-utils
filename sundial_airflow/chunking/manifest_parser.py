@@ -28,6 +28,7 @@ _START_TS_RE = re.compile(
     """,
     re.VERBOSE | re.DOTALL,
 )
+_END_TS_LAG_RE = re.compile(r"""end_ts\s*\(\s*(\d+)\s*\)""")
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
@@ -42,6 +43,7 @@ class BackfillModel:
     first_timestamp: Optional[date]
     depends_on: list[str]
     chunk_months: Optional[int] = None
+    lag: int = 0
     partition_column: Optional[str] = None
     table_name: Optional[str] = None
 
@@ -115,6 +117,7 @@ def load_backfill_models(
                 d for d in node.get("depends_on", {}).get("nodes", [])
                 if d.startswith("model.")
             ],
+            lag=_extract_end_ts_lag(raw_sql),
             partition_column=_extract_partition_column(raw_sql),
             table_name=node.get("alias") or node["name"],
         )
@@ -168,13 +171,25 @@ def compute_static_chunks(
     today: date,
 ) -> dict[str, list[tuple[date, date, str]]]:
     """Return static (start, end, chunk_id) windows per chunked model."""
+    from sundial_airflow.chunking.window import (
+        full_backfill_window,
+        incremental_window,
+        partial_backfill_window,
+        subdivide_window,
+    )
+
     out: dict[str, list[tuple[date, date, str]]] = {}
     for m in models.values():
         if m.kind != CHUNKED or m.first_timestamp is None or m.chunk_months is None:
             continue
-        out[m.name] = chunk_windows_from_anchor(
-            m.first_timestamp, m.chunk_months, m.first_timestamp, today,
+        window = full_backfill_window(execution_ts=today, lag=m.lag or 0)
+        planned = subdivide_window(
+            anchor=m.first_timestamp,
+            chunk_months=m.chunk_months,
+            window=window,
+            clip_start=m.first_timestamp,
         )
+        out[m.name] = [(c.start, c.end, c.chunk_id) for c in planned]
     return out
 
 
@@ -183,18 +198,29 @@ def chunk_windows_from_anchor(
     chunk_months: int,
     range_start: date,
     range_end: date,
+    *,
+    range_end_inclusive: bool = False,
+    lag: int = 0,
 ) -> list[tuple[date, date, str]]:
-    """Return aligned chunk windows overlapping ``[range_start, range_end)``."""
-    if range_end <= range_start or chunk_months < 1:
-        return []
-    out: list[tuple[date, date, str]] = []
-    for start, end in _generate_chunks(anchor, chunk_months, range_end):
-        if start >= range_end or end <= range_start:
-            continue
-        win_start = max(start, range_start)
-        win_end = min(end, range_end)
-        out.append((win_start, win_end, start.strftime("%Y-%m")))
-    return out
+    """Legacy test helper."""
+    from sundial_airflow.chunking.window import (
+        incremental_window,
+        partial_backfill_window,
+        subdivide_window,
+    )
+
+    window = (
+        partial_backfill_window(partial_start=range_start, partial_end=range_end)
+        if range_end_inclusive
+        else incremental_window(execution_ts=range_end, lag=lag)
+    )
+    planned = subdivide_window(
+        anchor=anchor,
+        chunk_months=chunk_months,
+        window=window,
+        clip_start=range_start,
+    )
+    return [(c.start, c.end, c.chunk_id) for c in planned]
 
 
 def _is_eligible(node: dict) -> bool:
@@ -209,6 +235,14 @@ def _extract_partition_column(raw_sql: str) -> Optional[str]:
     sql = _LINE_COMMENT_RE.sub("", sql)
     match = _START_TS_PARTITION_RE.search(sql)
     return match.group(1) if match else None
+
+
+def _extract_end_ts_lag(raw_sql: str) -> int:
+    """Return the lag argument from the first ``end_ts(N)`` call."""
+    sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
+    sql = _LINE_COMMENT_RE.sub("", sql)
+    match = _END_TS_LAG_RE.search(sql)
+    return int(match.group(1)) if match else 0
 
 
 def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
@@ -313,7 +347,7 @@ def _apply_chunking_config(
 def _generate_chunks(
     first_timestamp: date, chunk_months: int, today: date,
 ) -> list[tuple[date, date]]:
-    """Build contiguous month windows from first_timestamp through today."""
+    """Yield half-open month windows ``[start, end)`` from anchor while ``start < today``."""
     if chunk_months is None or chunk_months < 1:
         raise ValueError(
             f"chunk_months must be a positive int, got {chunk_months!r}"

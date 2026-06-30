@@ -401,9 +401,22 @@
     - dbt test only (Cosmos "test" task, local): tests only.
   In every case, on-run-end writes a terminal row, so the table never
   stays at 'started' for a model that dbt actually finished.
+
+  Chunked DAG fan-out (Airflow):
+    - defer_chunk_terminal_status=true on per-chunk ``dbt run``: build-only
+      invocations record window columns on 'started' but defer terminal status
+      until the shared model test runs.
+    - finalize_chunk_completions=true on that model's ``dbt test``: writes one
+      terminal row per deferred chunk_key (started row with no terminal yet)
+      for the run_group, so read_watermark advances only after tests pass.
 #}
 {% macro log_run_results() %}
   {% if execute and results %}
+    {% set finalize_completions = var('finalize_chunk_completions', false) %}
+    {% set defer_terminal = var('defer_chunk_terminal_status', false) %}
+    {% set _tbl = sundial_dbt_shared.dbt_completions_table() %}
+    {% set _rg = var('run_group_id', invocation_id) %}
+
     {# 1) Group test outcomes by parent model. #}
     {% set tests_by_model = {} %}
     {% for res in results if res.node.resource_type == 'test' %}
@@ -433,32 +446,61 @@
       {% endif %}
     {% endfor %}
 
-    {# 4) Pick a terminal status per touched model. #}
+    {# 4) Pick terminal rows — per model, or per deferred chunk on finalize. #}
     {% set rows = [] %}
-    {% for name in touched %}
-      {% set build_status = model_build.get(name) %}
-      {% set test_statuses = tests_by_model.get(name, []) %}
-      {% set has_failing_test = ('fail' in test_statuses) or ('error' in test_statuses) %}
-      {# Skipped tests didn't actually run — exclude them so a model whose tests
-         were all skipped isn't recorded 'succeeded' off the back of them. #}
-      {% set tests_ran = (test_statuses | reject('equalto', 'skipped') | list) | length > 0 %}
-      {% set build_skipped = build_status == 'skipped' %}
-      {% set build_failed = build_status is not none and build_status not in ('success', 'skipped') %}
-      {% set build_ok = build_status == 'success' %}
+    {% if finalize_completions %}
+      {% for name in touched %}
+        {% set test_statuses = tests_by_model.get(name, []) %}
+        {% set has_failing_test = ('fail' in test_statuses) or ('error' in test_statuses) %}
+        {% set tests_ran = (test_statuses | reject('equalto', 'skipped') | list) | length > 0 %}
+        {% if tests_ran %}
+          {% set terminal_status = 'failed' if has_failing_test else 'succeeded' %}
+          {% set pending = run_query(
+               "SELECT DISTINCT chunk_key FROM " ~ _tbl
+               ~ " WHERE model_name = '" ~ name ~ "'"
+               ~ " AND run_group_id = '" ~ _rg ~ "'"
+               ~ " AND status = 'started'"
+               ~ " AND NOT EXISTS ("
+               ~ "   SELECT 1 FROM " ~ _tbl ~ " t"
+               ~ "   WHERE t.model_name = '" ~ name ~ "'"
+               ~ "     AND t.run_group_id = '" ~ _rg ~ "'"
+               ~ "     AND t.chunk_key = " ~ _tbl ~ ".chunk_key"
+               ~ "     AND t.status IN ('succeeded', 'failed')"
+               ~ " )") %}
+          {% if pending is not none and pending.columns | length > 0 %}
+            {% for ck in pending.columns[0].values() %}
+              {% do rows.append({'name': name, 'status': terminal_status, 'chunk_key': ck}) %}
+            {% endfor %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+    {% else %}
+      {% for name in touched %}
+        {% set build_status = model_build.get(name) %}
+        {% set test_statuses = tests_by_model.get(name, []) %}
+        {% set has_failing_test = ('fail' in test_statuses) or ('error' in test_statuses) %}
+        {# Skipped tests didn't actually run — exclude them so a model whose tests
+           were all skipped aren't recorded 'succeeded' off the back of them. #}
+        {% set tests_ran = (test_statuses | reject('equalto', 'skipped') | list) | length > 0 %}
+        {% set build_skipped = build_status == 'skipped' %}
+        {% set build_failed = build_status is not none and build_status not in ('success', 'skipped') %}
+        {% set build_ok = build_status == 'success' %}
 
-      {% if build_skipped %}
-        {# dbt skipped this model — it never ran, so record nothing. #}
-      {% elif build_failed or has_failing_test %}
-        {% do rows.append({'name': name, 'status': 'failed'}) %}
-      {% elif build_ok or tests_ran %}
-        {% do rows.append({'name': name, 'status': 'succeeded'}) %}
-      {% endif %}
-    {% endfor %}
+        {% if build_skipped %}
+          {# dbt skipped this model — it never ran, so record nothing. #}
+        {% elif build_failed or has_failing_test %}
+          {% do rows.append({'name': name, 'status': 'failed'}) %}
+        {% elif defer_terminal and build_ok %}
+          {# Chunk build succeeded; defer terminal until shared model test. #}
+        {% elif build_ok or tests_ran %}
+          {% do rows.append({'name': name, 'status': 'succeeded'}) %}
+        {% endif %}
+      {% endfor %}
+    {% endif %}
 
     {# Exclude models that backed off behind another run's lock this run: they
        carry a 'locked_out' row and never actually ran, so they must NOT be
        overwritten with failed/succeeded. #}
-    {% set _rg = var('run_group_id', invocation_id) %}
     {% set _locked = run_query(
          "SELECT DISTINCT model_name FROM " ~ sundial_dbt_shared.dbt_completions_table()
          ~ " WHERE status = 'locked_out' AND run_group_id = '" ~ _rg ~ "'") %}
@@ -475,7 +517,7 @@
             {{ sundial_dbt_shared.execution_ts_as_datestr() }} AS execution_ts,
             '{{ row.status }}' AS status,
             '{{ _rg }}' AS run_group_id,
-            '{{ var('chunk_key', 'full') }}' AS chunk_key,
+            '{{ row.chunk_key if row.chunk_key is defined else var('chunk_key', 'full') }}' AS chunk_key,
             CURRENT_TIMESTAMP() AS updated_at
           {% if not loop.last %}UNION ALL{% endif %}
         {% endfor %}
