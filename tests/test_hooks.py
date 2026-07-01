@@ -28,10 +28,10 @@ def _load_hooks():
 
 
 hooks = _load_hooks()
-skip_chunked_precreate = hooks.skip_chunked_precreate
+skip_chunked_prepare_empty_table = hooks.skip_chunked_prepare_empty_table
 
 
-class SkipChunkedPrecreateTests(unittest.TestCase):
+class SkipChunkedPrepareEmptyTableTests(unittest.TestCase):
     def _context(self, *, full_refresh: bool, disposition: str):
         return {
             "params": {},
@@ -47,20 +47,20 @@ class SkipChunkedPrecreateTests(unittest.TestCase):
 
     def test_skips_when_not_full_refresh(self):
         with self.assertRaises(AirflowSkipException):
-            skip_chunked_precreate(
+            skip_chunked_prepare_empty_table(
                 self._context(full_refresh=False, disposition="chunked"),
                 "orders",
             )
 
     def test_skips_when_disposition_single(self):
         with self.assertRaises(AirflowSkipException):
-            skip_chunked_precreate(
+            skip_chunked_prepare_empty_table(
                 self._context(full_refresh=True, disposition="single"),
                 "orders",
             )
 
     def test_allows_full_refresh_chunked(self):
-        skip_chunked_precreate(
+        skip_chunked_prepare_empty_table(
             self._context(full_refresh=True, disposition="chunked"),
             "orders",
         )

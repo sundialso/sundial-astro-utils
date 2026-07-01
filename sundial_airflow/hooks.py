@@ -108,8 +108,8 @@ def skip_chunked_run(context, model_name: str) -> None:
         raise AirflowSkipException(f"No run plan for '{model_name}'")
 
 
-def skip_chunked_precreate(context, model_name: str) -> None:
-    """Skip pre-create unless this is a full_refresh chunked backfill."""
+def skip_chunked_prepare_empty_table(context, model_name: str) -> None:
+    """Skip prepare-empty unless this is a full_refresh chunked backfill."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Skipped (skip_tests or empty mode)")
@@ -124,11 +124,12 @@ def skip_chunked_precreate(context, model_name: str) -> None:
         raise AirflowSkipException(f"No run plan for '{model_name}'")
     if not prep.get("full_refresh"):
         raise AirflowSkipException(
-            f"Pre-create skipped for '{model_name}' (not full_refresh backfill)"
+            f"prepare_empty_table skipped for '{model_name}' "
+            "(not full_refresh backfill)"
         )
     if plan.get("disposition") != "chunked":
         raise AirflowSkipException(
-            f"Pre-create skipped for '{model_name}' "
+            f"prepare_empty_table skipped for '{model_name}' "
             f"(disposition={plan.get('disposition')})"
         )
 

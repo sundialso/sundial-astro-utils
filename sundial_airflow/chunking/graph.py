@@ -17,7 +17,7 @@ from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
     skip_chunked_model_test,
-    skip_chunked_precreate,
+    skip_chunked_prepare_empty_table,
     skip_chunked_run,
 )
 from sundial_airflow.task_log import log_chunk_task, log_chunk_units, log_dbt_run_result
@@ -83,7 +83,7 @@ def build_chunked_model_graph(
             stdout=result.stdout,
             stderr=result.stderr,
             chunk_id=extra_vars.get("chunk_key")
-            if extra_vars.get("chunk_key") not in (None, "full", "precreate")
+            if extra_vars.get("chunk_key") not in (None, "full", "prepare_empty")
             else None,
         )
         if result.returncode != 0:
@@ -105,19 +105,19 @@ def build_chunked_model_graph(
             )
             return units
 
-        @task(task_id="precreate_table", trigger_rule="none_failed")
-        def precreate_table(**context: Any) -> None:
+        @task(task_id="prepare_empty_table", trigger_rule="none_failed")
+        def prepare_empty_table(**context: Any) -> None:
             """Purge and rebuild an empty target before full_refresh chunk fan-out."""
-            skip_chunked_precreate(context, model_name=model_name)
+            skip_chunked_prepare_empty_table(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
             full_refresh = bool(prep.get("full_refresh"))
-            base_vars["chunk_key"] = "precreate"
+            base_vars["chunk_key"] = "prepare_empty"
             base_vars["run_group_id"] = context["dag_run"].run_id
             base_vars["record_incremental_window"] = False
             log_chunk_task(
                 model_name,
-                "precreate_table",
+                "prepare_empty_table",
                 full_refresh=full_refresh,
             )
             _invoke(base_vars, model_name, full_refresh=full_refresh, empty=True)
@@ -166,10 +166,10 @@ def build_chunked_model_graph(
             )
 
         units = chunk_units()
-        precreate = precreate_table()
+        prepare_empty = prepare_empty_table()
         mapped = run_chunk.expand_kwargs(units)
         incremental = run_incremental()
-        units >> precreate >> mapped
+        units >> prepare_empty >> mapped
         units >> incremental
         return units, mapped, incremental
 
