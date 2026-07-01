@@ -111,22 +111,14 @@ def build_chunked_model_graph(
 
         @task(task_id="precreate_table", trigger_rule="none_failed")
         def precreate_table(**context: Any) -> None:
-            """Build the (empty) target once before the parallel chunk fan-out.
-
-            Stops parallel first-build chunks from racing on CREATE OR REPLACE;
-            on full backfill it also --full-refreshes so the schema is rebuilt
-            and stale data purged (matching the non-chunking DAG). Window
-            recording is disabled so this never advances the watermark.
-            """
+            """Purge and rebuild an empty target before full_refresh chunk fan-out."""
             skip_chunked_precreate(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
-            base_vars["chunk_key"] = "precreate"
-            base_vars["run_group_id"] = (
-                f"{context['dag_run'].run_id}:precreate:{model_name}"
-            )
-            base_vars["record_incremental_window"] = False
             full_refresh = bool(prep.get("full_refresh"))
+            base_vars["chunk_key"] = "precreate"
+            base_vars["run_group_id"] = context["dag_run"].run_id
+            base_vars["record_incremental_window"] = False
             logger.info(
                 "Starting precreate_table model=%s full_refresh=%s (empty build)",
                 model_name,
@@ -156,12 +148,11 @@ def build_chunked_model_graph(
             skip_chunked_run(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
-            ti = context["ti"]
             base_vars[start_var] = chunk_start
             base_vars[end_var] = chunk_end
             base_vars["backfill_chunk_id"] = chunk_id
             base_vars["chunk_key"] = chunk_id
-            base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
+            base_vars["run_group_id"] = context["dag_run"].run_id
             _invoke(base_vars, model_name)
 
         @task(task_id="run_incremental", trigger_rule="none_failed")

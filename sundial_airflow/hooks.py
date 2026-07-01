@@ -109,11 +109,7 @@ def skip_chunked_run(context, model_name: str) -> None:
 
 
 def skip_chunked_precreate(context, model_name: str) -> None:
-    """Skip the empty pre-create unless this model will fan out into chunks.
-
-    The pre-create only protects the parallel chunk fan-out (and rebuilds the
-    table on full backfill), so it is a no-op for single/disabled runs.
-    """
+    """Skip pre-create unless this is a full_refresh chunked backfill."""
     params = context.get("params", {})
     if params.get("skip_tests") or params.get("empty"):
         raise AirflowSkipException("Skipped (skip_tests or empty mode)")
@@ -126,6 +122,10 @@ def skip_chunked_precreate(context, model_name: str) -> None:
     plan = _chunked_run_plan(context, model_name)
     if plan is None:
         raise AirflowSkipException(f"No run plan for '{model_name}'")
+    if not prep.get("full_refresh"):
+        raise AirflowSkipException(
+            f"Pre-create skipped for '{model_name}' (not full_refresh backfill)"
+        )
     if plan.get("disposition") != "chunked":
         raise AirflowSkipException(
             f"Pre-create skipped for '{model_name}' "
