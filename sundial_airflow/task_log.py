@@ -24,16 +24,24 @@ _SQL_HOOK_LOGGERS = (
 
 @contextmanager
 def quiet_sql_hook_loggers() -> Iterator[None]:
-    """Temporarily suppress INFO-level SQL from warehouse hooks/drivers."""
-    saved: list[tuple[logging.Logger, int]] = []
+    """Temporarily suppress INFO/DEBUG SQL noise from warehouse hooks/drivers.
+
+    Uses ``logging.disable`` so Airflow task logging cannot still emit hook SQL
+    when per-logger ``setLevel`` is ignored by preconfigured handlers.
+    """
+    root = logging.root
+    previous_disable = root.manager.disable
+    saved_levels: list[tuple[logging.Logger, int]] = []
     for name in _SQL_HOOK_LOGGERS:
         log = logging.getLogger(name)
-        saved.append((log, log.level))
+        saved_levels.append((log, log.level))
         log.setLevel(logging.WARNING)
+    logging.disable(logging.WARNING)
     try:
         yield
     finally:
-        for log, level in saved:
+        logging.disable(previous_disable)
+        for log, level in saved_levels:
             log.setLevel(level)
 
 

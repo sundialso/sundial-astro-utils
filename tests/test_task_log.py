@@ -72,6 +72,21 @@ class TaskLogTests(unittest.TestCase):
         self.assertIn("orders", text)
         self.assertIn("run_chunk", text)
 
+    def test_quiet_sql_hook_loggers_suppresses_hook_info(self):
+        captured: list[str] = []
+        handler = logging.Handler()
+        handler.emit = lambda record: captured.append(record.getMessage())  # type: ignore[method-assign]
+        hook_log = logging.getLogger("airflow.providers.common.sql.hooks.sql")
+        hook_log.addHandler(handler)
+        hook_log.setLevel(logging.INFO)
+        try:
+            with task_log.quiet_sql_hook_loggers():
+                hook_log.info("Running statement: SELECT 1")
+            hook_log.info("after quiet")
+        finally:
+            hook_log.removeHandler(handler)
+        self.assertEqual(captured, ["after quiet"])
+
     def test_log_prepare_summary_truncates_large_run_plans(self):
         run_plan = {
             f"model_{idx}": {

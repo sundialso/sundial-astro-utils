@@ -142,59 +142,58 @@ def fetch_partition_watermarks(
 
     logger.info("Fetching watermarks for %d model(s) via %s", len(queries), warehouse)
 
-    if len(queries) == 1:
-        fetched = _fetch_one(
-            warehouse=warehouse,
-            conn_id=conn_id,
-            table_fqn=queries[0].table_fqn,
-            partition_column=queries[0].partition_column,
-        )
-        watermarks[queries[0].model_name] = fetched
-    else:
-        try:
-            watermarks.update(_fetch_batch(warehouse, conn_id, queries))
-        except Exception as exc:
-            if _is_missing_table_error(exc):
-                logger.info(
-                    "Batch watermark query failed (%s); falling back to parallel "
-                    "per-model queries.",
-                    exc,
-                )
-                watermarks.update(_fetch_parallel(warehouse, conn_id, queries))
-            else:
-                raise
-
-    # Align the planning watermark with the dbt read_watermark macro:
-    # COALESCE(read_watermark, MAX(partition_column)). read_watermark (MAX
-    # completed end_ts in dbt_completions_raw) is the exact lower bound the
-    # incremental start_ts() macro uses at run time, so chunked planning and
-    # execution can't diverge when completions and table data disagree (failed
-    # tests / retries / partial runs). Falls back to the partition MAX when the
-    # completions table doesn't exist yet (pre-first-run).
-    partition_only = dict(watermarks)
+    partition_only: dict[str, datetime | None]
     completions: dict[str, datetime | None] = {}
     completions_fqn = adapter.build_table_fqn(dbt_vars, _COMPLETIONS_TABLE)
-    if completions_fqn:
-        try:
-            completions = _fetch_completion_watermarks(
+
+    with quiet_sql_hook_loggers():
+        if len(queries) == 1:
+            fetched = _fetch_one(
                 warehouse=warehouse,
                 conn_id=conn_id,
-                completions_fqn=completions_fqn,
-                model_names=[query.model_name for query in queries],
+                table_fqn=queries[0].table_fqn,
+                partition_column=queries[0].partition_column,
             )
-        except Exception as exc:
-            logger.warning(
-                "Completion watermark query failed (%s); using partition MAX only.",
-                exc,
-            )
-        for name, completed in completions.items():
-            if completed is not None:
-                watermarks[name] = completed
-    else:
+            watermarks[queries[0].model_name] = fetched
+        else:
+            try:
+                watermarks.update(_fetch_batch(warehouse, conn_id, queries))
+            except Exception as exc:
+                if _is_missing_table_error(exc):
+                    logger.warning(
+                        "Batch watermark query failed (%s); falling back to parallel "
+                        "per-model queries.",
+                        exc,
+                    )
+                    watermarks.update(_fetch_parallel(warehouse, conn_id, queries))
+                else:
+                    raise
+
+        partition_only = dict(watermarks)
+        if completions_fqn:
+            try:
+                completions = _fetch_completion_watermarks(
+                    warehouse=warehouse,
+                    conn_id=conn_id,
+                    completions_fqn=completions_fqn,
+                    model_names=[query.model_name for query in queries],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Completion watermark query failed (%s); using partition MAX only.",
+                    exc,
+                )
+            for name, completed in completions.items():
+                if completed is not None:
+                    watermarks[name] = completed
+
+    if not completions_fqn:
         logger.info(
             "Cannot resolve %s FQN; planning on partition MAX only.",
             _COMPLETIONS_TABLE,
         )
+
+    logger.info("Fetched watermarks for %d model(s) via %s", len(queries), warehouse)
 
     for query in queries:
         name = query.model_name
@@ -312,8 +311,7 @@ def _run_snowflake_query(
 
     hook = SnowflakeHook(snowflake_conn_id=conn_id)
     try:
-        with quiet_sql_hook_loggers():
-            rows = hook.get_records(sql)
+        rows = hook.get_records(sql)
     except Exception as exc:
         if allow_missing_table and _is_missing_table_error(exc):
             logger.info("Partition watermark table not found; first run: %s", exc)
@@ -336,8 +334,7 @@ def _run_bigquery_query(
 
     hook = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
     try:
-        with quiet_sql_hook_loggers():
-            rows = list(hook.get_client().query(sql).result())
+        rows = list(hook.get_client().query(sql).result())
     except Exception as exc:
         if allow_missing_table and _is_missing_table_error(exc):
             logger.info("Partition watermark table not found; first run: %s", exc)
