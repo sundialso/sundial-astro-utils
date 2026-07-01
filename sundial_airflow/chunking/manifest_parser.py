@@ -103,7 +103,7 @@ def load_chunking_config(
             )
         out[entry.model_name] = entry
 
-    logger.info("Loaded %d chunking-config entries from %s.", len(out), path)
+    logger.debug("Loaded %d chunking-config entries from %s.", len(out), path)
     return out
 
 
@@ -137,7 +137,7 @@ def load_backfill_models(
     promoted = _apply_chunking_config(models, chunking_config or {})
 
     chunked = sum(1 for m in models.values() if m.kind == CHUNKED)
-    logger.info(
+    logger.debug(
         "Discovered %d eligible model(s) from %s "
         "(%d chunked + %d full-refresh; %d promoted via config).",
         len(models), manifest_path, chunked, len(models) - chunked,
@@ -324,7 +324,7 @@ def _apply_chunking_config(
             )
             continue
         if not entry.chunking_enabled:
-            logger.info(
+            logger.debug(
                 "Chunking config explicitly disables %r — staying full_refresh.",
                 target.name,
             )
@@ -346,7 +346,7 @@ def _apply_chunking_config(
         target.kind = CHUNKED
         target.chunk_months = entry.chunk_size
         promoted += 1
-        logger.info(
+        logger.debug(
             "Chunking config: %r → chunked, %d-month window "
             "(anchor=%s, lag=%d, lookback=%d from SQL).",
             target.name, entry.chunk_size, target.first_timestamp,

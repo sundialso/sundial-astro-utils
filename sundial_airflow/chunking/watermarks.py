@@ -195,7 +195,7 @@ def fetch_partition_watermarks(
 
     for query in queries:
         name = query.model_name
-        logger.info(
+        logger.debug(
             "Planning watermark for %r: %s (read_watermark=%s, partition_max=%s, "
             "table=%s, column=%s)",
             name,

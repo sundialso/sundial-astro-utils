@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 from functools import partial
@@ -21,8 +20,7 @@ from sundial_airflow.hooks import (
     skip_chunked_precreate,
     skip_chunked_run,
 )
-
-logger = logging.getLogger(__name__)
+from sundial_airflow.task_log import log_chunk_task, log_chunk_units, log_dbt_run_result
 
 
 def build_chunked_model_graph(
@@ -79,9 +77,15 @@ def build_chunked_model_graph(
             result = subprocess.run(
                 cmd, capture_output=True, text=True, env=env, check=False,
             )
-        logger.info("dbt run [%s] stdout:\n%s", model_name, result.stdout)
-        if result.stderr:
-            logger.warning("dbt run [%s] stderr:\n%s", model_name, result.stderr)
+        log_dbt_run_result(
+            model_name,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            chunk_id=extra_vars.get("chunk_key")
+            if extra_vars.get("chunk_key") not in (None, "full", "precreate")
+            else None,
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"dbt run failed for {model_name} (exit={result.returncode})"
@@ -93,20 +97,12 @@ def build_chunked_model_graph(
             """Read mapped chunk kwargs from prepare_dbt_args."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             units = (prep.get("chunk_units") or {}).get(model_name, [])
-            if units:
-                logger.info(
-                    "chunk_units %r: %d chunk(s): %s",
-                    model_name,
-                    len(units),
-                    ", ".join(u["chunk_id"] for u in units),
-                )
-            else:
-                plan = (prep.get("run_plan") or {}).get(model_name) or {}
-                logger.info(
-                    "chunk_units %r: 0 mapped tasks (disposition=%s)",
-                    model_name,
-                    plan.get("disposition", "missing"),
-                )
+            plan = (prep.get("run_plan") or {}).get(model_name) or {}
+            log_chunk_units(
+                model_name,
+                units,
+                disposition=plan.get("disposition"),
+            )
             return units
 
         @task(task_id="precreate_table", trigger_rule="none_failed")
@@ -119,10 +115,10 @@ def build_chunked_model_graph(
             base_vars["chunk_key"] = "precreate"
             base_vars["run_group_id"] = context["dag_run"].run_id
             base_vars["record_incremental_window"] = False
-            logger.info(
-                "Starting precreate_table model=%s full_refresh=%s (empty build)",
+            log_chunk_task(
                 model_name,
-                full_refresh,
+                "precreate_table",
+                full_refresh=full_refresh,
             )
             _invoke(base_vars, model_name, full_refresh=full_refresh, empty=True)
 
@@ -138,12 +134,11 @@ def build_chunked_model_graph(
             **context: Any,
         ) -> None:
             """Run one chunk window."""
-            logger.info(
-                "Starting run_chunk model=%s chunk=%s window=%s..%s",
+            log_chunk_task(
                 model_name,
-                chunk_id,
-                chunk_start,
-                chunk_end,
+                "run_chunk",
+                chunk_id=chunk_id,
+                window=f"{chunk_start} → {chunk_end}",
             )
             skip_chunked_run(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
@@ -158,7 +153,7 @@ def build_chunked_model_graph(
         @task(task_id="run_incremental", trigger_rule="none_failed")
         def run_incremental(**context: Any) -> None:
             """Run one incremental pass."""
-            logger.info("Starting run_incremental for model=%s", model_name)
+            log_chunk_task(model_name, "run_incremental")
             skip_chunked_incremental(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})

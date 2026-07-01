@@ -271,9 +271,9 @@ def _log_plan(plan: ModelRunPlan) -> None:
 
     logger = logging.getLogger(__name__)
     if plan.disposition == "single":
-        logger.info("Run plan: %s → single run", plan.model_name)
+        logger.debug("Run plan: %s → single run", plan.model_name)
         return
-    logger.info(
+    logger.debug(
         "Run plan: %s → %d chunk(s): %s",
         plan.model_name,
         len(plan.chunks),

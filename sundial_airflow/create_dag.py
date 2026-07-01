@@ -55,6 +55,7 @@ from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
 )
+from sundial_airflow.task_log import log_prepare_dbt_args_summary
 
 logger = logging.getLogger(__name__)
 
@@ -110,26 +111,7 @@ def _validate_backfill_params(
         )
 
 
-def _format_chunk_windows(chunks: list[dict], edge: int = 2) -> str:
-    """Pretty multi-line listing of chunk windows (first ``edge`` + last ``edge``)."""
-    if not chunks:
-        return "    (no chunk windows)"
-
-    def _line(chunk: dict) -> str:
-        return (
-            f"    {chunk.get('chunk_id'):<10} "
-            f"{chunk.get('start')}  ->  {chunk.get('end')}"
-        )
-
-    if len(chunks) <= edge * 2:
-        return "\n".join(_line(c) for c in chunks)
-
-    head = [_line(c) for c in chunks[:edge]]
-    tail = [_line(c) for c in chunks[-edge:]]
-    return "\n".join(head + [f"    ... {len(chunks) - edge * 2} more ..."] + tail)
-
-
-def _collect_run_tasks(group: Any) -> dict[str, Any]:
+def _validate_backfill_params(
     """Walk a Cosmos ``DbtTaskGroup`` and return ``{model_name: run_task}``.
 
     Handles both rendering layouts Cosmos can produce:
@@ -363,11 +345,6 @@ def create_dag(
             exclude_param = (params.get("exclude") or "").strip()
 
             if select_param or exclude_param:
-                logger.info(
-                    "Resolving model selection (select=%r, exclude=%r) via dbt ls",
-                    select_param,
-                    exclude_param,
-                )
                 ls_profile_config = profile_config_factory("dev", target_value)
                 with ls_profile_config.ensure_profile() as (
                     profile_path,
@@ -436,13 +413,9 @@ def create_dag(
                     for line in result.stdout.strip().splitlines()
                     if line.strip()
                 }
-                logger.info(
-                    "Selection resolved to %d model(s): %s",
-                    len(selected_models),
-                    sorted(selected_models),
-                )
 
             run_plan: dict = {}
+            watermarks: dict[str, Any] = {}
             if _chunked_names:
                 exec_raw = dbt_vars.get("execution_ts") or _dt.date.today().isoformat()
                 execution_date = _dt.date.fromisoformat(str(exec_raw)[:10])
@@ -474,20 +447,10 @@ def create_dag(
                     else None,
                 )
                 run_plan = serialize_run_plan(plans)
-                for name, plan in run_plan.items():
-                    chunks = plan.get("chunks") or []
-                    logger.info(
-                        "Run plan summary: %s watermark=%s disposition=%s chunks=%d\n%s",
-                        name,
-                        watermarks.get(name),
-                        plan.get("disposition"),
-                        len(chunks),
-                        _format_chunk_windows(chunks),
-                    )
 
             chunk_units = build_chunk_units(run_plan) if run_plan else {}
 
-            return {
+            payload = {
                 param_field: target_value,
                 "vars": dbt_vars,
                 # Selects the warehouse adapter in the dbt_completions listener.
@@ -499,6 +462,23 @@ def create_dag(
                 "run_plan": run_plan,
                 "chunk_units": chunk_units,
             }
+            log_prepare_dbt_args_summary(
+                run_id=run_id,
+                params=params,
+                param_field=param_field,
+                target_value=target_value,
+                warehouse=warehouse,
+                backfill_mode=backfill_mode,
+                run_context=run_context,
+                full_refresh=payload["full_refresh"],
+                dbt_vars=dbt_vars,
+                selected_models=selected_models,
+                run_plan=run_plan,
+                watermarks=watermarks,
+                start_var=start_var,
+                end_var=end_var,
+            )
+            return payload
 
         dbt_args = prepare_dbt_args()
 
