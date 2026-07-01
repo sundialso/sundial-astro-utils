@@ -72,7 +72,33 @@ class TaskLogTests(unittest.TestCase):
         self.assertIn("orders", text)
         self.assertIn("run_chunk", text)
 
-    def test_log_dbt_run_result_success_is_one_line(self):
+    def test_log_prepare_summary_truncates_large_run_plans(self):
+        run_plan = {
+            f"model_{idx}": {
+                "disposition": "chunked",
+                "chunks": [{"chunk_id": f"2024-{idx:02d}"}],
+            }
+            for idx in range(20)
+        }
+        with self.assertLogs(task_log.logger, level="INFO") as captured:
+            task_log.log_prepare_dbt_args_summary(
+                run_id="manual__2026",
+                params={},
+                param_field="schema",
+                target_value="DBT",
+                warehouse="snowflake",
+                backfill_mode="full",
+                run_context="full_backfill",
+                full_refresh=True,
+                dbt_vars={"execution_ts": "2026-06-30"},
+                selected_models=None,
+                run_plan=run_plan,
+            )
+        text = "\n".join(captured.output)
+        self.assertIn("20 model(s)", text)
+        self.assertIn("and 17 more model(s)", text)
+        self.assertNotIn("model_19", text)
+
         with self.assertLogs(task_log.logger, level="INFO") as captured:
             task_log.log_dbt_run_result(
                 "orders",

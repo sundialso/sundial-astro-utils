@@ -2,11 +2,39 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
 _BANNER = "=" * 78
+_MAX_PLAN_MODELS_IN_LOG = 12
+
+# Hook / driver loggers that dump full SQL at INFO during watermark queries.
+_SQL_HOOK_LOGGERS = (
+    "airflow.hooks.base",
+    "airflow.providers.common.sql.hooks.sql",
+    "airflow.providers.snowflake.hooks.snowflake",
+    "airflow.providers.google.cloud.hooks.bigquery",
+    "snowflake.connector",
+    "snowflake.connector.connection",
+    "snowflake.connector.cursor",
+)
+
+
+@contextmanager
+def quiet_sql_hook_loggers() -> Iterator[None]:
+    """Temporarily suppress INFO-level SQL from warehouse hooks/drivers."""
+    saved: list[tuple[logging.Logger, int]] = []
+    for name in _SQL_HOOK_LOGGERS:
+        log = logging.getLogger(name)
+        saved.append((log, log.level))
+        log.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for log, level in saved:
+            log.setLevel(level)
 
 
 def log_block(title: str, lines: list[str]) -> None:
@@ -80,24 +108,62 @@ def log_prepare_dbt_args_summary(
     run_plan = run_plan or {}
     watermarks = watermarks or {}
     if run_plan:
-        lines.extend(["", "CHUNKED RUN PLANS"])
-        for name in sorted(run_plan):
-            plan = run_plan[name]
-            disposition = plan.get("disposition", "?")
-            chunks = plan.get("chunks") or []
-            wm_str = _fmt(watermarks.get(name))
-            if disposition == "single":
-                action = "single → run_incremental"
-            else:
-                action = (
-                    f"{len(chunks)} chunk(s) → run_chunk: "
-                    f"{_compact_chunk_ids(chunks)}"
-                )
-            lines.append(f"  {name}")
-            lines.append(f"    watermark:   {wm_str}")
-            lines.append(f"    disposition: {action}")
+        lines.extend(_format_run_plan_lines(run_plan, watermarks))
+        if len(run_plan) > _MAX_PLAN_MODELS_IN_LOG:
+            logger.debug("Full run plan detail:\n%s", _full_run_plan_text(run_plan, watermarks))
 
     log_block("prepare_dbt_args", lines)
+
+
+def _plan_action(plan: dict) -> str:
+    disposition = plan.get("disposition", "?")
+    chunks = plan.get("chunks") or []
+    if disposition == "single":
+        return "single → run_incremental"
+    return f"{len(chunks)} chunk(s) → run_chunk: {_compact_chunk_ids(chunks)}"
+
+
+def _format_run_plan_lines(
+    run_plan: dict[str, dict],
+    watermarks: dict[str, Any],
+) -> list[str]:
+    names = sorted(run_plan)
+    chunked = sum(
+        1 for name in names if run_plan[name].get("disposition") == "chunked"
+    )
+    single = len(names) - chunked
+    total_chunks = sum(len(run_plan[name].get("chunks") or []) for name in names)
+    lines = [
+        "",
+        "CHUNKED RUN PLANS",
+        (
+            f"  totals:      {len(names)} model(s), "
+            f"{chunked} chunked / {single} single, {total_chunks} chunk(s)"
+        ),
+    ]
+    show = names if len(names) <= _MAX_PLAN_MODELS_IN_LOG else names[:3]
+    hidden = len(names) - len(show)
+    for name in show:
+        plan = run_plan[name]
+        lines.append(f"  {name}")
+        lines.append(f"    watermark:   {_fmt(watermarks.get(name))}")
+        lines.append(f"    disposition: {_plan_action(plan)}")
+    if hidden:
+        lines.append(
+            f"  … and {hidden} more model(s) (enable DEBUG on sundial_airflow for full list)"
+        )
+    return lines
+
+
+def _full_run_plan_text(
+    run_plan: dict[str, dict],
+    watermarks: dict[str, Any],
+) -> str:
+    parts: list[str] = []
+    for name in sorted(run_plan):
+        plan = run_plan[name]
+        parts.append(f"{name}: watermark={_fmt(watermarks.get(name))}, {_plan_action(plan)}")
+    return "\n".join(parts)
 
 
 def log_chunk_units(

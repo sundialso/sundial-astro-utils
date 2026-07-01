@@ -155,7 +155,7 @@ def make_dbt_dag(
         on_failure_callback=dag_failure_alert,
     )
     def _build():
-        @task(task_id=PREPARE_TASK_ID)
+        @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             params = context["params"]
             dbt_vars: dict[str, Any] = {}

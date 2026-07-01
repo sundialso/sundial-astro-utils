@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from sundial_airflow.chunking.manifest_parser import BackfillModel
+from sundial_airflow.task_log import quiet_sql_hook_loggers
 from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,8 @@ def fetch_partition_watermarks(
 
     if not queries:
         return watermarks
+
+    logger.info("Fetching watermarks for %d model(s) via %s", len(queries), warehouse)
 
     if len(queries) == 1:
         fetched = _fetch_one(
@@ -309,7 +312,8 @@ def _run_snowflake_query(
 
     hook = SnowflakeHook(snowflake_conn_id=conn_id)
     try:
-        rows = hook.get_records(sql)
+        with quiet_sql_hook_loggers():
+            rows = hook.get_records(sql)
     except Exception as exc:
         if allow_missing_table and _is_missing_table_error(exc):
             logger.info("Partition watermark table not found; first run: %s", exc)
@@ -332,7 +336,8 @@ def _run_bigquery_query(
 
     hook = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
     try:
-        rows = list(hook.get_client().query(sql).result())
+        with quiet_sql_hook_loggers():
+            rows = list(hook.get_client().query(sql).result())
     except Exception as exc:
         if allow_missing_table and _is_missing_table_error(exc):
             logger.info("Partition watermark table not found; first run: %s", exc)
