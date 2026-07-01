@@ -111,7 +111,7 @@ def _validate_backfill_params(
         )
 
 
-def _validate_backfill_params(
+def _collect_run_tasks(group: Any) -> dict[str, Any]:
     """Walk a Cosmos ``DbtTaskGroup`` and return ``{model_name: run_task}``.
 
     Handles both rendering layouts Cosmos can produce:
