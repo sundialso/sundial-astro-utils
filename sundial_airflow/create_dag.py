@@ -41,7 +41,7 @@ from sundial_airflow.chunking.manifest_parser import (
 )
 from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.graph import build_chunked_model_graph
-from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.run_plan import _as_datetime, build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
@@ -89,7 +89,7 @@ def _validate_backfill_params(
                 "backfill_mode=partial requires both start_ts and end_ts "
                 f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
             )
-        if str(start_ts) >= str(end_ts):
+        if _as_datetime(start_ts) >= _as_datetime(end_ts):
             raise ValueError(
                 "backfill_mode=partial requires start_ts < end_ts "
                 f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."

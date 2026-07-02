@@ -71,7 +71,15 @@ class ExtractLagTests(unittest.TestCase):
 
     def test_non_literal_lag_defaults_zero(self) -> None:
         sql = "{{ end_ts(var('lag')) }}"
-        self.assertEqual(_extract_lag(sql, "m"), 0)
+        with self.assertLogs(manifest_parser.logger, level="WARNING") as captured:
+            self.assertEqual(_extract_lag(sql, "m"), 0)
+        self.assertTrue(any("non-literal lag" in msg for msg in captured.output))
+
+    def test_mixed_literal_and_non_literal_defaults_zero(self) -> None:
+        sql = "{{ end_ts(2) }} and {{ end_ts(var('lag')) }}"
+        with self.assertLogs(manifest_parser.logger, level="WARNING") as captured:
+            self.assertEqual(_extract_lag(sql, "mixed_model"), 0)
+        self.assertTrue(any("non-literal lag" in msg for msg in captured.output))
 
     def test_absent_defaults_zero(self) -> None:
         self.assertEqual(_extract_lag("select 1", "m"), 0)

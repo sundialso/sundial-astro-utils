@@ -72,6 +72,30 @@ class TaskLogTests(unittest.TestCase):
         self.assertIn("orders", text)
         self.assertIn("run_chunk", text)
 
+    def test_log_prepare_summary_includes_partial_backfill_window(self):
+        with self.assertLogs(task_log.logger, level="INFO") as captured:
+            task_log.log_prepare_dbt_args_summary(
+                run_id="manual__2026",
+                params={},
+                param_field="target_schema",
+                target_value="OPENDOOR_BACKFILL",
+                warehouse="snowflake",
+                backfill_mode="partial",
+                run_context="partial_backfill",
+                full_refresh=False,
+                dbt_vars={
+                    "execution_ts": "2026-06-30",
+                    "backfill_start_ts": "2025-09-01",
+                    "backfill_end_ts": "2025-10-01",
+                },
+                selected_models=None,
+                start_var="backfill_start_ts",
+                end_var="backfill_end_ts",
+            )
+        text = "\n".join(captured.output)
+        self.assertIn("backfill_start_ts: 2025-09-01", text)
+        self.assertIn("backfill_end_ts:   2025-10-01", text)
+
     def test_quiet_sql_hook_loggers_suppresses_hook_info(self):
         captured: list[str] = []
         handler = logging.Handler()

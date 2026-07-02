@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
 from dateutil.relativedelta import relativedelta
@@ -14,6 +14,8 @@ from sundial_airflow.chunking.manifest_parser import (
 )
 
 RunDisposition = Literal["single", "chunked"]
+
+_UTC = timezone.utc
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,7 @@ def build_run_plan(
 
 def compute_window_end(execution_ts: date, lag: int = 0) -> datetime:
     """Mirror the ``end_ts()`` macro: ``execution_ts - lag days - 1s`` (inclusive)."""
-    base = datetime(execution_ts.year, execution_ts.month, execution_ts.day)
+    base = datetime(execution_ts.year, execution_ts.month, execution_ts.day, tzinfo=_UTC)
     return base - timedelta(days=max(lag, 0)) - timedelta(seconds=1)
 
 
@@ -246,16 +248,22 @@ def _as_date(value: datetime | date | str) -> date:
 
 
 def _as_datetime(value: datetime | date | str) -> datetime:
-    """Coerce a date/datetime/ISO string to a datetime (date → start of day)."""
+    """Coerce a date/datetime/ISO string to a UTC-aware datetime."""
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, date):
-        return datetime(value.year, value.month, value.day)
-    text = str(value).strip().replace("Z", "").replace(" ", "T")
-    try:
-        return datetime.fromisoformat(text[:19])
-    except ValueError:
-        return datetime.fromisoformat(text[:10])
+        dt = value
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day)
+    else:
+        text = str(value).strip().replace(" ", "T")
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            dt = datetime.fromisoformat(text[:10])
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=_UTC)
+    return dt.astimezone(_UTC)
 
 
 def _month_span(start: date, end: date) -> int:

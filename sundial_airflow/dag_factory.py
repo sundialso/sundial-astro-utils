@@ -300,6 +300,8 @@ def make_dbt_dag(
                 full_refresh=payload["full_refresh"],
                 dbt_vars=dbt_vars,
                 selected_models=selected_models,
+                start_var="backfill_start_ts",
+                end_var="backfill_end_ts",
             )
             return payload
 

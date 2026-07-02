@@ -38,7 +38,7 @@ _START_TS_LOOKBACK_RE = re.compile(
 )
 # end_ts(lag): the lag days literal, plus a bare-call probe for non-literal lags.
 _END_TS_LAG_RE = re.compile(r"end_ts\s*\(\s*(\d+)\s*\)")
-_END_TS_CALL_RE = re.compile(r"end_ts\s*\(")
+_END_TS_NON_LITERAL_RE = re.compile(r"end_ts\s*\(\s*(?!\d+\s*\))")
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
@@ -258,15 +258,14 @@ def _extract_lag(raw_sql: str, model_name: str) -> int:
     sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
     sql = _LINE_COMMENT_RE.sub("", sql)
     values = [int(v) for v in _END_TS_LAG_RE.findall(sql)]
-    if values:
-        return max(values)
-    if _END_TS_CALL_RE.search(sql):
+    if _END_TS_NON_LITERAL_RE.search(sql):
         logger.warning(
             "Model %r calls end_ts() with a non-literal lag — defaulting lag=0 "
             "for chunk windows (may diverge from the rendered end_ts).",
             model_name,
         )
-    return 0
+        return 0
+    return max(values) if values else 0
 
 
 def _parse_config_entry(item: object, idx: int) -> Optional[ChunkingConfigEntry]:
