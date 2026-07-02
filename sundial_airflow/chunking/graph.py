@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 from functools import partial
@@ -18,10 +17,10 @@ from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
     skip_chunked_model_test,
+    skip_chunked_prepare_empty_table,
     skip_chunked_run,
 )
-
-logger = logging.getLogger(__name__)
+from sundial_airflow.task_log import log_chunk_task, log_chunk_units, log_dbt_run_result
 
 
 def build_chunked_model_graph(
@@ -48,6 +47,7 @@ def build_chunked_model_graph(
         model_name: str,
         *,
         full_refresh: bool = False,
+        empty: bool = False,
     ) -> None:
         target_value = extra_vars.get("target_dataset") or extra_vars.get("target_schema")
         run_profile = profile_config_factory("dev", target_value)
@@ -71,13 +71,21 @@ def build_chunked_model_graph(
             ]
             if full_refresh:
                 cmd.append("--full-refresh")
+            if empty:
+                cmd.append("--empty")
             env = {**os.environ, **profile_env}
             result = subprocess.run(
                 cmd, capture_output=True, text=True, env=env, check=False,
             )
-        logger.info("dbt run [%s] stdout:\n%s", model_name, result.stdout)
-        if result.stderr:
-            logger.warning("dbt run [%s] stderr:\n%s", model_name, result.stderr)
+        log_dbt_run_result(
+            model_name,
+            returncode=result.returncode,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            chunk_id=extra_vars.get("chunk_key")
+            if extra_vars.get("chunk_key") not in (None, "full", "prepare_empty")
+            else None,
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"dbt run failed for {model_name} (exit={result.returncode})"
@@ -89,21 +97,30 @@ def build_chunked_model_graph(
             """Read mapped chunk kwargs from prepare_dbt_args."""
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             units = (prep.get("chunk_units") or {}).get(model_name, [])
-            if units:
-                logger.info(
-                    "chunk_units %r: %d chunk(s): %s",
-                    model_name,
-                    len(units),
-                    ", ".join(u["chunk_id"] for u in units),
-                )
-            else:
-                plan = (prep.get("run_plan") or {}).get(model_name) or {}
-                logger.info(
-                    "chunk_units %r: 0 mapped tasks (disposition=%s)",
-                    model_name,
-                    plan.get("disposition", "missing"),
-                )
+            plan = (prep.get("run_plan") or {}).get(model_name) or {}
+            log_chunk_units(
+                model_name,
+                units,
+                disposition=plan.get("disposition"),
+            )
             return units
+
+        @task(task_id="prepare_empty_table", trigger_rule="none_failed")
+        def prepare_empty_table(**context: Any) -> None:
+            """Purge and rebuild an empty target before full_refresh chunk fan-out."""
+            skip_chunked_prepare_empty_table(context, model_name=model_name)
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            base_vars = dict(prep.get("vars") or {})
+            full_refresh = bool(prep.get("full_refresh"))
+            base_vars["chunk_key"] = "prepare_empty"
+            base_vars["run_group_id"] = context["dag_run"].run_id
+            base_vars["record_incremental_window"] = False
+            log_chunk_task(
+                model_name,
+                "prepare_empty_table",
+                full_refresh=full_refresh,
+            )
+            _invoke(base_vars, model_name, full_refresh=full_refresh, empty=True)
 
         @task(
             task_id="run_chunk",
@@ -117,28 +134,26 @@ def build_chunked_model_graph(
             **context: Any,
         ) -> None:
             """Run one chunk window."""
-            logger.info(
-                "Starting run_chunk model=%s chunk=%s window=%s..%s",
+            log_chunk_task(
                 model_name,
-                chunk_id,
-                chunk_start,
-                chunk_end,
+                "run_chunk",
+                chunk_id=chunk_id,
+                window=f"{chunk_start} → {chunk_end}",
             )
             skip_chunked_run(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
-            ti = context["ti"]
             base_vars[start_var] = chunk_start
             base_vars[end_var] = chunk_end
             base_vars["backfill_chunk_id"] = chunk_id
             base_vars["chunk_key"] = chunk_id
-            base_vars["run_group_id"] = f"{context['dag_run'].run_id}:{ti.task_id}"
+            base_vars["run_group_id"] = context["dag_run"].run_id
             _invoke(base_vars, model_name)
 
         @task(task_id="run_incremental", trigger_rule="none_failed")
         def run_incremental(**context: Any) -> None:
             """Run one incremental pass."""
-            logger.info("Starting run_incremental for model=%s", model_name)
+            log_chunk_task(model_name, "run_incremental")
             skip_chunked_incremental(context, model_name=model_name)
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
             base_vars = dict(prep.get("vars") or {})
@@ -151,8 +166,10 @@ def build_chunked_model_graph(
             )
 
         units = chunk_units()
+        prepare_empty = prepare_empty_table()
         mapped = run_chunk.expand_kwargs(units)
         incremental = run_incremental()
+        units >> prepare_empty >> mapped
         units >> incremental
         return units, mapped, incremental
 

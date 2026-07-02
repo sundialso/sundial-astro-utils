@@ -41,6 +41,8 @@ watermarks = _load_module(
 _extract_partition_column = manifest_parser._extract_partition_column
 partition_watermark_sql = watermarks.partition_watermark_sql
 partition_watermarks_batch_sql = watermarks.partition_watermarks_batch_sql
+read_watermark_sql = watermarks.read_watermark_sql
+completion_watermarks_batch_sql = watermarks.completion_watermarks_batch_sql
 _WatermarkQuery = watermarks._WatermarkQuery
 _parse_watermark = watermarks._parse_watermark
 
@@ -105,6 +107,34 @@ class PartitionWatermarksBatchSqlTests(unittest.TestCase):
     def test_rejects_empty_batch(self):
         with self.assertRaises(ValueError):
             partition_watermarks_batch_sql([])
+
+
+class ReadWatermarkSqlTests(unittest.TestCase):
+    def test_reads_max_completed_end_ts(self):
+        sql = read_watermark_sql("DB.SCHEMA.dbt_completions_raw", "orders")
+        self.assertIn("MAX(w.end_ts)", sql)
+        self.assertIn("w.model_name = 'orders'", sql)
+        self.assertIn("w.status = 'started'", sql)
+        self.assertIn("w.end_ts IS NOT NULL", sql)
+        # All-or-nothing completeness check (a started chunk lacking a succeeded
+        # sibling excludes the whole run_group).
+        self.assertIn("NOT EXISTS", sql)
+        self.assertIn("s.status = 'succeeded'", sql)
+
+    def test_escapes_model_name(self):
+        sql = read_watermark_sql("DB.SCHEMA.dbt_completions_raw", "o'rders")
+        self.assertIn("w.model_name = 'o''rders'", sql)
+
+
+class CompletionWatermarksBatchSqlTests(unittest.TestCase):
+    def test_builds_union_all_with_read_watermark_per_model(self):
+        sql = completion_watermarks_batch_sql(
+            "DB.SCHEMA.dbt_completions_raw", ["orders", "line_items"]
+        )
+        self.assertIn("SELECT 'orders' AS model_name", sql)
+        self.assertIn("SELECT 'line_items' AS model_name", sql)
+        self.assertEqual(sql.count("MAX(w.end_ts)"), 2)
+        self.assertIn("UNION ALL", sql)
 
 
 class ParseWatermarkTests(unittest.TestCase):

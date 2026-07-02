@@ -9,12 +9,15 @@ from datetime import datetime
 from typing import Any
 
 from sundial_airflow.chunking.manifest_parser import BackfillModel
+from sundial_airflow.task_log import quiet_sql_hook_loggers
 from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_BATCH_FALLBACK_WORKERS = 32
+# The table the dbt completions hooks MERGE into (what read_watermark reads).
+_COMPLETIONS_TABLE = "dbt_completions_raw"
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,39 @@ def partition_watermarks_batch_sql(queries: list[_WatermarkQuery]) -> str:
             f"SELECT {name} AS model_name, MAX({col}) AS watermark "
             f"FROM {query.table_fqn}"
         )
+    return "\nUNION ALL\n".join(parts)
+
+
+def read_watermark_sql(completions_fqn: str, model_name: str) -> str:
+    """Replicate the dbt ``read_watermark`` macro: ``MAX(end_ts)`` over the
+    model's COMPLETE run_groups (every 'started' chunk has a 'succeeded'
+    sibling). This is the same lower-bound source the incremental ``start_ts()``
+    macro uses at run time.
+    """
+    name = _sql_string_literal(model_name)
+    return (
+        f"SELECT MAX(w.end_ts) FROM {completions_fqn} w "
+        f"WHERE w.model_name = {name} AND w.status = 'started' "
+        f"AND w.end_ts IS NOT NULL "
+        f"AND NOT EXISTS ("
+        f"SELECT 1 FROM {completions_fqn} u "
+        f"WHERE u.model_name = w.model_name AND u.run_group_id = w.run_group_id "
+        f"AND u.status = 'started' AND NOT EXISTS ("
+        f"SELECT 1 FROM {completions_fqn} s "
+        f"WHERE s.model_name = u.model_name AND s.run_group_id = u.run_group_id "
+        f"AND s.chunk_key = u.chunk_key AND s.status = 'succeeded'))"
+    )
+
+
+def completion_watermarks_batch_sql(
+    completions_fqn: str, model_names: list[str]
+) -> str:
+    """One UNION ALL query returning each model's ``read_watermark`` value."""
+    parts = [
+        f"SELECT {_sql_string_literal(name)} AS model_name, "
+        f"({read_watermark_sql(completions_fqn, name)}) AS watermark"
+        for name in model_names
+    ]
     return "\nUNION ALL\n".join(parts)
 
 
@@ -104,33 +140,70 @@ def fetch_partition_watermarks(
     if not queries:
         return watermarks
 
-    if len(queries) == 1:
-        fetched = _fetch_one(
-            warehouse=warehouse,
-            conn_id=conn_id,
-            table_fqn=queries[0].table_fqn,
-            partition_column=queries[0].partition_column,
-        )
-        watermarks[queries[0].model_name] = fetched
-    else:
-        try:
-            watermarks.update(_fetch_batch(warehouse, conn_id, queries))
-        except Exception as exc:
-            if _is_missing_table_error(exc):
-                logger.info(
-                    "Batch watermark query failed (%s); falling back to parallel "
-                    "per-model queries.",
+    logger.info("Fetching watermarks for %d model(s) via %s", len(queries), warehouse)
+
+    partition_only: dict[str, datetime | None]
+    completions: dict[str, datetime | None] = {}
+    completions_fqn = adapter.build_table_fqn(dbt_vars, _COMPLETIONS_TABLE)
+
+    with quiet_sql_hook_loggers():
+        if len(queries) == 1:
+            fetched = _fetch_one(
+                warehouse=warehouse,
+                conn_id=conn_id,
+                table_fqn=queries[0].table_fqn,
+                partition_column=queries[0].partition_column,
+            )
+            watermarks[queries[0].model_name] = fetched
+        else:
+            try:
+                watermarks.update(_fetch_batch(warehouse, conn_id, queries))
+            except Exception as exc:
+                if _is_missing_table_error(exc):
+                    logger.warning(
+                        "Batch watermark query failed (%s); falling back to parallel "
+                        "per-model queries.",
+                        exc,
+                    )
+                    watermarks.update(_fetch_parallel(warehouse, conn_id, queries))
+                else:
+                    raise
+
+        partition_only = dict(watermarks)
+        if completions_fqn:
+            try:
+                completions = _fetch_completion_watermarks(
+                    warehouse=warehouse,
+                    conn_id=conn_id,
+                    completions_fqn=completions_fqn,
+                    model_names=[query.model_name for query in queries],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Completion watermark query failed (%s); using partition MAX only.",
                     exc,
                 )
-                watermarks.update(_fetch_parallel(warehouse, conn_id, queries))
-            else:
-                raise
+            for name, completed in completions.items():
+                if completed is not None:
+                    watermarks[name] = completed
+
+    if not completions_fqn:
+        logger.info(
+            "Cannot resolve %s FQN; planning on partition MAX only.",
+            _COMPLETIONS_TABLE,
+        )
+
+    logger.info("Fetched watermarks for %d model(s) via %s", len(queries), warehouse)
 
     for query in queries:
-        logger.info(
-            "Partition watermark for %r: %s (table=%s, column=%s)",
-            query.model_name,
-            watermarks.get(query.model_name),
+        name = query.model_name
+        logger.debug(
+            "Planning watermark for %r: %s (read_watermark=%s, partition_max=%s, "
+            "table=%s, column=%s)",
+            name,
+            watermarks.get(name),
+            completions.get(name),
+            partition_only.get(name),
             query.table_fqn,
             query.partition_column,
         )
@@ -180,6 +253,29 @@ def _fetch_parallel(
             model_name, value = future.result()
             out[model_name] = value
     return out
+
+
+def _fetch_completion_watermarks(
+    *,
+    warehouse: str,
+    conn_id: str,
+    completions_fqn: str,
+    model_names: list[str],
+) -> dict[str, datetime | None]:
+    """Read each model's ``read_watermark`` value in one query. Returns ``{}``
+    when the completions table doesn't exist yet, so callers keep the partition
+    MAX (mirrors the macro's ``COALESCE(read_watermark, MAX(col))``).
+    """
+    if not model_names:
+        return {}
+    sql = completion_watermarks_batch_sql(completions_fqn, model_names)
+    if warehouse == "snowflake":
+        rows = _run_snowflake_query(conn_id, sql, allow_missing_table=True)
+    elif warehouse == "bigquery":
+        rows = _run_bigquery_query(conn_id, sql, allow_missing_table=True)
+    else:
+        return {}
+    return {str(row[0]): _parse_watermark(row[1]) for row in rows}
 
 
 def _fetch_one(

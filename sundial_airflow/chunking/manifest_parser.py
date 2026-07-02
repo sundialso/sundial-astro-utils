@@ -28,6 +28,17 @@ _START_TS_RE = re.compile(
     """,
     re.VERBOSE | re.DOTALL,
 )
+# Second arg of start_ts(col, lookback, first): the lookback days literal.
+_START_TS_LOOKBACK_RE = re.compile(
+    r"""start_ts\s*\(
+        \s*[^,]+,
+        \s*(\d+)\s*,
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+# end_ts(lag): the lag days literal, plus a bare-call probe for non-literal lags.
+_END_TS_LAG_RE = re.compile(r"end_ts\s*\(\s*(\d+)\s*\)")
+_END_TS_NON_LITERAL_RE = re.compile(r"end_ts\s*\(\s*(?!\d+\s*\))")
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
@@ -44,6 +55,8 @@ class BackfillModel:
     chunk_months: Optional[int] = None
     partition_column: Optional[str] = None
     table_name: Optional[str] = None
+    lag: int = 0
+    lookback: int = 0
 
 
 @dataclass(frozen=True)
@@ -90,7 +103,7 @@ def load_chunking_config(
             )
         out[entry.model_name] = entry
 
-    logger.info("Loaded %d chunking-config entries from %s.", len(out), path)
+    logger.debug("Loaded %d chunking-config entries from %s.", len(out), path)
     return out
 
 
@@ -117,12 +130,14 @@ def load_backfill_models(
             ],
             partition_column=_extract_partition_column(raw_sql),
             table_name=node.get("alias") or node["name"],
+            lag=_extract_lag(raw_sql, node["name"]),
+            lookback=_extract_lookback(raw_sql),
         )
 
     promoted = _apply_chunking_config(models, chunking_config or {})
 
     chunked = sum(1 for m in models.values() if m.kind == CHUNKED)
-    logger.info(
+    logger.debug(
         "Discovered %d eligible model(s) from %s "
         "(%d chunked + %d full-refresh; %d promoted via config).",
         len(models), manifest_path, chunked, len(models) - chunked,
@@ -226,6 +241,33 @@ def _extract_first_timestamp(raw_sql: str) -> Optional[date]:
     return min(parsed) if parsed else None
 
 
+def _extract_lookback(raw_sql: str) -> int:
+    """Return the largest start_ts() lookback (days) literal, or 0."""
+    sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
+    sql = _LINE_COMMENT_RE.sub("", sql)
+    values = [int(v) for v in _START_TS_LOOKBACK_RE.findall(sql)]
+    return max(values) if values else 0
+
+
+def _extract_lag(raw_sql: str, model_name: str) -> int:
+    """Return the largest end_ts() lag (days) literal, or 0.
+
+    Warns when end_ts() is called with a non-literal lag, since the orchestrator
+    then falls back to 0 and the chunk upper bound may diverge from the macro.
+    """
+    sql = _BLOCK_COMMENT_RE.sub("", raw_sql)
+    sql = _LINE_COMMENT_RE.sub("", sql)
+    values = [int(v) for v in _END_TS_LAG_RE.findall(sql)]
+    if _END_TS_NON_LITERAL_RE.search(sql):
+        logger.warning(
+            "Model %r calls end_ts() with a non-literal lag — defaulting lag=0 "
+            "for chunk windows (may diverge from the rendered end_ts).",
+            model_name,
+        )
+        return 0
+    return max(values) if values else 0
+
+
 def _parse_config_entry(item: object, idx: int) -> Optional[ChunkingConfigEntry]:
     """Parse one chunking config entry."""
     if not isinstance(item, dict):
@@ -281,7 +323,7 @@ def _apply_chunking_config(
             )
             continue
         if not entry.chunking_enabled:
-            logger.info(
+            logger.debug(
                 "Chunking config explicitly disables %r — staying full_refresh.",
                 target.name,
             )
@@ -303,9 +345,11 @@ def _apply_chunking_config(
         target.kind = CHUNKED
         target.chunk_months = entry.chunk_size
         promoted += 1
-        logger.info(
-            "Chunking config: %r → chunked, %d-month window (anchor=%s).",
+        logger.debug(
+            "Chunking config: %r → chunked, %d-month window "
+            "(anchor=%s, lag=%d, lookback=%d from SQL).",
             target.name, entry.chunk_size, target.first_timestamp,
+            target.lag, target.lookback,
         )
     return promoted
 

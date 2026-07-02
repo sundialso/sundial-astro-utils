@@ -41,7 +41,7 @@ from sundial_airflow.chunking.manifest_parser import (
 )
 from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.graph import build_chunked_model_graph
-from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.run_plan import _as_datetime, build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
@@ -55,6 +55,7 @@ from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
 )
+from sundial_airflow.task_log import log_prepare_dbt_args_summary
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,41 @@ def _vars_field_name(warehouse: Warehouse) -> str:
 
 def _param_field_name(warehouse: Warehouse) -> str:
     return "dataset" if warehouse == "bigquery" else "schema"
+
+
+def _validate_backfill_params(
+    *, backfill_mode: str, start_ts: Any, end_ts: Any, execution_ts: Any,
+) -> None:
+    """Validate the run-window params against the selected ``backfill_mode``."""
+    has_start = bool(start_ts)
+    has_end = bool(end_ts)
+
+    if backfill_mode == "partial":
+        if not (has_start and has_end):
+            raise ValueError(
+                "backfill_mode=partial requires both start_ts and end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if _as_datetime(start_ts) >= _as_datetime(end_ts):
+            raise ValueError(
+                "backfill_mode=partial requires start_ts < end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if execution_ts:
+            raise ValueError(
+                "backfill_mode=partial does not accept execution_ts "
+                f"(got execution_ts={execution_ts!r}); the window is defined "
+                "by start_ts and end_ts."
+            )
+        return
+
+    if has_start or has_end:
+        raise ValueError(
+            f"backfill_mode={backfill_mode!r} does not accept start_ts/end_ts "
+            f"(got start_ts={start_ts!r}, end_ts={end_ts!r}). "
+            "Use backfill_mode=partial for an explicit window, otherwise leave "
+            "start_ts/end_ts blank and rely on execution_ts."
+        )
 
 
 def _collect_run_tasks(group: Any) -> dict[str, Any]:
@@ -245,7 +281,7 @@ def create_dag(
         on_failure_callback=dag_failure_alert,
     )
     def _build():
-        @task(task_id=PREPARE_TASK_ID)
+        @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             start_var, end_var = chunk_var_keys
             params = context["params"]
@@ -275,15 +311,18 @@ def create_dag(
                 dbt_vars["run_group_id"] = run_id
 
             backfill_mode = params.get("backfill_mode", "none")
+            start_ts = params.get("start_ts")
+            end_ts = params.get("end_ts")
+
+            _validate_backfill_params(
+                backfill_mode=backfill_mode,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                execution_ts=params.get("execution_ts"),
+            )
             if backfill_mode == "partial":
-                start = params.get("start_ts")
-                end = params.get("end_ts")
-                if not start or not end:
-                    raise ValueError(
-                        "backfill_mode=partial requires both start_ts and end_ts"
-                    )
-                dbt_vars[start_var] = start
-                dbt_vars[end_var] = end
+                dbt_vars[start_var] = start_ts
+                dbt_vars[end_var] = end_ts
 
             run_context = "normal"
             if backfill_mode == "full":
@@ -306,11 +345,6 @@ def create_dag(
             exclude_param = (params.get("exclude") or "").strip()
 
             if select_param or exclude_param:
-                logger.info(
-                    "Resolving model selection (select=%r, exclude=%r) via dbt ls",
-                    select_param,
-                    exclude_param,
-                )
                 ls_profile_config = profile_config_factory("dev", target_value)
                 with ls_profile_config.ensure_profile() as (
                     profile_path,
@@ -379,13 +413,9 @@ def create_dag(
                     for line in result.stdout.strip().splitlines()
                     if line.strip()
                 }
-                logger.info(
-                    "Selection resolved to %d model(s): %s",
-                    len(selected_models),
-                    sorted(selected_models),
-                )
 
             run_plan: dict = {}
+            watermarks: dict[str, Any] = {}
             if _chunked_names:
                 exec_raw = dbt_vars.get("execution_ts") or _dt.date.today().isoformat()
                 execution_date = _dt.date.fromisoformat(str(exec_raw)[:10])
@@ -417,19 +447,10 @@ def create_dag(
                     else None,
                 )
                 run_plan = serialize_run_plan(plans)
-                for name, wm in watermarks.items():
-                    plan = run_plan.get(name, {})
-                    logger.info(
-                        "Run plan summary: %s watermark=%s disposition=%s chunks=%d",
-                        name,
-                        wm,
-                        plan.get("disposition"),
-                        len(plan.get("chunks") or []),
-                    )
 
             chunk_units = build_chunk_units(run_plan) if run_plan else {}
 
-            return {
+            payload = {
                 param_field: target_value,
                 "vars": dbt_vars,
                 # Selects the warehouse adapter in the dbt_completions listener.
@@ -441,6 +462,23 @@ def create_dag(
                 "run_plan": run_plan,
                 "chunk_units": chunk_units,
             }
+            log_prepare_dbt_args_summary(
+                run_id=run_id,
+                params=params,
+                param_field=param_field,
+                target_value=target_value,
+                warehouse=warehouse,
+                backfill_mode=backfill_mode,
+                run_context=run_context,
+                full_refresh=payload["full_refresh"],
+                dbt_vars=dbt_vars,
+                selected_models=selected_models,
+                run_plan=run_plan,
+                watermarks=watermarks,
+                start_var=start_var,
+                end_var=end_var,
+            )
+            return payload
 
         dbt_args = prepare_dbt_args()
 

@@ -30,6 +30,7 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.params import build_standard_params
 from sundial_airflow.slack_alerts import dag_failure_alert
+from sundial_airflow.task_log import log_prepare_dbt_args_summary
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
@@ -154,7 +155,7 @@ def make_dbt_dag(
         on_failure_callback=dag_failure_alert,
     )
     def _build():
-        @task(task_id=PREPARE_TASK_ID)
+        @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             params = context["params"]
             dbt_vars: dict[str, Any] = {}
@@ -210,11 +211,6 @@ def make_dbt_dag(
             exclude_param = (params.get("exclude") or "").strip()
 
             if select_param or exclude_param:
-                logger.info(
-                    "Resolving model selection (select=%r, exclude=%r) via dbt ls",
-                    select_param,
-                    exclude_param,
-                )
                 ls_profile_config = profile_config_factory("dev", target_value)
                 with ls_profile_config.ensure_profile() as (
                     profile_path,
@@ -283,13 +279,8 @@ def make_dbt_dag(
                     for line in result.stdout.strip().splitlines()
                     if line.strip()
                 }
-                logger.info(
-                    "Selection resolved to %d model(s): %s",
-                    len(selected_models),
-                    sorted(selected_models),
-                )
 
-            return {
+            payload = {
                 param_field: target_value,
                 "vars": dbt_vars,
                 "warehouse": warehouse,
@@ -298,6 +289,21 @@ def make_dbt_dag(
                 "run_context": run_context,
                 "run_context_tag": run_context_tag,
             }
+            log_prepare_dbt_args_summary(
+                run_id=run_id,
+                params=params,
+                param_field=param_field,
+                target_value=target_value,
+                warehouse=warehouse,
+                backfill_mode=backfill_mode,
+                run_context=run_context,
+                full_refresh=payload["full_refresh"],
+                dbt_vars=dbt_vars,
+                selected_models=selected_models,
+                start_var="backfill_start_ts",
+                end_var="backfill_end_ts",
+            )
+            return payload
 
         dbt_args = prepare_dbt_args()
 
