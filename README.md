@@ -15,6 +15,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
 | `sundial_airflow.slack_alerts.dag_failure_alert` | `on_failure_callback` that posts to Slack via the `sundial_slack_webhook` connection. |
+| `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |

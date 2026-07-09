@@ -11,6 +11,7 @@ from sundial_airflow.listeners import (
     DbtCompletionsListener,
     SundialDbtCompletionsPlugin,
 )
+from sundial_airflow.profiles import bigquery_profile_args
 from sundial_airflow.slack_alerts import dag_failure_alert
 from sundial_airflow.warehouses import WarehouseAdapter, get_adapter, register
 
@@ -23,6 +24,8 @@ __all__ = [
     "dag_failure_alert",
     "DbtCompletionsListener",
     "SundialDbtCompletionsPlugin",
+    # BigQuery dbt profile-arg builder (Dataproc-aware) shared across tenants.
+    "bigquery_profile_args",
     # Warehouse adapter API — subclass + register to add a new warehouse.
     "WarehouseAdapter",
     "register",
