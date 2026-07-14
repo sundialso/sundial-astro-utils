@@ -78,16 +78,19 @@ def build_standard_params(
             default=None,
             type=["null", "string"],
             description=(
-                "dbt model selection: 'model_a model_b', '+model' (upstream), "
-                "'model+' (downstream), '+model+' (both), 'tag:daily'. "
-                "Leave blank for all."
+                "dbt model selection: '+model' (upstream), 'model+' "
+                "(downstream), '+model+' (both), 'tag:daily'. Separate multiple "
+                "models with SPACES ('model_a model_b') for a union. Do NOT use "
+                "commas: dbt reads commas as set intersection, so "
+                "'model_a,model_b' matches nothing. Leave blank for all."
             ),
         ),
         "exclude": Param(
             default=None,
             type=["null", "string"],
             description=(
-                "Exclude models: 'model_a model_b', 'tag:wip'. "
+                "Exclude models, SPACE-separated ('model_a model_b', 'tag:wip'). "
+                "Do NOT use commas (dbt reads them as intersection). "
                 "Leave blank to exclude nothing."
             ),
         ),
