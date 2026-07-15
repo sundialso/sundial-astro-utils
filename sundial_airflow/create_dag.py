@@ -56,6 +56,7 @@ from sundial_airflow.source_discovery import (
     discover_source_to_models,
 )
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
+from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ def create_dag(
     chunking_config_path: str | Path | None = None,
     warehouse_conn_id: str | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
+    scaling_warehouse_name: str | None = None,
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -480,7 +482,88 @@ def create_dag(
             )
             return payload
 
-        dbt_args = prepare_dbt_args()
+        # Snowflake-only warehouse autoscaling for chunked backfills.
+        _scale_warehouse = warehouse == "snowflake"
+
+        def _scaling_conn_id() -> str:
+            return warehouse_conn_id or get_adapter("snowflake").resolve_conn_id()
+
+        @task(task_id="upsize_wh")
+        def upsize_wh(**context: Any) -> dict[str, Any]:
+            """Grow the warehouse one size when the run plan has chunked models."""
+            from sundial_airflow.warehouse_scaling import (
+                get_warehouse_size,
+                next_warehouse_size,
+                resolve_warehouse_name,
+                set_warehouse_size,
+            )
+
+            result: dict[str, Any] = {
+                "upsized": False,
+                "warehouse": None,
+                "original_size": None,
+                "new_size": None,
+            }
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            run_plan = prep.get("run_plan") or {}
+            if not any(
+                (plan or {}).get("disposition") == "chunked"
+                for plan in run_plan.values()
+            ):
+                logger.info("No chunked models; leaving warehouse size unchanged.")
+                return result
+
+            try:
+                conn_id = _scaling_conn_id()
+                wh_name = scaling_warehouse_name or resolve_warehouse_name(conn_id)
+                if not wh_name:
+                    logger.warning("Could not resolve Snowflake warehouse; skipping upsize.")
+                    return result
+                current = get_warehouse_size(conn_id, wh_name)
+                target = next_warehouse_size(current)
+                result.update(warehouse=wh_name, original_size=current)
+                if not target:
+                    logger.info(
+                        "Warehouse %s is %s; no larger size available.", wh_name, current
+                    )
+                    return result
+                set_warehouse_size(conn_id, wh_name, target)
+                result.update(upsized=True, new_size=target)
+                logger.info("Upsized warehouse %s: %s → %s.", wh_name, current, target)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Warehouse upsize failed; continuing at current size.",
+                    exc_info=True,
+                )
+            return result
+
+        @task(task_id="downsize_wh", trigger_rule="all_done")
+        def downsize_wh(**context: Any) -> None:
+            """Restore the original warehouse size if upsize_wh grew it."""
+            from sundial_airflow.warehouse_scaling import set_warehouse_size
+
+            info = context["ti"].xcom_pull(task_ids="upsize_wh") or {}
+            if not info.get("upsized"):
+                logger.info("Warehouse was not upsized; nothing to downsize.")
+                return
+            try:
+                set_warehouse_size(
+                    _scaling_conn_id(), info["warehouse"], info["original_size"]
+                )
+                logger.info(
+                    "Downsized warehouse %s back to %s.",
+                    info["warehouse"],
+                    info["original_size"],
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("Warehouse downsize failed.", exc_info=True)
+
+        # ``prefix_group_id=False`` keeps the prepare task id as ``prepare_dbt_args``
+        # so XCom pulls and the completions listener keep resolving it.
+        with TaskGroup("preprocess", prefix_group_id=False) as preprocess:
+            dbt_args = prepare_dbt_args()
+            if _scale_warehouse:
+                dbt_args >> upsize_wh()
 
         profile_config = profile_config_factory("dev", default_dataset_or_schema)
 
@@ -547,6 +630,13 @@ def create_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
+        # Post-processing runs after all dbt work. Add further post-process
+        # tasks inside this group as needed.
+        postprocess = None
+        if _scale_warehouse:
+            with TaskGroup("postprocess", prefix_group_id=False) as postprocess:
+                downsize_wh()
+
         # Per-source fan-out (no global gate):
         #
         #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
@@ -556,8 +646,12 @@ def create_dag(
         # that consume that source; sibling branches are unaffected. Models
         # with no source dependency (or whose sources have no tests) just run
         # after ``prepare_dbt_args``.
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        preprocess >> source_test_group
+        preprocess >> dbt_models
+
+        # Run post-processing after all dbt work finishes (success or failure).
+        if postprocess is not None:
+            dbt_models >> postprocess
 
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
@@ -574,7 +668,7 @@ def create_dag(
                 profile_config=profile_config,
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
-                upstream_task=dbt_args,
+                upstream_task=preprocess,
                 parent_group=dbt_models,
             )
             models_by_key = {m.node_key: m for m in _chunk_order}
