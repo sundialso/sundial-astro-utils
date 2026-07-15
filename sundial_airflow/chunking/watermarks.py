@@ -310,6 +310,8 @@ def _run_snowflake_query(
         return []
 
     hook = SnowflakeHook(snowflake_conn_id=conn_id)
+    # Suppress the hook's "Running statement: ..." SQL dump.
+    hook.log_sql = False
     try:
         rows = hook.get_records(sql)
     except Exception as exc:
@@ -333,6 +335,8 @@ def _run_bigquery_query(
         return []
 
     hook = BigQueryHook(gcp_conn_id=conn_id, use_legacy_sql=False)
+    # Suppress the hook's "Running statement: ..." SQL dump.
+    hook.log_sql = False
     try:
         rows = list(hook.get_client().query(sql).result())
     except Exception as exc:

@@ -111,7 +111,7 @@ class TaskLogTests(unittest.TestCase):
             hook_log.removeHandler(handler)
         self.assertEqual(captured, ["after quiet"])
 
-    def test_log_prepare_summary_truncates_large_run_plans(self):
+    def test_log_prepare_summary_lists_all_run_plan_models(self):
         run_plan = {
             f"model_{idx}": {
                 "disposition": "chunked",
@@ -132,11 +132,15 @@ class TaskLogTests(unittest.TestCase):
                 dbt_vars={"execution_ts": "2026-06-30"},
                 selected_models=None,
                 run_plan=run_plan,
+                watermarks={f"model_{idx}": f"2026-06-{idx:02d}" for idx in range(20)},
             )
         text = "\n".join(captured.output)
         self.assertIn("20 model(s)", text)
-        self.assertIn("and 17 more model(s)", text)
-        self.assertNotIn("model_19", text)
+        self.assertNotIn("more model(s)", text)
+        # Every model appears on its own single line, watermark + disposition.
+        for idx in range(20):
+            self.assertIn(f"model_{idx}:\twatermark: ", text)
+        self.assertIn("model_19:\twatermark: 2026-06-19\tdisposition:", text)
 
         with self.assertLogs(task_log.logger, level="INFO") as captured:
             task_log.log_dbt_run_result(

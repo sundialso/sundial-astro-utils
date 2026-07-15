@@ -8,7 +8,6 @@ from typing import Any, Iterator
 logger = logging.getLogger(__name__)
 
 _BANNER = "=" * 78
-_MAX_PLAN_MODELS_IN_LOG = 12
 
 # Hook / driver loggers that dump full SQL at INFO during watermark queries.
 _SQL_HOOK_LOGGERS = (
@@ -117,8 +116,6 @@ def log_prepare_dbt_args_summary(
     watermarks = watermarks or {}
     if run_plan:
         lines.extend(_format_run_plan_lines(run_plan, watermarks))
-        if len(run_plan) > _MAX_PLAN_MODELS_IN_LOG:
-            logger.debug("Full run plan detail:\n%s", _full_run_plan_text(run_plan, watermarks))
 
     log_block("prepare_dbt_args", lines)
 
@@ -149,29 +146,13 @@ def _format_run_plan_lines(
             f"{chunked} chunked / {single} single, {total_chunks} chunk(s)"
         ),
     ]
-    show = names if len(names) <= _MAX_PLAN_MODELS_IN_LOG else names[:3]
-    hidden = len(names) - len(show)
-    for name in show:
+    for name in names:
         plan = run_plan[name]
-        lines.append(f"  {name}")
-        lines.append(f"    watermark:   {_fmt(watermarks.get(name))}")
-        lines.append(f"    disposition: {_plan_action(plan)}")
-    if hidden:
         lines.append(
-            f"  … and {hidden} more model(s) (enable DEBUG on sundial_airflow for full list)"
+            f"  {name}:\twatermark: {_fmt(watermarks.get(name))}"
+            f"\tdisposition: {_plan_action(plan)}"
         )
     return lines
-
-
-def _full_run_plan_text(
-    run_plan: dict[str, dict],
-    watermarks: dict[str, Any],
-) -> str:
-    parts: list[str] = []
-    for name in sorted(run_plan):
-        plan = run_plan[name]
-        parts.append(f"{name}: watermark={_fmt(watermarks.get(name))}, {_plan_action(plan)}")
-    return "\n".join(parts)
 
 
 def log_chunk_units(
