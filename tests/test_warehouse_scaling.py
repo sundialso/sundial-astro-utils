@@ -25,7 +25,7 @@ def _load_module(qualified: str, path: Path):
             package.__path__ = [str(ROOT.joinpath(*pkg_name.split(".")))]
             sys.modules[pkg_name] = package
             added.append(pkg_name)
-    target_added = qualified not in sys.modules
+    prev_target = sys.modules.get(qualified)
     spec = importlib.util.spec_from_file_location(qualified, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[qualified] = module
@@ -33,7 +33,9 @@ def _load_module(qualified: str, path: Path):
     try:
         spec.loader.exec_module(module)
     finally:
-        if target_added:
+        if prev_target is not None:
+            sys.modules[qualified] = prev_target
+        else:
             sys.modules.pop(qualified, None)
         for name in reversed(added):
             sys.modules.pop(name, None)
