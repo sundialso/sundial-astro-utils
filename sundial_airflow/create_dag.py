@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
@@ -482,15 +483,16 @@ def create_dag(
             )
             return payload
 
-        # Snowflake-only warehouse autoscaling for chunked backfills.
+        # Snowflake-only warehouse autoscaling for backfill runs.
         _scale_warehouse = warehouse == "snowflake"
+        _BACKFILL_CONTEXTS = ("full_backfill", "partial_backfill")
 
         def _scaling_conn_id() -> str:
             return warehouse_conn_id or get_adapter("snowflake").resolve_conn_id()
 
         @task(task_id="upsize_wh")
         def upsize_wh(**context: Any) -> dict[str, Any]:
-            """Grow the warehouse one size when the run plan has chunked models."""
+            """Grow the warehouse one size on partial/full backfill runs."""
             from sundial_airflow.warehouse_scaling import (
                 get_warehouse_size,
                 next_warehouse_size,
@@ -505,13 +507,10 @@ def create_dag(
                 "new_size": None,
             }
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            run_plan = prep.get("run_plan") or {}
-            if not any(
-                (plan or {}).get("disposition") == "chunked"
-                for plan in run_plan.values()
-            ):
-                logger.info("No chunked models; leaving warehouse size unchanged.")
-                return result
+            if prep.get("run_context") not in _BACKFILL_CONTEXTS:
+                raise AirflowSkipException(
+                    "Not a partial/full backfill run; skipping warehouse upsize."
+                )
 
             try:
                 conn_id = _scaling_conn_id()
@@ -539,8 +538,14 @@ def create_dag(
 
         @task(task_id="downsize_wh", trigger_rule="all_done")
         def downsize_wh(**context: Any) -> None:
-            """Restore the original warehouse size if upsize_wh grew it."""
+            """Restore the original warehouse size on partial/full backfill runs."""
             from sundial_airflow.warehouse_scaling import set_warehouse_size
+
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            if prep.get("run_context") not in _BACKFILL_CONTEXTS:
+                raise AirflowSkipException(
+                    "Not a partial/full backfill run; skipping warehouse downsize."
+                )
 
             info = context["ti"].xcom_pull(task_ids="upsize_wh") or {}
             if not info.get("upsized"):
@@ -585,6 +590,9 @@ def create_dag(
                         + "')['vars'] }}"
                     ),
                     install_deps=True,
+                    # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
+                    # run) does not cascade-skip source tests.
+                    trigger_rule="none_failed",
                     pre_execute=make_source_test_skip_hook(dependents),
                 )
 
