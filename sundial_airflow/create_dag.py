@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.task_group import TaskGroup
 from cosmos import DbtTaskGroup, ProjectConfig, RenderConfig
@@ -45,6 +46,7 @@ from sundial_airflow.chunking.run_plan import _as_datetime, build_run_plan, seri
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
+    PREPARE_LOCAL_TASK_ID,
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
     skip_unselected,
@@ -56,6 +58,7 @@ from sundial_airflow.source_discovery import (
     discover_source_to_models,
 )
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
+from sundial_airflow.warehouses import get_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +174,7 @@ def create_dag(
     chunking_config_path: str | Path | None = None,
     warehouse_conn_id: str | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
+    scaling_warehouse_name: str | None = None,
 ):
     """Build and register a fully-wired Sundial dbt DAG.
 
@@ -281,7 +285,7 @@ def create_dag(
         on_failure_callback=dag_failure_alert,
     )
     def _build():
-        @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
+        @task(task_id=PREPARE_LOCAL_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             start_var, end_var = chunk_var_keys
             params = context["params"]
@@ -480,7 +484,104 @@ def create_dag(
             )
             return payload
 
-        dbt_args = prepare_dbt_args()
+        # Snowflake-only warehouse autoscaling for backfill runs.
+        _scale_warehouse = warehouse == "snowflake"
+        _BACKFILL_CONTEXTS = ("full_backfill", "partial_backfill")
+
+        def _scaling_conn_id() -> str:
+            return warehouse_conn_id or get_adapter("snowflake").resolve_conn_id()
+
+        @task(task_id="upsize_wh")
+        def upsize_wh(**context: Any) -> dict[str, Any]:
+            """Grow the warehouse one size on partial/full backfill runs."""
+            from sundial_airflow.warehouse_scaling import (
+                get_warehouse_size,
+                next_warehouse_size,
+                resolve_warehouse_name,
+                set_warehouse_size,
+            )
+
+            result: dict[str, Any] = {
+                "upsized": False,
+                "warehouse": None,
+                "original_size": None,
+                "new_size": None,
+            }
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            run_context = prep.get("run_context")
+            if run_context not in _BACKFILL_CONTEXTS:
+                logger.info(
+                    "Skipping warehouse upsize: run_context=%r is not a "
+                    "partial/full backfill.",
+                    run_context,
+                )
+                raise AirflowSkipException(
+                    "Not a partial/full backfill run; skipping warehouse upsize."
+                )
+
+            try:
+                conn_id = _scaling_conn_id()
+                wh_name = scaling_warehouse_name or resolve_warehouse_name(conn_id)
+                if not wh_name:
+                    logger.warning("Could not resolve Snowflake warehouse; skipping upsize.")
+                    return result
+                current = get_warehouse_size(conn_id, wh_name)
+                target = next_warehouse_size(current)
+                result.update(warehouse=wh_name, original_size=current)
+                if not target:
+                    logger.info(
+                        "Warehouse %s is %s; no larger size available.", wh_name, current
+                    )
+                    return result
+                set_warehouse_size(conn_id, wh_name, target)
+                result.update(upsized=True, new_size=target)
+                logger.info("Upsized warehouse %s: %s → %s.", wh_name, current, target)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Warehouse upsize failed; continuing at current size.",
+                    exc_info=True,
+                )
+            return result
+
+        @task(task_id="downsize_wh", trigger_rule="all_done")
+        def downsize_wh(**context: Any) -> None:
+            """Restore the original warehouse size on partial/full backfill runs."""
+            from sundial_airflow.warehouse_scaling import set_warehouse_size
+
+            prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
+            run_context = prep.get("run_context")
+            if run_context not in _BACKFILL_CONTEXTS:
+                logger.info(
+                    "Skipping warehouse downsize: run_context=%r is not a "
+                    "partial/full backfill.",
+                    run_context,
+                )
+                raise AirflowSkipException(
+                    "Not a partial/full backfill run; skipping warehouse downsize."
+                )
+
+            info = context["ti"].xcom_pull(task_ids="preprocess.upsize_wh") or {}
+            if not info.get("upsized"):
+                logger.info("Warehouse was not upsized; nothing to downsize.")
+                return
+            try:
+                set_warehouse_size(
+                    _scaling_conn_id(), info["warehouse"], info["original_size"]
+                )
+                logger.info(
+                    "Downsized warehouse %s back to %s.",
+                    info["warehouse"],
+                    info["original_size"],
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("Warehouse downsize failed.", exc_info=True)
+
+        # The group prefixes child ids -> ``preprocess.prepare_dbt_args`` /
+        # ``preprocess.upsize_wh`` (matches ``PREPARE_TASK_ID``).
+        with TaskGroup("preprocess") as preprocess:
+            dbt_args = prepare_dbt_args()
+            if _scale_warehouse:
+                dbt_args >> upsize_wh()
 
         profile_config = profile_config_factory("dev", default_dataset_or_schema)
 
@@ -502,6 +603,9 @@ def create_dag(
                         + "')['vars'] }}"
                     ),
                     install_deps=True,
+                    # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
+                    # run) does not cascade-skip source tests.
+                    trigger_rule="none_failed",
                     pre_execute=make_source_test_skip_hook(dependents),
                 )
 
@@ -547,6 +651,13 @@ def create_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
+        # Post-processing runs after all dbt work. Add further post-process
+        # tasks inside this group as needed.
+        postprocess = None
+        if _scale_warehouse:
+            with TaskGroup("postprocess") as postprocess:
+                downsize_wh()
+
         # Per-source fan-out (no global gate):
         #
         #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
@@ -556,8 +667,8 @@ def create_dag(
         # that consume that source; sibling branches are unaffected. Models
         # with no source dependency (or whose sources have no tests) just run
         # after ``prepare_dbt_args``.
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        preprocess >> source_test_group
+        preprocess >> dbt_models
 
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
@@ -574,7 +685,7 @@ def create_dag(
                 profile_config=profile_config,
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
-                upstream_task=dbt_args,
+                upstream_task=preprocess,
                 parent_group=dbt_models,
             )
             models_by_key = {m.node_key: m for m in _chunk_order}
@@ -618,5 +729,15 @@ def create_dag(
                     )
                     continue
                 test_task >> run_task
+
+        # Wire post-processing only after the *complete* dbt graph is built.
+        # ``dbt_models >> postprocess`` binds the group's leaves at call time, so
+        # this must run after ``build_chunked_model_graph`` has attached the
+        # chunk groups (``parent_group=dbt_models``) and after source-test
+        # wiring, so ``downsize_wh`` (``trigger_rule="all_done"``) waits for
+        # chunked models and source tests before restoring the warehouse size.
+        if postprocess is not None:
+            dbt_models >> postprocess
+            source_test_group >> postprocess
 
     return _build()
