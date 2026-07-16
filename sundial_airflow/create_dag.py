@@ -46,6 +46,7 @@ from sundial_airflow.chunking.run_plan import _as_datetime, build_run_plan, seri
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
+    PREPARE_LOCAL_TASK_ID,
     PREPARE_TASK_ID,
     make_source_test_skip_hook,
     skip_unselected,
@@ -284,7 +285,7 @@ def create_dag(
         on_failure_callback=dag_failure_alert,
     )
     def _build():
-        @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
+        @task(task_id=PREPARE_LOCAL_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             start_var, end_var = chunk_var_keys
             params = context["params"]
@@ -507,7 +508,13 @@ def create_dag(
                 "new_size": None,
             }
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            if prep.get("run_context") not in _BACKFILL_CONTEXTS:
+            run_context = prep.get("run_context")
+            if run_context not in _BACKFILL_CONTEXTS:
+                logger.info(
+                    "Skipping warehouse upsize: run_context=%r is not a "
+                    "partial/full backfill.",
+                    run_context,
+                )
                 raise AirflowSkipException(
                     "Not a partial/full backfill run; skipping warehouse upsize."
                 )
@@ -542,12 +549,18 @@ def create_dag(
             from sundial_airflow.warehouse_scaling import set_warehouse_size
 
             prep = context["ti"].xcom_pull(task_ids=PREPARE_TASK_ID) or {}
-            if prep.get("run_context") not in _BACKFILL_CONTEXTS:
+            run_context = prep.get("run_context")
+            if run_context not in _BACKFILL_CONTEXTS:
+                logger.info(
+                    "Skipping warehouse downsize: run_context=%r is not a "
+                    "partial/full backfill.",
+                    run_context,
+                )
                 raise AirflowSkipException(
                     "Not a partial/full backfill run; skipping warehouse downsize."
                 )
 
-            info = context["ti"].xcom_pull(task_ids="upsize_wh") or {}
+            info = context["ti"].xcom_pull(task_ids="preprocess.upsize_wh") or {}
             if not info.get("upsized"):
                 logger.info("Warehouse was not upsized; nothing to downsize.")
                 return
@@ -563,9 +576,9 @@ def create_dag(
             except Exception:  # noqa: BLE001
                 logger.warning("Warehouse downsize failed.", exc_info=True)
 
-        # ``prefix_group_id=False`` keeps the prepare task id as ``prepare_dbt_args``
-        # so XCom pulls and the completions listener keep resolving it.
-        with TaskGroup("preprocess", prefix_group_id=False) as preprocess:
+        # The group prefixes child ids -> ``preprocess.prepare_dbt_args`` /
+        # ``preprocess.upsize_wh`` (matches ``PREPARE_TASK_ID``).
+        with TaskGroup("preprocess") as preprocess:
             dbt_args = prepare_dbt_args()
             if _scale_warehouse:
                 dbt_args >> upsize_wh()
@@ -644,7 +657,7 @@ def create_dag(
         # tasks inside this group as needed.
         postprocess = None
         if _scale_warehouse:
-            with TaskGroup("postprocess", prefix_group_id=False) as postprocess:
+            with TaskGroup("postprocess") as postprocess:
                 downsize_wh()
 
         # --- TEMP: dbt wiring disabled to isolate preprocess/postprocess.

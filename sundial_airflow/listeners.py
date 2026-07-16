@@ -68,8 +68,9 @@ from sundial_airflow.warehouses import WarehouseAdapter, get_adapter
 
 log = logging.getLogger(__name__)
 
-# Must match dag_factory.PREPARE_TASK_ID; duplicated here to avoid a circular import.
-PREPARE_TASK_ID = "prepare_dbt_args"
+# Must match hooks.PREPARE_TASK_ID; duplicated here to avoid a circular import.
+# The prepare task sits in the ``preprocess`` TaskGroup, so its id is prefixed.
+PREPARE_TASK_ID = "preprocess.prepare_dbt_args"
 
 # Table name is a Sundial-wide convention; the table always sits in the same
 # dataset/schema the tenant's dbt models write to, so we hardcode it here

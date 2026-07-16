@@ -7,7 +7,11 @@ from typing import Iterable
 
 from airflow.exceptions import AirflowSkipException
 
-PREPARE_TASK_ID = "prepare_dbt_args"
+# ``prepare_dbt_args`` lives inside the ``preprocess`` TaskGroup, which prefixes
+# its id. ``PREPARE_LOCAL_TASK_ID`` is the id passed to ``@task``; the group
+# turns it into ``PREPARE_TASK_ID``, the resolved id every ``xcom_pull`` uses.
+PREPARE_LOCAL_TASK_ID = "prepare_dbt_args"
+PREPARE_TASK_ID = f"preprocess.{PREPARE_LOCAL_TASK_ID}"
 
 
 def skip_tests_if_disabled(context) -> None:
