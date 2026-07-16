@@ -407,56 +407,58 @@ def make_dbt_dag(
 
         profile_config = profile_config_factory("dev", default_dataset_or_schema)
 
-        source_test_tasks: dict[tuple[str, str], DbtTestLocalOperator] = {}
-        with TaskGroup("source_tests") as source_test_group:
-            if not source_tables:
-                EmptyOperator(task_id="no_source_tests")
-            for source_name, table_name in source_tables:
-                dependents = source_to_models.get((source_name, table_name), ())
-                source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
-                    task_id=f"test_{source_name}_{table_name}",
-                    profile_config=profile_config,
-                    project_dir=project_path_str,
-                    dbt_executable_path=dbt_executable,
-                    select=[f"source:{source_name}.{table_name}"],
-                    vars=(
-                        "{{ ti.xcom_pull(task_ids='"
-                        + PREPARE_TASK_ID
-                        + "')['vars'] }}"
-                    ),
-                    install_deps=True,
-                    # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
-                    # run) does not cascade-skip source tests.
-                    trigger_rule="none_failed",
-                    pre_execute=make_source_test_skip_hook(dependents),
-                )
+        # --- TEMP: source_tests + dbt_models disabled to isolate
+        # preprocess/postprocess (upsize_wh/downsize_wh). Revert to re-enable. ---
+        # source_test_tasks: dict[tuple[str, str], DbtTestLocalOperator] = {}
+        # with TaskGroup("source_tests") as source_test_group:
+        #     if not source_tables:
+        #         EmptyOperator(task_id="no_source_tests")
+        #     for source_name, table_name in source_tables:
+        #         dependents = source_to_models.get((source_name, table_name), ())
+        #         source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
+        #             task_id=f"test_{source_name}_{table_name}",
+        #             profile_config=profile_config,
+        #             project_dir=project_path_str,
+        #             dbt_executable_path=dbt_executable,
+        #             select=[f"source:{source_name}.{table_name}"],
+        #             vars=(
+        #                 "{{ ti.xcom_pull(task_ids='"
+        #                 + PREPARE_TASK_ID
+        #                 + "')['vars'] }}"
+        #             ),
+        #             install_deps=True,
+        #             # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
+        #             # run) does not cascade-skip source tests.
+        #             trigger_rule="none_failed",
+        #             pre_execute=make_source_test_skip_hook(dependents),
+        #         )
 
-        manifest_path = Path(project_path_str) / "target" / "manifest.json"
-        dbt_models = DbtTaskGroup(
-            group_id="dbt_models",
-            project_config=ProjectConfig(
-                dbt_project_path=project_path_str,
-                manifest_path=str(manifest_path) if manifest_path.exists() else None,
-            ),
-            profile_config=profile_config,
-            execution_config=venv_execution_config,
-            render_config=RenderConfig(test_behavior=TestBehavior.AFTER_EACH),
-            operator_args={
-                "vars": (
-                    "{{ ti.xcom_pull(task_ids='"
-                    + PREPARE_TASK_ID
-                    + "')['vars'] }}"
-                ),
-                "full_refresh": (
-                    "{{ ti.xcom_pull(task_ids='"
-                    + PREPARE_TASK_ID
-                    + "')['full_refresh'] }}"
-                ),
-                "install_deps": True,
-                "pre_execute": skip_unselected,
-                "trigger_rule": "none_failed",
-            },
-        )
+        # manifest_path = Path(project_path_str) / "target" / "manifest.json"
+        # dbt_models = DbtTaskGroup(
+        #     group_id="dbt_models",
+        #     project_config=ProjectConfig(
+        #         dbt_project_path=project_path_str,
+        #         manifest_path=str(manifest_path) if manifest_path.exists() else None,
+        #     ),
+        #     profile_config=profile_config,
+        #     execution_config=venv_execution_config,
+        #     render_config=RenderConfig(test_behavior=TestBehavior.AFTER_EACH),
+        #     operator_args={
+        #         "vars": (
+        #             "{{ ti.xcom_pull(task_ids='"
+        #             + PREPARE_TASK_ID
+        #             + "')['vars'] }}"
+        #         ),
+        #         "full_refresh": (
+        #             "{{ ti.xcom_pull(task_ids='"
+        #             + PREPARE_TASK_ID
+        #             + "')['full_refresh'] }}"
+        #         ),
+        #         "install_deps": True,
+        #         "pre_execute": skip_unselected,
+        #         "trigger_rule": "none_failed",
+        #     },
+        # )
 
         pre_task_chain = [factory() for factory in pre_tasks or []]
         for prev, nxt in zip(pre_task_chain, pre_task_chain[1:]):
@@ -464,30 +466,29 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        preprocess >> source_test_group
-        preprocess >> dbt_models
+        # --- TEMP: dbt wiring disabled to isolate preprocess/postprocess.
+        # Revert to restore source_tests + dbt_models wiring. ---
+        # preprocess >> source_test_group
+        # preprocess >> dbt_models
+        #
+        # run_tasks_by_model = _collect_run_tasks(dbt_models)
+        # for (source_name, table_name), test_task in source_test_tasks.items():
+        #     for model_name in source_to_models.get((source_name, table_name), ()):
+        #         run_task = run_tasks_by_model.get(model_name)
+        #         if run_task is None:
+        #             logger.warning(
+        #                 "Model %r references source %s.%s but no matching "
+        #                 "run task was found in the Cosmos task group; "
+        #                 "skipping wiring.",
+        #                 model_name,
+        #                 source_name,
+        #                 table_name,
+        #             )
+        #             continue
+        #         test_task >> run_task
 
-        run_tasks_by_model = _collect_run_tasks(dbt_models)
-        for (source_name, table_name), test_task in source_test_tasks.items():
-            for model_name in source_to_models.get((source_name, table_name), ()):
-                run_task = run_tasks_by_model.get(model_name)
-                if run_task is None:
-                    logger.warning(
-                        "Model %r references source %s.%s but no matching "
-                        "run task was found in the Cosmos task group; "
-                        "skipping wiring.",
-                        model_name,
-                        source_name,
-                        table_name,
-                    )
-                    continue
-                test_task >> run_task
-
-        # Run post-processing after all Snowflake work finishes (success or
-        # failure). ``downsize_wh`` uses ``trigger_rule="all_done"``, so barrier
-        # it behind both the models and the source tests.
+        # TEMP: run postprocess straight after preprocess (dbt work disabled).
         if postprocess is not None:
-            dbt_models >> postprocess
-            source_test_group >> postprocess
+            preprocess >> postprocess
 
     return _build()

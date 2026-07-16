@@ -572,62 +572,64 @@ def create_dag(
 
         profile_config = profile_config_factory("dev", default_dataset_or_schema)
 
-        source_test_tasks: dict[tuple[str, str], DbtTestLocalOperator] = {}
-        with TaskGroup("source_tests") as source_test_group:
-            if not source_tables:
-                EmptyOperator(task_id="no_source_tests")
-            for source_name, table_name in source_tables:
-                dependents = source_to_models.get((source_name, table_name), ())
-                source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
-                    task_id=f"test_{source_name}_{table_name}",
-                    profile_config=profile_config,
-                    project_dir=project_path_str,
-                    dbt_executable_path=dbt_executable,
-                    select=[f"source:{source_name}.{table_name}"],
-                    vars=(
-                        "{{ ti.xcom_pull(task_ids='"
-                        + PREPARE_TASK_ID
-                        + "')['vars'] }}"
-                    ),
-                    install_deps=True,
-                    # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
-                    # run) does not cascade-skip source tests.
-                    trigger_rule="none_failed",
-                    pre_execute=make_source_test_skip_hook(dependents),
-                )
+        # --- TEMP: source_tests + dbt_models disabled to isolate
+        # preprocess/postprocess (upsize_wh/downsize_wh). Revert to re-enable. ---
+        # source_test_tasks: dict[tuple[str, str], DbtTestLocalOperator] = {}
+        # with TaskGroup("source_tests") as source_test_group:
+        #     if not source_tables:
+        #         EmptyOperator(task_id="no_source_tests")
+        #     for source_name, table_name in source_tables:
+        #         dependents = source_to_models.get((source_name, table_name), ())
+        #         source_test_tasks[(source_name, table_name)] = DbtTestLocalOperator(
+        #             task_id=f"test_{source_name}_{table_name}",
+        #             profile_config=profile_config,
+        #             project_dir=project_path_str,
+        #             dbt_executable_path=dbt_executable,
+        #             select=[f"source:{source_name}.{table_name}"],
+        #             vars=(
+        #                 "{{ ti.xcom_pull(task_ids='"
+        #                 + PREPARE_TASK_ID
+        #                 + "')['vars'] }}"
+        #             ),
+        #             install_deps=True,
+        #             # ``none_failed`` so a skipped ``upsize_wh`` (non-backfill
+        #             # run) does not cascade-skip source tests.
+        #             trigger_rule="none_failed",
+        #             pre_execute=make_source_test_skip_hook(dependents),
+        #         )
 
-        cosmos_render = RenderConfig(
-            test_behavior=TestBehavior.AFTER_EACH,
-            exclude=_chunked_names or None,
-        )
-        dbt_models = DbtTaskGroup(
-            group_id="dbt_models",
-            project_config=ProjectConfig(
-                dbt_project_path=project_path_str,
-                manifest_path=str(manifest_path) if manifest_path.exists() else None,
-            ),
-            profile_config=profile_config,
-            execution_config=venv_execution_config,
-            render_config=cosmos_render,
-            operator_args={
-                "vars": (
-                    "{{ ti.xcom_pull(task_ids='"
-                    + PREPARE_TASK_ID
-                    + "')['vars'] }}"
-                ),
-                "full_refresh": (
-                    "{{ ti.xcom_pull(task_ids='"
-                    + PREPARE_TASK_ID
-                    + "')['full_refresh'] }}"
-                ),
-                "install_deps": False,
-                "pre_execute": skip_unselected,
-                # ``none_failed`` lets a model run when its upstream source
-                # test was *skipped* (skip_tests / empty mode) but still
-                # propagates ``upstream_failed`` if the test actually failed.
-                "trigger_rule": "none_failed",
-            },
-        )
+        # cosmos_render = RenderConfig(
+        #     test_behavior=TestBehavior.AFTER_EACH,
+        #     exclude=_chunked_names or None,
+        # )
+        # dbt_models = DbtTaskGroup(
+        #     group_id="dbt_models",
+        #     project_config=ProjectConfig(
+        #         dbt_project_path=project_path_str,
+        #         manifest_path=str(manifest_path) if manifest_path.exists() else None,
+        #     ),
+        #     profile_config=profile_config,
+        #     execution_config=venv_execution_config,
+        #     render_config=cosmos_render,
+        #     operator_args={
+        #         "vars": (
+        #             "{{ ti.xcom_pull(task_ids='"
+        #             + PREPARE_TASK_ID
+        #             + "')['vars'] }}"
+        #         ),
+        #         "full_refresh": (
+        #             "{{ ti.xcom_pull(task_ids='"
+        #             + PREPARE_TASK_ID
+        #             + "')['full_refresh'] }}"
+        #         ),
+        #         "install_deps": False,
+        #         "pre_execute": skip_unselected,
+        #         # ``none_failed`` lets a model run when its upstream source
+        #         # test was *skipped* (skip_tests / empty mode) but still
+        #         # propagates ``upstream_failed`` if the test actually failed.
+        #         "trigger_rule": "none_failed",
+        #     },
+        # )
 
         # Optional pre-tasks (e.g. ami_dbt's S3 -> Snowflake EMR ingest) run
         # serially before ``prepare_dbt_args``. ``pre_tasks`` items are
@@ -645,86 +647,82 @@ def create_dag(
             with TaskGroup("postprocess", prefix_group_id=False) as postprocess:
                 downsize_wh()
 
-        # Per-source fan-out (no global gate):
+        # --- TEMP: dbt wiring disabled to isolate preprocess/postprocess.
+        # Revert to restore source_tests + dbt_models + chunk graph wiring. ---
+        # # Per-source fan-out (no global gate):
+        # #
+        # #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
+        # #                     └─ <models with no tested source> (run after prepare)
+        # #
+        # # A failing ``test_s_t`` only flips ``upstream_failed`` on the models
+        # # that consume that source; sibling branches are unaffected. Models
+        # # with no source dependency (or whose sources have no tests) just run
+        # # after ``prepare_dbt_args``.
+        # preprocess >> source_test_group
+        # preprocess >> dbt_models
         #
-        #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
-        #                     └─ <models with no tested source> (run after prepare)
+        # cosmos_runs = _collect_run_tasks(dbt_models)
+        # run_tasks_by_model = dict(cosmos_runs)
+        # chunk_groups: dict[str, Any] = {}
+        # chunk_tests: dict[str, Any] = {}
+        # chunk_plans: dict[str, Any] = {}
         #
-        # A failing ``test_s_t`` only flips ``upstream_failed`` on the models
-        # that consume that source; sibling branches are unaffected. Models
-        # with no source dependency (or whose sources have no tests) just run
-        # after ``prepare_dbt_args``.
-        preprocess >> source_test_group
-        preprocess >> dbt_models
+        # if _chunk_order:
+        #     chunk_groups, chunk_tests, chunk_plans = build_chunked_model_graph(
+        #         order=_chunk_order,
+        #         project_path_str=project_path_str,
+        #         dbt_executable=dbt_executable,
+        #         dbt_profile_name=dbt_profile_name,
+        #         profile_config=profile_config,
+        #         profile_config_factory=profile_config_factory,
+        #         chunk_var_keys=chunk_var_keys,
+        #         upstream_task=preprocess,
+        #         parent_group=dbt_models,
+        #     )
+        #     models_by_key = {m.node_key: m for m in _chunk_order}
+        #
+        #     for chunked in _chunk_order:
+        #         if chunked.kind != CHUNKED or chunked.name not in chunk_plans:
+        #             continue
+        #         planned = chunk_plans[chunked.name]
+        #         for dep_key in chunked.depends_on:
+        #             dep = models_by_key.get(dep_key)
+        #             if dep is None or dep.name in chunk_groups:
+        #                 continue
+        #             cosmos_run = cosmos_runs.get(dep.name)
+        #             if cosmos_run is not None:
+        #                 cosmos_run >> planned
+        #
+        #     for model in _chunk_order:
+        #         cosmos_run = cosmos_runs.get(model.name)
+        #         if cosmos_run is None:
+        #             continue
+        #         for dep_key in model.depends_on:
+        #             dep = models_by_key.get(dep_key)
+        #             if dep is None or dep.name not in chunk_tests:
+        #                 continue
+        #             chunk_tests[dep.name] >> cosmos_run
+        #
+        # for (source_name, table_name), test_task in source_test_tasks.items():
+        #     for model_name in source_to_models.get((source_name, table_name), ()):
+        #         if model_name in chunk_groups:
+        #             test_task >> chunk_groups[model_name]
+        #             continue
+        #         run_task = run_tasks_by_model.get(model_name)
+        #         if run_task is None:
+        #             logger.warning(
+        #                 "Model %r references source %s.%s but no matching "
+        #                 "run task was found in the Cosmos task group; "
+        #                 "skipping wiring.",
+        #                 model_name,
+        #                 source_name,
+        #                 table_name,
+        #             )
+        #             continue
+        #         test_task >> run_task
 
-        cosmos_runs = _collect_run_tasks(dbt_models)
-        run_tasks_by_model = dict(cosmos_runs)
-        chunk_groups: dict[str, Any] = {}
-        chunk_tests: dict[str, Any] = {}
-        chunk_plans: dict[str, Any] = {}
-
-        if _chunk_order:
-            chunk_groups, chunk_tests, chunk_plans = build_chunked_model_graph(
-                order=_chunk_order,
-                project_path_str=project_path_str,
-                dbt_executable=dbt_executable,
-                dbt_profile_name=dbt_profile_name,
-                profile_config=profile_config,
-                profile_config_factory=profile_config_factory,
-                chunk_var_keys=chunk_var_keys,
-                upstream_task=preprocess,
-                parent_group=dbt_models,
-            )
-            models_by_key = {m.node_key: m for m in _chunk_order}
-
-            for chunked in _chunk_order:
-                if chunked.kind != CHUNKED or chunked.name not in chunk_plans:
-                    continue
-                planned = chunk_plans[chunked.name]
-                for dep_key in chunked.depends_on:
-                    dep = models_by_key.get(dep_key)
-                    if dep is None or dep.name in chunk_groups:
-                        continue
-                    cosmos_run = cosmos_runs.get(dep.name)
-                    if cosmos_run is not None:
-                        cosmos_run >> planned
-
-            for model in _chunk_order:
-                cosmos_run = cosmos_runs.get(model.name)
-                if cosmos_run is None:
-                    continue
-                for dep_key in model.depends_on:
-                    dep = models_by_key.get(dep_key)
-                    if dep is None or dep.name not in chunk_tests:
-                        continue
-                    chunk_tests[dep.name] >> cosmos_run
-
-        for (source_name, table_name), test_task in source_test_tasks.items():
-            for model_name in source_to_models.get((source_name, table_name), ()):
-                if model_name in chunk_groups:
-                    test_task >> chunk_groups[model_name]
-                    continue
-                run_task = run_tasks_by_model.get(model_name)
-                if run_task is None:
-                    logger.warning(
-                        "Model %r references source %s.%s but no matching "
-                        "run task was found in the Cosmos task group; "
-                        "skipping wiring.",
-                        model_name,
-                        source_name,
-                        table_name,
-                    )
-                    continue
-                test_task >> run_task
-
-        # Wire post-processing only after the *complete* dbt graph is built.
-        # ``dbt_models >> postprocess`` binds the group's leaves at call time, so
-        # this must run after ``build_chunked_model_graph`` has attached the
-        # chunk groups (``parent_group=dbt_models``) and after source-test
-        # wiring, so ``downsize_wh`` (``trigger_rule="all_done"``) waits for
-        # chunked models and source tests before restoring the warehouse size.
+        # TEMP: run postprocess straight after preprocess (dbt work disabled).
         if postprocess is not None:
-            dbt_models >> postprocess
-            source_test_group >> postprocess
+            preprocess >> postprocess
 
     return _build()
