@@ -649,10 +649,6 @@ def create_dag(
         preprocess >> source_test_group
         preprocess >> dbt_models
 
-        # Run post-processing after all dbt work finishes (success or failure).
-        if postprocess is not None:
-            dbt_models >> postprocess
-
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
         chunk_groups: dict[str, Any] = {}
@@ -712,5 +708,15 @@ def create_dag(
                     )
                     continue
                 test_task >> run_task
+
+        # Wire post-processing only after the *complete* dbt graph is built.
+        # ``dbt_models >> postprocess`` binds the group's leaves at call time, so
+        # this must run after ``build_chunked_model_graph`` has attached the
+        # chunk groups (``parent_group=dbt_models``) and after source-test
+        # wiring, so ``downsize_wh`` (``trigger_rule="all_done"``) waits for
+        # chunked models and source tests before restoring the warehouse size.
+        if postprocess is not None:
+            dbt_models >> postprocess
+            source_test_group >> postprocess
 
     return _build()

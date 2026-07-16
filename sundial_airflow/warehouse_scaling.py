@@ -1,14 +1,13 @@
-"""Snowflake virtual-warehouse sizing for chunked backfills.
+"""Snowflake warehouse sizing helpers for chunked backfills.
 
-Chunked runs fan a model out into many parallel windows, so a temporarily
-larger warehouse clears the backlog faster. ``create_dag`` upsizes before the
-run and restores the original size afterwards; the helpers here own the size
-ladder and the Snowflake SQL.
+``create_dag`` upsizes the warehouse before a chunked run and restores it
+afterwards. These helpers own the size ladder and the Snowflake SQL.
 """
 from __future__ import annotations
 
 import logging
 import re
+from contextlib import closing
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +64,12 @@ def next_warehouse_size(size: str | None) -> str | None:
 
 
 def _esc(literal: str) -> str:
+    """Escape single quotes so ``literal`` is safe inside a SQL string."""
     return str(literal).replace("'", "''")
 
 
 def _hook(conn_id: str):
+    """Return a SnowflakeHook for ``conn_id`` with SQL logging disabled."""
     from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
     hook = SnowflakeHook(snowflake_conn_id=conn_id)
@@ -94,8 +95,6 @@ def resolve_warehouse_name(conn_id: str) -> str | None:
 
 def get_warehouse_size(conn_id: str, warehouse_name: str) -> str | None:
     """Return the current size of ``warehouse_name``, or None if not found."""
-    from contextlib import closing
-
     hook = _hook(conn_id)
     with closing(hook.get_conn()) as conn, closing(conn.cursor()) as cur:
         cur.execute(f"SHOW WAREHOUSES LIKE '{_esc(warehouse_name)}'")
@@ -105,6 +104,16 @@ def get_warehouse_size(conn_id: str, warehouse_name: str) -> str | None:
         cols = [c[0].lower() for c in cur.description]
         if "size" not in cols:
             return None
+        # ``SHOW ... LIKE`` treats ``%``/``_`` as wildcards (warehouse names
+        # routinely contain ``_``), so the pattern can match sibling warehouses.
+        # Keep only the exact name match before reading size; SHOW matching is
+        # case-insensitive, so compare case-insensitively too.
+        if "name" in cols:
+            name_idx = cols.index("name")
+            want = str(warehouse_name).upper()
+            rows = [r for r in rows if str(r[name_idx]).upper() == want]
+            if not rows:
+                return None
         return rows[0][cols.index("size")]
 
 
