@@ -41,24 +41,6 @@ _TRIGGER_PATH = "/ai/khruangbin/internal/notification-triggers/fire"
 _SECRET_HEADER = "X-Notification-Trigger-Secret"  # noqa: S105 — header name, not a secret
 _TIMEOUT_SECONDS = 30
 
-# ==========================================================================
-# DO NOT MERGE — test scaffolding for Astro <> Sundial wiring verification.
-# When _TEST_MODE is True, bypass the ``sundial_notify_api`` Airflow connection
-# and post to a hardcoded codespace URL with a hardcoded secret, so no Astro
-# connection setup is needed for the first end-to-end test.
-#   - Replace _TEST_BASE_URL with your codespace's PUBLIC forwarded ai-service
-#     URL (Ports panel → set visibility Public), e.g. https://name-7001.app.github.dev
-#   - _TEST_SECRET must match ai-service's _TRIGGER_SECRET.
-#   - _TEST_BASE_URL points at the Kong gateway (port 5555), so _TEST_PATH keeps
-#     the ``/ai`` prefix (Kong routes ``/ai/*`` to ai-service). Drop ``/ai`` only
-#     if you point straight at the ai-service port instead.
-# Remove this block (and the _TEST_MODE branch below) before merging.
-_TEST_MODE = True
-_TEST_BASE_URL = "https://fluffy-fishstick-rjq75wxwpgph4j9-5555.app.github.dev"
-_TEST_SECRET = "sundial-astro-test-secret"  # noqa: S105
-_TEST_PATH = "/ai/khruangbin/internal/notification-triggers/fire"
-# ==========================================================================
-
 
 def _today() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
@@ -80,22 +62,18 @@ def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
     Raises on transport errors or a non-2xx response so a genuine failure is
     visible in the Airflow UI (and retried per the DAG's ``default_args``).
     """
-    if _TEST_MODE:  # DO NOT MERGE — hardcoded URL + secret; skips the connection.
-        url = f"{_TEST_BASE_URL.rstrip('/')}{_TEST_PATH}"
-        secret = _TEST_SECRET
-    else:
-        try:
-            conn = BaseHook.get_connection(NOTIFY_CONN_ID)
-        except AirflowNotFoundException:
-            conn = None
+    try:
+        conn = BaseHook.get_connection(NOTIFY_CONN_ID)
+    except AirflowNotFoundException:
+        conn = None
 
-        if conn is None or not conn.host or not conn.password:
-            raise AirflowSkipException(
-                f"{NOTIFY_CONN_ID} connection not configured; skipping notification trigger "
-                f"for tenant={tenant!r}"
-            )
-        url = f"{_resolve_base_url(conn.host, conn.schema)}{_TRIGGER_PATH}"
-        secret = conn.password
+    if conn is None or not conn.host or not conn.password:
+        raise AirflowSkipException(
+            f"{NOTIFY_CONN_ID} connection not configured; skipping notification trigger "
+            f"for tenant={tenant!r}"
+        )
+    url = f"{_resolve_base_url(conn.host, conn.schema)}{_TRIGGER_PATH}"
+    secret = conn.password
 
     payload = {
         "tenant_slug": tenant,

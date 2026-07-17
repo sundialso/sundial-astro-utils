@@ -30,13 +30,6 @@ class ResolveBaseUrlTest(unittest.TestCase):
 
 
 class NotifyEndOfPipelineTest(unittest.TestCase):
-    def setUp(self) -> None:
-        # Exercise the production (Airflow-connection) path, not the DO-NOT-MERGE
-        # _TEST_MODE hardcode. Remove once the test scaffolding is stripped.
-        patcher = mock.patch(f"{_MODULE}._TEST_MODE", False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_skips_when_connection_missing(self) -> None:
         with mock.patch(f"{_MODULE}.BaseHook") as base_hook:
             base_hook.get_connection.side_effect = AirflowNotFoundException("nope")
