@@ -19,7 +19,6 @@ URL and its ``password`` is the HMAC trigger secret (matches
 """
 from __future__ import annotations
 
-import datetime as _dt
 import logging
 from typing import Any
 
@@ -42,15 +41,20 @@ _SECRET_HEADER = "X-Notification-Trigger-Secret"  # noqa: S105 — header name, 
 _TIMEOUT_SECONDS = 30
 
 
-def _today() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+def _resolve_base_url(host: str) -> str:
+    """Normalise a connection host into an ``https`` base URL.
 
-
-def _resolve_base_url(host: str, schema: str | None) -> str:
-    """Normalise a connection host into a scheme-qualified base URL."""
+    Rejects plaintext ``http``: the request carries the HMAC trigger secret, so
+    it must never traverse an unencrypted channel (a MITM could capture the
+    secret and forge completion events).
+    """
     base = host.rstrip("/")
-    if not base.startswith(("http://", "https://")):
-        base = f"{schema or 'https'}://{base}"
+    if base.startswith("http://"):
+        raise ValueError(
+            f"{NOTIFY_CONN_ID} host must use https (the request carries a secret); got {base!r}"
+        )
+    if not base.startswith("https://"):
+        base = f"https://{base}"
     return base
 
 
@@ -72,7 +76,7 @@ def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
             f"{NOTIFY_CONN_ID} connection not configured; skipping notification trigger "
             f"for tenant={tenant!r}"
         )
-    url = f"{_resolve_base_url(conn.host, conn.schema)}{_TRIGGER_PATH}"
+    url = f"{_resolve_base_url(conn.host)}{_TRIGGER_PATH}"
     secret = conn.password
 
     payload = {
@@ -118,13 +122,15 @@ def build_notify_task(*, tenant: str, dag_id: str) -> Any:
     fires on pipeline completion even if some models failed (success/completion
     signal; failure alerting is handled separately by ``on_failure_callback``).
     The run date mirrors the ``execution_ts`` dbt var the pipeline uses, so the
-    endpoint's age/dedup gates see the same data date the run processed.
+    endpoint's age/dedup gates see the same data date the run processed. When
+    ``execution_ts`` is unset it falls back to the run's ``logical_date`` (not
+    today), so a backfill notifies for the data date it actually processed.
     """
 
     @task(task_id=NOTIFY_TASK_ID, trigger_rule=TriggerRule.ALL_DONE)
     def notify(**context: Any) -> None:
         params = context.get("params") or {}
-        run_date = str(params.get("execution_ts") or _today())[:10]
+        run_date = str(params.get("execution_ts") or context["logical_date"])[:10]
         notify_end_of_pipeline(tenant=tenant, run_date=run_date, dag_id=dag_id)
 
     return notify()

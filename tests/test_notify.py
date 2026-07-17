@@ -17,16 +17,18 @@ def _conn(host: str | None = "api.sundial.so", password: str | None = "s3cret", 
 
 
 class ResolveBaseUrlTest(unittest.TestCase):
-    def test_prepends_scheme_when_missing(self) -> None:
-        self.assertEqual(notify._resolve_base_url("api.sundial.so", "https"), "https://api.sundial.so")
+    def test_prepends_https_when_scheme_missing(self) -> None:
+        self.assertEqual(notify._resolve_base_url("api.sundial.so"), "https://api.sundial.so")
 
-    def test_defaults_scheme_to_https(self) -> None:
-        self.assertEqual(notify._resolve_base_url("api.sundial.so", None), "https://api.sundial.so")
-
-    def test_keeps_explicit_scheme_and_strips_trailing_slash(self) -> None:
+    def test_keeps_https_and_strips_trailing_slash(self) -> None:
         self.assertEqual(
-            notify._resolve_base_url("http://localhost:8000/", "https"), "http://localhost:8000"
+            notify._resolve_base_url("https://api.sundial.so/"), "https://api.sundial.so"
         )
+
+    def test_rejects_plaintext_http(self) -> None:
+        # The request carries the HMAC secret, so http must be refused.
+        with self.assertRaises(ValueError):
+            notify._resolve_base_url("http://api.sundial.so")
 
 
 class NotifyEndOfPipelineTest(unittest.TestCase):

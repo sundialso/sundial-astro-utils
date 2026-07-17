@@ -560,14 +560,6 @@ def create_dag(
         dbt_args >> source_test_group
         dbt_args >> dbt_models
 
-        # Terminal notification trigger — fires the tenant's enabled
-        # notification triggers once the pipeline completes. Added for every
-        # tenant here (not opt-in) so consumers get it with no repo changes;
-        # self-skips when the ``sundial_notify_api`` connection is absent.
-        # Hung off the ``dbt_models`` group so it waits for all models (and any
-        # chunk sub-groups nested under it).
-        dbt_models >> build_notify_task(tenant=tenant, dag_id=dag_id)
-
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
         chunk_groups: dict[str, Any] = {}
@@ -627,5 +619,12 @@ def create_dag(
                     )
                     continue
                 test_task >> run_task
+
+        # Terminal notification trigger — appended after the full graph (chunk
+        # groups + source-test wiring) is built so it waits on every branch,
+        # including chunk sub-groups added to ``dbt_models`` above. Added for
+        # every tenant (not opt-in) so consumers get it with no repo changes;
+        # self-skips when the ``sundial_notify_api`` connection is absent.
+        [source_test_group, dbt_models] >> build_notify_task(tenant=tenant, dag_id=dag_id)
 
     return _build()
