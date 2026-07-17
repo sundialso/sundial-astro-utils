@@ -28,6 +28,7 @@ from sundial_airflow.hooks import (
     make_source_test_skip_hook,
     skip_unselected,
 )
+from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
 from sundial_airflow.slack_alerts import dag_failure_alert
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
@@ -365,6 +366,12 @@ def make_dbt_dag(
 
         dbt_args >> source_test_group
         dbt_args >> dbt_models
+
+        # Terminal notification trigger — fires the tenant's enabled
+        # notification triggers once the pipeline completes. Added for every
+        # tenant here (not opt-in) so consumers get it with no repo changes;
+        # self-skips when the ``sundial_notify_api`` connection is absent.
+        dbt_models >> build_notify_task(tenant=tenant, dag_id=dag_id)
 
         run_tasks_by_model = _collect_run_tasks(dbt_models)
         for (source_name, table_name), test_task in source_test_tasks.items():
