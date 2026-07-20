@@ -370,9 +370,10 @@ def make_dbt_dag(
         # Terminal notification trigger — fires the tenant's enabled
         # notification triggers once the pipeline completes. Added for every
         # tenant here (not opt-in) so consumers get it with no repo changes;
-        # self-skips when the ``sundial_notify_api`` connection is absent.
-        # Waits on both branches (source tests + models); a source test with no
-        # dependent model would otherwise still be running when notify fires.
+        # self-skips unless the SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
+        # env vars are set on the deployment. Waits on both branches (source
+        # tests + models); a source test with no dependent model would otherwise
+        # still be running when notify fires.
         [source_test_group, dbt_models] >> build_notify_task(tenant=tenant, dag_id=dag_id)
 
         run_tasks_by_model = _collect_run_tasks(dbt_models)

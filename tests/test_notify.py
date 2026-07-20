@@ -1,91 +1,69 @@
 """Tests for the end-of-pipeline notification trigger."""
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
-from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
-from airflow.models import Connection
+from airflow.exceptions import AirflowSkipException
 
 from sundial_airflow import notify
 
 _MODULE = "sundial_airflow.notify"
-
-
-def _conn(host: str | None = "api.sundial.so", password: str | None = "s3cret", schema: str | None = "https") -> Connection:
-    return Connection(conn_id=notify.NOTIFY_CONN_ID, host=host, password=password, schema=schema)
-
-
-class ResolveBaseUrlTest(unittest.TestCase):
-    def test_prepends_https_when_scheme_missing(self) -> None:
-        self.assertEqual(notify._resolve_base_url("api.sundial.so"), "https://api.sundial.so")
-
-    def test_keeps_https_and_strips_trailing_slash(self) -> None:
-        self.assertEqual(
-            notify._resolve_base_url("https://api.sundial.so/"), "https://api.sundial.so"
-        )
-
-    def test_rejects_plaintext_http(self) -> None:
-        # The request carries the HMAC secret, so http must be refused.
-        with self.assertRaises(ValueError):
-            notify._resolve_base_url("http://api.sundial.so")
+_ENV = {
+    "SUNDIAL_AI_SERVICE_URL": "https://gw.example/",
+    "NOTIFICATION_TRIGGER_SECRET": "sekret",
+}
 
 
 class NotifyEndOfPipelineTest(unittest.TestCase):
-    def test_skips_when_connection_missing(self) -> None:
-        with mock.patch(f"{_MODULE}.BaseHook") as base_hook:
-            base_hook.get_connection.side_effect = AirflowNotFoundException("nope")
+    def test_skips_when_url_unset(self) -> None:
+        with mock.patch.dict(os.environ, {"NOTIFICATION_TRIGGER_SECRET": "sekret"}, clear=True):
             with self.assertRaises(AirflowSkipException):
-                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-15", dag_id="dbt_acme")
+                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="d")
 
-    def test_skips_when_host_or_password_empty(self) -> None:
-        for conn in (_conn(host=None), _conn(password=None)):
-            with mock.patch(f"{_MODULE}.BaseHook") as base_hook:
-                base_hook.get_connection.return_value = conn
-                with self.assertRaises(AirflowSkipException):
-                    notify.notify_end_of_pipeline(
-                        tenant="acme", run_date="2026-07-15", dag_id="dbt_acme"
-                    )
+    def test_skips_when_secret_unset(self) -> None:
+        with mock.patch.dict(os.environ, {"SUNDIAL_AI_SERVICE_URL": "https://gw.example"}, clear=True):
+            with self.assertRaises(AirflowSkipException):
+                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="d")
+
+    def test_rejects_non_https_url(self) -> None:
+        env = {**_ENV, "SUNDIAL_AI_SERVICE_URL": "http://gw.example"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError):
+                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="d")
 
     def test_posts_expected_request_on_happy_path(self) -> None:
-        with (
-            mock.patch(f"{_MODULE}.BaseHook") as base_hook,
-            mock.patch(f"{_MODULE}.requests") as req,
-        ):
-            base_hook.get_connection.return_value = _conn()
+        with mock.patch.dict(os.environ, _ENV, clear=True), mock.patch(f"{_MODULE}.requests") as req:
             req.post.return_value = mock.Mock(ok=True, status_code=202)
 
-            notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-15", dag_id="dbt_acme")
+            notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="dbt_acme")
 
             req.post.assert_called_once()
             _, kwargs = req.post.call_args
             self.assertEqual(
                 req.post.call_args.args[0],
-                "https://api.sundial.so/ai/khruangbin/internal/notification-triggers/fire",
+                "https://gw.example/ai/khruangbin/internal/notification-triggers/fire",
             )
+            self.assertEqual(kwargs["headers"][notify._SECRET_HEADER], "sekret")
             self.assertEqual(
                 kwargs["json"],
                 {
                     "tenant_slug": "acme",
-                    "run_date": "2026-07-15",
+                    "run_date": "2026-07-20",
                     "dag_id": "dbt_acme",
                     "source": "astro",
                 },
             )
-            self.assertEqual(kwargs["headers"], {notify._SECRET_HEADER: "s3cret"})
 
     def test_raises_on_non_2xx(self) -> None:
-        with (
-            mock.patch(f"{_MODULE}.BaseHook") as base_hook,
-            mock.patch(f"{_MODULE}.requests") as req,
-        ):
-            base_hook.get_connection.return_value = _conn()
+        with mock.patch.dict(os.environ, _ENV, clear=True), mock.patch(f"{_MODULE}.requests") as req:
             response = mock.Mock(ok=False, status_code=500, text="boom")
             response.raise_for_status.side_effect = RuntimeError("500")
             req.post.return_value = response
 
             with self.assertRaises(RuntimeError):
-                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-15", dag_id="dbt_acme")
+                notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="d")
 
 
 if __name__ == "__main__":

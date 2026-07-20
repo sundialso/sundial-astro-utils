@@ -7,95 +7,77 @@ changes. On pipeline completion it POSTs a pipeline-completion event to
 Sundial's notification-trigger endpoint, which fans out to the tenant's enabled
 notification triggers for the run date.
 
-Enrollment is a deploy-time toggle, not code: the task self-skips
-(``AirflowSkipException``) unless the ``sundial_notify_api`` Airflow connection
-is configured in the deployment, so un-enrolled deployments are harmless
-no-ops.
+Config mirrors the data-quality trigger's convention (see gamma-dbt's
+``include/dq_email_trigger.py``) — two env vars set on the Astro deployment:
 
-Auth mirrors ``slack_alerts.py``: the secret lives in an Airflow **Connection**,
-never a committed file. The connection's ``host`` is the Sundial gateway base
-URL and its ``password`` is the HMAC trigger secret (matches
-``NOTIFICATION_TRIGGER_SECRET`` on the ai-service side).
+  - ``SUNDIAL_AI_SERVICE_URL``      Kong gateway base URL, shared with the
+                                    data-quality + connector-sync triggers
+                                    (``/ai/*`` routes to ai-service).
+  - ``NOTIFICATION_TRIGGER_SECRET`` HMAC secret (flag it Secret); must match the
+                                    ``NOTIFICATION_TRIGGER_SECRET`` value on the
+                                    ai-service side.
+
+Enrollment is a deploy-time toggle: the task self-skips
+(``AirflowSkipException``) unless BOTH are set, so un-enrolled deployments are
+harmless no-ops. (The data-quality trigger ``raise``s on a missing env because
+it is opt-in per tenant; ``notify`` is added to *every* tenant DAG, so an
+un-enrolled tenant must skip, not fail.)
 """
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import requests
 from airflow.decorators import task
-from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
-from airflow.hooks.base import BaseHook
+from airflow.exceptions import AirflowSkipException
 from airflow.utils.trigger_rule import TriggerRule
 
 logger = logging.getLogger(__name__)
 
-#: Airflow connection holding the gateway URL (host) + HMAC secret (password).
-NOTIFY_CONN_ID = "sundial_notify_api"
 NOTIFY_TASK_ID = "notify"
 
 # Gateway route for the ai-service trigger endpoint. The ``/ai`` prefix is added
 # by the gateway in front of ai-service's ``/khruangbin`` mount.
-_TRIGGER_PATH = "/ai/khruangbin/internal/notification-triggers/fire"
+_ENDPOINT_PATH = "/ai/khruangbin/internal/notification-triggers/fire"
 _SECRET_HEADER = "X-Notification-Trigger-Secret"  # noqa: S105 — header name, not a secret
+_URL_ENV_VAR = "SUNDIAL_AI_SERVICE_URL"
+_SECRET_ENV_VAR = "NOTIFICATION_TRIGGER_SECRET"  # noqa: S105 — env var name, not a secret
 _TIMEOUT_SECONDS = 30
-
-
-def _resolve_base_url(host: str) -> str:
-    """Normalise a connection host into an ``https`` base URL.
-
-    Rejects plaintext ``http``: the request carries the HMAC trigger secret, so
-    it must never traverse an unencrypted channel (a MITM could capture the
-    secret and forge completion events).
-    """
-    base = host.rstrip("/")
-    if base.startswith("http://"):
-        raise ValueError(
-            f"{NOTIFY_CONN_ID} host must use https (the request carries a secret); got {base!r}"
-        )
-    if not base.startswith("https://"):
-        base = f"https://{base}"
-    return base
 
 
 def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
     """POST a pipeline-completion event to Sundial's notification-trigger API.
 
-    Skips (``AirflowSkipException``) when the ``sundial_notify_api`` connection
-    is absent or incomplete, so a deployment that hasn't enrolled is a no-op.
-    Raises on transport errors or a non-2xx response so a genuine failure is
-    visible in the Airflow UI (and retried per the DAG's ``default_args``).
+    Self-skips (``AirflowSkipException``) when ``SUNDIAL_AI_SERVICE_URL`` or
+    ``NOTIFICATION_TRIGGER_SECRET`` is unset, so a deployment that hasn't
+    enrolled is a no-op. Raises on a non-https gateway, a transport error, or a
+    non-2xx response so a genuine failure is visible in the Airflow UI (and
+    retried per the DAG's ``default_args``).
     """
-    try:
-        conn = BaseHook.get_connection(NOTIFY_CONN_ID)
-    except AirflowNotFoundException:
-        conn = None
-
-    if conn is None or not conn.host or not conn.password:
+    base_url = os.environ.get(_URL_ENV_VAR, "")
+    secret = os.environ.get(_SECRET_ENV_VAR, "")
+    if not base_url or not secret:
         raise AirflowSkipException(
-            f"{NOTIFY_CONN_ID} connection not configured; skipping notification trigger "
-            f"for tenant={tenant!r}"
+            f"{_URL_ENV_VAR}/{_SECRET_ENV_VAR} not configured; skipping notification "
+            f"trigger for tenant={tenant!r}"
         )
-    url = f"{_resolve_base_url(conn.host)}{_TRIGGER_PATH}"
-    secret = conn.password
+    if not base_url.startswith("https://"):
+        # The request carries the HMAC secret — refuse to send it unencrypted.
+        raise ValueError(f"{_URL_ENV_VAR} must be an https URL; got {base_url!r}")
 
-    payload = {
-        "tenant_slug": tenant,
-        "run_date": run_date,
-        "dag_id": dag_id,
-        "source": "astro",
-    }
-
-    logger.info(
-        "Firing notification trigger for tenant=%r run_date=%s via %s",
-        tenant,
-        run_date,
-        NOTIFY_CONN_ID,
-    )
+    url = base_url.rstrip("/") + _ENDPOINT_PATH
+    logger.info("Firing notification trigger for tenant=%r run_date=%s", tenant, run_date)
     response = requests.post(
         url,
-        json=payload,
-        headers={_SECRET_HEADER: secret},
+        headers={_SECRET_HEADER: secret, "Content-Type": "application/json"},
+        json={
+            "tenant_slug": tenant,
+            "run_date": run_date,
+            "dag_id": dag_id,
+            "source": "astro",
+        },
         timeout=_TIMEOUT_SECONDS,
     )
     if not response.ok:

@@ -624,7 +624,8 @@ def create_dag(
         # groups + source-test wiring) is built so it waits on every branch,
         # including chunk sub-groups added to ``dbt_models`` above. Added for
         # every tenant (not opt-in) so consumers get it with no repo changes;
-        # self-skips when the ``sundial_notify_api`` connection is absent.
+        # self-skips unless SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
+        # env vars are set on the deployment.
         [source_test_group, dbt_models] >> build_notify_task(tenant=tenant, dag_id=dag_id)
 
     return _build()
