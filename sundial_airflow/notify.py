@@ -79,6 +79,9 @@ def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
             "source": "astro",
         },
         timeout=_TIMEOUT_SECONDS,
+        # Don't follow redirects: requests preserves the secret header across
+        # them, so a redirect could leak it to a different/downgraded host.
+        allow_redirects=False,
     )
     if not response.ok:
         logger.error(
