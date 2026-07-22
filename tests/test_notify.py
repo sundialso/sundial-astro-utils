@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 from airflow.exceptions import AirflowSkipException
@@ -11,10 +12,15 @@ from airflow.utils.types import DagRunType
 from sundial_airflow import notify
 
 
-def _context(run_type: DagRunType, execution_ts: str = "2026-07-20T00:00:00") -> dict[str, object]:
+def _context(
+    run_type: DagRunType,
+    *,
+    execution_ts: str | None = "2026-07-20T00:00:00",
+    backfill_mode: str = "none",
+) -> dict[str, object]:
     return {
         "dag_run": mock.Mock(run_type=run_type),
-        "params": {"execution_ts": execution_ts},
+        "params": {"execution_ts": execution_ts, "backfill_mode": backfill_mode},
         "run_id": "scheduled__2026-07-20",
     }
 
@@ -115,6 +121,31 @@ class NotifyFromContextTest(unittest.TestCase):
                 _context(DagRunType.MANUAL), tenant="acme", dag_id="dbt_acme"
             )
             fire.assert_called_once()
+
+    def test_skips_param_driven_backfill(self) -> None:
+        # A backfill_mode=full|partial run is triggered manually (run_type MANUAL)
+        # but must still be treated as a backfill and skipped.
+        for mode in ("full", "partial"):
+            with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+                with self.assertRaises(AirflowSkipException):
+                    notify._notify_from_context(
+                        _context(DagRunType.MANUAL, backfill_mode=mode),
+                        tenant="acme",
+                        dag_id="dbt_acme",
+                    )
+                fire.assert_not_called()
+
+    def test_run_date_falls_back_to_utc_date_like_dbt(self) -> None:
+        # execution_ts defaults to None; notify must mirror dbt's UTC-date fallback
+        # (not send "None"), matching the data date the run processed.
+        expected = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+            notify._notify_from_context(
+                _context(DagRunType.SCHEDULED, execution_ts=None),
+                tenant="acme",
+                dag_id="dbt_acme",
+            )
+            self.assertEqual(fire.call_args.kwargs["run_date"], expected)
 
 
 if __name__ == "__main__":

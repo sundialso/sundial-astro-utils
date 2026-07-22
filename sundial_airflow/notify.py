@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -109,10 +110,11 @@ def build_notify_task(*, tenant: str, dag_id: str) -> Any:
 
     Called inside a DAG context by the factories. ``trigger_rule=ALL_SUCCESS`` so
     it fires only when the whole pipeline succeeded — a partial failure produces
-    no notification. It skips backfill runs, which reprocess historical data
-    dates and must not emit notifications. The run date is the
-    ``execution_ts`` dbt var the pipeline runs with, so the endpoint's age/dedup
-    gates see the same data date the run processed.
+    no notification. It skips backfill runs (both Airflow backfill jobs and
+    ``backfill_mode`` param runs), which reprocess historical data dates and must
+    not emit notifications. The run date mirrors the dbt ``execution_ts``
+    resolution (``execution_ts`` else current UTC date), so the endpoint's
+    age/dedup gates see the same data date the run processed.
     """
 
     @task(task_id=NOTIFY_TASK_ID, trigger_rule=TriggerRule.ALL_SUCCESS, retries=2)
@@ -125,8 +127,19 @@ def build_notify_task(*, tenant: str, dag_id: str) -> Any:
 def _notify_from_context(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
     """Gate on run type, resolve the run date, and fire. Split out from the task
     body so it is unit-testable with a plain context dict."""
+    params = context["params"]
     run_type = context["dag_run"].run_type
-    if run_type == DagRunType.BACKFILL_JOB:
-        raise AirflowSkipException(f"notify skipped for backfill run_type={run_type!r}")
-    run_date = str(context["params"]["execution_ts"])[:10]
+    backfill_mode = params.get("backfill_mode", "none")
+    # Skip both Airflow backfill jobs and param-driven backfills (which run as
+    # MANUAL) — a backfill reprocesses historical data dates and must not notify.
+    if run_type == DagRunType.BACKFILL_JOB or backfill_mode in {"full", "partial"}:
+        raise AirflowSkipException(
+            f"notify skipped for backfill (run_type={run_type!r}, backfill_mode={backfill_mode!r})"
+        )
+    # Resolve run_date exactly as the DAG factories resolve the dbt execution_ts
+    # var (execution_ts, else current UTC date), so notify reports the same data
+    # date the run processed. execution_ts defaults to None.
+    run_date = str(params.get("execution_ts") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))[
+        :10
+    ]
     notify_end_of_pipeline(tenant=tenant, run_date=run_date, dag_id=dag_id, run_id=context["run_id"])
