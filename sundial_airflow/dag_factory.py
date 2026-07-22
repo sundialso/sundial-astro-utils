@@ -368,8 +368,9 @@ def make_dbt_dag(
         dbt_args >> dbt_models
 
         # Terminal notification trigger — fires the tenant's enabled
-        # notification triggers once the pipeline completes. Added for every
-        # tenant here (not opt-in) so consumers get it with no repo changes;
+        # notification triggers once the pipeline completes successfully (backfill
+        # runs are skipped). Added for every tenant here (not opt-in) so consumers
+        # get it with no repo changes;
         # self-skips unless the SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
         # env vars are set on the deployment. Waits on both branches (source
         # tests + models); a source test with no dependent model would otherwise

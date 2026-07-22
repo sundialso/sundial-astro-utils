@@ -33,6 +33,7 @@ import requests
 from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
 from airflow.utils.trigger_rule import TriggerRule
+from airflow.utils.types import DagRunType
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +45,12 @@ _ENDPOINT_PATH = "/ai/khruangbin/internal/notification-triggers/fire"
 _SECRET_HEADER = "X-Notification-Trigger-Secret"  # noqa: S105 — header name, not a secret
 _URL_ENV_VAR = "SUNDIAL_AI_SERVICE_URL"
 _SECRET_ENV_VAR = "NOTIFICATION_TRIGGER_SECRET"  # noqa: S105 — env var name, not a secret
-_TIMEOUT_SECONDS = 30
+_TIMEOUT_SECONDS = 120
 
 
-def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
+def notify_end_of_pipeline(
+    *, tenant: str, run_date: str, dag_id: str, run_id: str | None = None
+) -> None:
     """POST a pipeline-completion event to Sundial's notification-trigger API.
 
     Self-skips (``AirflowSkipException``) when ``SUNDIAL_AI_SERVICE_URL`` or
@@ -77,6 +80,7 @@ def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
             "run_date": run_date,
             "dag_id": dag_id,
             "source": "astro",
+            "run_id": run_id,
         },
         timeout=_TIMEOUT_SECONDS,
         # Don't follow redirects: requests preserves the secret header across
@@ -103,19 +107,26 @@ def notify_end_of_pipeline(*, tenant: str, run_date: str, dag_id: str) -> None:
 def build_notify_task(*, tenant: str, dag_id: str) -> Any:
     """Create the terminal ``notify`` task and return the operator.
 
-    Called inside a DAG context by the factories. ``trigger_rule=ALL_DONE`` so it
-    fires on pipeline completion even if some models failed (success/completion
-    signal; failure alerting is handled separately by ``on_failure_callback``).
-    The run date mirrors the ``execution_ts`` dbt var the pipeline uses, so the
-    endpoint's age/dedup gates see the same data date the run processed. When
-    ``execution_ts`` is unset it falls back to the run's ``logical_date`` (not
-    today), so a backfill notifies for the data date it actually processed.
+    Called inside a DAG context by the factories. ``trigger_rule=ALL_SUCCESS`` so
+    it fires only when the whole pipeline succeeded — a partial failure produces
+    no notification. It skips backfill runs, which reprocess historical data
+    dates and must not emit notifications. The run date is the
+    ``execution_ts`` dbt var the pipeline runs with, so the endpoint's age/dedup
+    gates see the same data date the run processed.
     """
 
-    @task(task_id=NOTIFY_TASK_ID, trigger_rule=TriggerRule.ALL_DONE)
+    @task(task_id=NOTIFY_TASK_ID, trigger_rule=TriggerRule.ALL_SUCCESS, retries=2)
     def notify(**context: Any) -> None:
-        params = context.get("params") or {}
-        run_date = str(params.get("execution_ts") or context["logical_date"])[:10]
-        notify_end_of_pipeline(tenant=tenant, run_date=run_date, dag_id=dag_id)
+        _notify_from_context(context, tenant=tenant, dag_id=dag_id)
 
     return notify()
+
+
+def _notify_from_context(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
+    """Gate on run type, resolve the run date, and fire. Split out from the task
+    body so it is unit-testable with a plain context dict."""
+    run_type = context["dag_run"].run_type
+    if run_type == DagRunType.BACKFILL_JOB:
+        raise AirflowSkipException(f"notify skipped for backfill run_type={run_type!r}")
+    run_date = str(context["params"]["execution_ts"])[:10]
+    notify_end_of_pipeline(tenant=tenant, run_date=run_date, dag_id=dag_id, run_id=context["run_id"])

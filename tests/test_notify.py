@@ -6,8 +6,17 @@ import unittest
 from unittest import mock
 
 from airflow.exceptions import AirflowSkipException
+from airflow.utils.types import DagRunType
 
 from sundial_airflow import notify
+
+
+def _context(run_type: DagRunType, execution_ts: str = "2026-07-20T00:00:00") -> dict[str, object]:
+    return {
+        "dag_run": mock.Mock(run_type=run_type),
+        "params": {"execution_ts": execution_ts},
+        "run_id": "scheduled__2026-07-20",
+    }
 
 _MODULE = "sundial_airflow.notify"
 _ENV = {
@@ -37,7 +46,9 @@ class NotifyEndOfPipelineTest(unittest.TestCase):
         with mock.patch.dict(os.environ, _ENV, clear=True), mock.patch(f"{_MODULE}.requests") as req:
             req.post.return_value = mock.Mock(ok=True, status_code=202)
 
-            notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="dbt_acme")
+            notify.notify_end_of_pipeline(
+                tenant="acme", run_date="2026-07-20", dag_id="dbt_acme", run_id="manual__2026-07-20"
+            )
 
             req.post.assert_called_once()
             _, kwargs = req.post.call_args
@@ -46,6 +57,7 @@ class NotifyEndOfPipelineTest(unittest.TestCase):
                 "https://gw.example/ai/khruangbin/internal/notification-triggers/fire",
             )
             self.assertEqual(kwargs["headers"][notify._SECRET_HEADER], "sekret")
+            self.assertEqual(kwargs["timeout"], 120)
             self.assertEqual(
                 kwargs["json"],
                 {
@@ -53,8 +65,18 @@ class NotifyEndOfPipelineTest(unittest.TestCase):
                     "run_date": "2026-07-20",
                     "dag_id": "dbt_acme",
                     "source": "astro",
+                    "run_id": "manual__2026-07-20",
                 },
             )
+
+    def test_run_id_defaults_to_none_when_omitted(self) -> None:
+        with mock.patch.dict(os.environ, _ENV, clear=True), mock.patch(f"{_MODULE}.requests") as req:
+            req.post.return_value = mock.Mock(ok=True, status_code=202)
+
+            notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="dbt_acme")
+
+            _, kwargs = req.post.call_args
+            self.assertIsNone(kwargs["json"]["run_id"])
 
     def test_raises_on_non_2xx(self) -> None:
         with mock.patch.dict(os.environ, _ENV, clear=True), mock.patch(f"{_MODULE}.requests") as req:
@@ -64,6 +86,35 @@ class NotifyEndOfPipelineTest(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 notify.notify_end_of_pipeline(tenant="acme", run_date="2026-07-20", dag_id="d")
+
+
+class NotifyFromContextTest(unittest.TestCase):
+    def test_fires_for_scheduled_run(self) -> None:
+        with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+            notify._notify_from_context(
+                _context(DagRunType.SCHEDULED), tenant="acme", dag_id="dbt_acme"
+            )
+            fire.assert_called_once_with(
+                tenant="acme",
+                run_date="2026-07-20",
+                dag_id="dbt_acme",
+                run_id="scheduled__2026-07-20",
+            )
+
+    def test_skips_backfill_run(self) -> None:
+        with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+            with self.assertRaises(AirflowSkipException):
+                notify._notify_from_context(
+                    _context(DagRunType.BACKFILL_JOB), tenant="acme", dag_id="dbt_acme"
+                )
+            fire.assert_not_called()
+
+    def test_fires_for_manual_run(self) -> None:
+        with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+            notify._notify_from_context(
+                _context(DagRunType.MANUAL), tenant="acme", dag_id="dbt_acme"
+            )
+            fire.assert_called_once()
 
 
 if __name__ == "__main__":
