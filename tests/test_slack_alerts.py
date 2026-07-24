@@ -1,75 +1,93 @@
-"""Tests for the Slack failure alert (worker-side ``one_failed`` task)."""
+"""Tests for the Slack failure alert (worker-side ``all_done`` task)."""
 from __future__ import annotations
 
 import unittest
 from unittest import mock
 
+from airflow.exceptions import AirflowSkipException
+
 from sundial_airflow import slack_alerts
 
 _MODULE = "sundial_airflow.slack_alerts"
+_GET_TASK_STATES = (
+    "airflow.sdk.execution_time.task_runner.RuntimeTaskInstance.get_task_states"
+)
+_RUN_ID = "scheduled__2026-07-20"
 
 
-def _ti(task_id: str, state: str) -> mock.Mock:
-    return mock.Mock(task_id=task_id, state=state)
+def _states(run_id: str = _RUN_ID, **task_states: str) -> dict[str, dict[str, str]]:
+    """Shape the ``get_task_states`` return value: ``{run_id: {task_id: state}}``."""
+    return {run_id: dict(task_states)}
 
 
-def _context(*tis: mock.Mock, run_id: str = "scheduled__2026-07-20") -> dict[str, object]:
-    return {"dag_run": mock.Mock(get_task_instances=lambda: list(tis)), "run_id": run_id}
+class FailedTaskIdsTest(unittest.TestCase):
+    def test_lists_only_failed_and_excludes_alert_task(self) -> None:
+        with mock.patch(
+            _GET_TASK_STATES,
+            return_value=_states(
+                model_a="failed",
+                model_b="success",
+                model_c="upstream_failed",
+                **{slack_alerts.FAILURE_ALERT_TASK_ID: "running"},
+            ),
+        ):
+            result = slack_alerts._get_failed_task_ids("dbt_acme", _RUN_ID)
 
+        self.assertEqual(result, ["model_a"])
 
-class FormatFailedTasksTest(unittest.TestCase):
-    def test_lists_failed_tasks_and_excludes_alert_task(self) -> None:
-        ctx = _context(
-            _ti("model_a", "failed"),
-            _ti("model_b", "success"),
-            _ti(slack_alerts.FAILURE_ALERT_TASK_ID, "failed"),
-        )
-        result = slack_alerts._format_failed_tasks(ctx, "[t]")
-        self.assertIn("• `model_a`", result)
-        self.assertNotIn("model_b", result)
-        self.assertNotIn(slack_alerts.FAILURE_ALERT_TASK_ID, result)
+    def test_returns_sorted_failures(self) -> None:
+        with mock.patch(
+            _GET_TASK_STATES,
+            return_value=_states(zeta="failed", alpha="failed", mid="failed"),
+        ):
+            result = slack_alerts._get_failed_task_ids("dbt_acme", _RUN_ID)
 
-    def test_caps_at_three_and_counts_remainder(self) -> None:
-        ctx = _context(*(_ti(f"m{i}", "failed") for i in range(5)))
-        result = slack_alerts._format_failed_tasks(ctx, "[t]")
-        self.assertEqual(result.count("• `m"), 3)
-        self.assertIn("…and 2 more", result)
+        self.assertEqual(result, ["alpha", "mid", "zeta"])
 
-    def test_falls_back_when_no_dag_run(self) -> None:
-        result = slack_alerts._format_failed_tasks({"run_id": "x"}, "[t]")
-        self.assertIn("Airflow UI", result)
+    def test_empty_when_no_failures(self) -> None:
+        with mock.patch(_GET_TASK_STATES, return_value=_states(model_a="success")):
+            self.assertEqual(slack_alerts._get_failed_task_ids("dbt_acme", _RUN_ID), [])
 
-    def test_falls_back_when_enumeration_raises(self) -> None:
-        dag_run = mock.Mock()
-        dag_run.get_task_instances.side_effect = RuntimeError("no db access")
-        result = slack_alerts._format_failed_tasks(
-            {"dag_run": dag_run, "run_id": "x"}, "[t]"
-        )
-        self.assertIn("Airflow UI", result)
-
-    def test_falls_back_when_only_non_failed(self) -> None:
-        ctx = _context(_ti("model_a", "success"))
-        result = slack_alerts._format_failed_tasks(ctx, "[t]")
-        self.assertIn("Airflow UI", result)
+    def test_empty_when_run_id_absent(self) -> None:
+        with mock.patch(_GET_TASK_STATES, return_value={}):
+            self.assertEqual(slack_alerts._get_failed_task_ids("dbt_acme", _RUN_ID), [])
 
 
 class SendFailureAlertTest(unittest.TestCase):
-    def test_sends_message_on_happy_path(self) -> None:
-        ctx = _context(_ti("model_a", "failed"))
-        with mock.patch(f"{_MODULE}.SlackWebhookHook") as hook:
+    def test_sends_message_listing_all_failed_tasks(self) -> None:
+        ctx = {"run_id": _RUN_ID}
+        with mock.patch(
+            _GET_TASK_STATES,
+            return_value=_states(model_a="failed", model_b="failed", ok="success"),
+        ), mock.patch(f"{_MODULE}.SlackWebhookHook") as hook:
             slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
 
             hook.assert_called_once_with(slack_webhook_conn_id=slack_alerts.SLACK_CONN_ID)
             hook.return_value.send_text.assert_called_once()
             sent = hook.return_value.send_text.call_args.args[0]
             self.assertIn("`acme`", sent)
+            self.assertIn("Failed Tasks (2)", sent)
             self.assertIn("• `model_a`", sent)
+            self.assertIn("• `model_b`", sent)
+            self.assertIn(_RUN_ID, sent)
+
+    def test_skips_when_nothing_failed(self) -> None:
+        ctx = {"run_id": _RUN_ID}
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_a="success")
+        ), mock.patch(f"{_MODULE}.SlackWebhookHook") as hook:
+            with self.assertRaises(AirflowSkipException):
+                slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
+
+            hook.assert_not_called()
 
     def test_raises_when_send_fails(self) -> None:
         # Passthrough retry so the test doesn't sleep through tenacity backoff, and
         # so a send failure surfaces (the task must go red, not swallow the error).
-        ctx = _context(_ti("model_a", "failed"))
-        with mock.patch(f"{_MODULE}._send_with_retry", lambda fn: fn), mock.patch(
+        ctx = {"run_id": _RUN_ID}
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_a="failed")
+        ), mock.patch(f"{_MODULE}._send_with_retry", lambda fn: fn), mock.patch(
             f"{_MODULE}.SlackWebhookHook"
         ) as hook:
             hook.return_value.send_text.side_effect = RuntimeError("slack down")
@@ -78,7 +96,7 @@ class SendFailureAlertTest(unittest.TestCase):
 
 
 class BuildFailureAlertTaskTest(unittest.TestCase):
-    def test_task_has_one_failed_trigger_rule(self) -> None:
+    def test_task_has_all_done_trigger_rule(self) -> None:
         from datetime import datetime
 
         from airflow import DAG
@@ -89,7 +107,7 @@ class BuildFailureAlertTaskTest(unittest.TestCase):
 
         operator = result.operator
         self.assertEqual(operator.task_id, slack_alerts.FAILURE_ALERT_TASK_ID)
-        self.assertEqual(operator.trigger_rule, TriggerRule.ONE_FAILED)
+        self.assertEqual(operator.trigger_rule, TriggerRule.ALL_DONE)
 
 
 if __name__ == "__main__":

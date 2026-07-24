@@ -14,7 +14,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory.make_dbt_dag` | Cosmos-only factory (no chunk task groups) for all other tenants. |
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
-| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `one_failed` task (added by the factories) that posts to Slack via the `sundial_slack_webhook` connection when any task fails. Runs on a worker so its logs are visible (Airflow 3 hides DAG-level callback logs). |
+| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task (added by the factories) that posts one Slack alert via the `sundial_slack_webhook` connection listing every failed task (self-skips on success). Runs on a worker so its logs are visible (Airflow 3 hides DAG-level callback logs). |
 | `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -83,8 +83,9 @@ legacy_dag = make_dbt_dag(
 ```
 
 The factory takes care of:
-- Slack failure alert as a terminal `one_failed` task (`slack_failure_alert`)
-  that posts via the `sundial_slack_webhook` connection when any task fails.
+- Slack failure alert as a terminal `all_done` task (`slack_failure_alert`) that
+  posts one message listing every failed task via the `sundial_slack_webhook`
+  connection (self-skips on success).
 - `tenant:<name>` DAG tag.
 - The full standard parameter set (`backfill_mode`, `select`, `exclude`,
   `skip_tests`, `empty`, `vars`, `target`, ...).
