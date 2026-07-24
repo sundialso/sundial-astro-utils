@@ -30,7 +30,7 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import dag_failure_alert
+from sundial_airflow.slack_alerts import build_failure_alert_task
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
@@ -153,7 +153,6 @@ def make_dbt_dag(
         render_template_as_native_obj=True,
         default_args=merged_default_args,
         params=params,
-        on_failure_callback=dag_failure_alert,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
@@ -375,7 +374,15 @@ def make_dbt_dag(
         # env vars are set on the deployment. Waits on both branches (source
         # tests + models); a source test with no dependent model would otherwise
         # still be running when notify fires.
-        [source_test_group, dbt_models] >> build_notify_task(tenant=tenant, dag_id=dag_id)
+        notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
+        [source_test_group, dbt_models] >> notify_task
+
+        # Terminal Slack failure alert — ``one_failed`` so it fires on any task
+        # failure (including ``notify``). A worker task, not a DAG-level callback,
+        # which Airflow 3 runs unreliably in the DAG processor.
+        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
+            tenant=tenant, dag_id=dag_id
+        )
 
         run_tasks_by_model = _collect_run_tasks(dbt_models)
         for (source_name, table_name), test_task in source_test_tasks.items():
