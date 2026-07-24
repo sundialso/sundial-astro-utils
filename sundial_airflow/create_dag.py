@@ -51,7 +51,7 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import dag_failure_alert
+from sundial_airflow.slack_alerts import build_failure_alert_task
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
@@ -212,9 +212,8 @@ def create_dag(
         DbtCompletionsListener can locate the ``dbt_completions`` table on a
         manual UI state change. Optional; the listener no-ops without it.
     default_args:
-        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. The factory wires
-        ``dag_failure_alert`` as the DAG-level ``on_failure_callback`` so it
-        fires once per failed DAG run rather than on every failed task.
+        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. Slack failure alerts are
+        handled separately by the terminal ``slack_failure_alert`` task.
     extra_tags:
         Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
     pre_tasks:
@@ -279,7 +278,6 @@ def create_dag(
         render_template_as_native_obj=True,
         default_args=merged_default_args,
         params=params,
-        on_failure_callback=dag_failure_alert,
     )
     def _build():
         @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
@@ -626,6 +624,15 @@ def create_dag(
         # every tenant (not opt-in) so consumers get it with no repo changes;
         # self-skips unless SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
         # env vars are set on the deployment.
-        [source_test_group, dbt_models] >> build_notify_task(tenant=tenant, dag_id=dag_id)
+        notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
+        [source_test_group, dbt_models] >> notify_task
+
+        # Terminal Slack failure alert — ``all_done`` so it waits for the whole
+        # run, then posts one alert listing every failed task (self-skips on
+        # success). A worker task, not a DAG-level callback, which Airflow 3 runs
+        # unreliably in the DAG processor.
+        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
+            tenant=tenant, dag_id=dag_id
+        )
 
     return _build()

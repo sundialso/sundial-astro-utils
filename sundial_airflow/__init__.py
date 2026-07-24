@@ -12,7 +12,7 @@ from sundial_airflow.listeners import (
     SundialDbtCompletionsPlugin,
 )
 from sundial_airflow.profiles import bigquery_profile_args
-from sundial_airflow.slack_alerts import dag_failure_alert
+from sundial_airflow.slack_alerts import build_failure_alert_task
 from sundial_airflow.warehouses import WarehouseAdapter, get_adapter, register
 
 __all__ = [
@@ -21,7 +21,7 @@ __all__ = [
     "make_dbt_dag_legacy",
     "is_chunking_enabled",
     "resolve_dag_schedules",
-    "dag_failure_alert",
+    "build_failure_alert_task",
     "DbtCompletionsListener",
     "SundialDbtCompletionsPlugin",
     # BigQuery dbt profile-arg builder (Dataproc-aware) shared across tenants.
