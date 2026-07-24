@@ -23,6 +23,22 @@ _SOURCE_REF_RE = re.compile(
     r"\{\{\s*source\s*\(\s*['\"](\w+)['\"]\s*,\s*['\"](\w+)['\"]\s*\)"
 )
 
+# dbt 1.8 renamed the ``tests:`` YAML property to ``data_tests:`` (to disambiguate
+# data tests from the new unit tests). Both keys are accepted by dbt and are
+# functionally identical, so we honour either spelling.
+_TEST_KEYS: tuple[str, ...] = ("tests", "data_tests")
+
+
+def _table_has_tests(table: dict) -> bool:
+    """True if a source-table YAML block declares table- or column-level tests."""
+    if any(table.get(key) for key in _TEST_KEYS):
+        return True
+    return any(
+        col.get(key)
+        for col in table.get("columns", [])
+        for key in _TEST_KEYS
+    )
+
 
 def discover_source_tables_with_tests(
     project_path: str | Path,
@@ -85,12 +101,7 @@ def discover_source_tables_with_tests(
             source_name = source["name"]
             for table in source.get("tables", []):
                 table_name = table["name"]
-                has_tests = bool(table.get("tests"))
-                if not has_tests:
-                    has_tests = any(
-                        col.get("tests") for col in table.get("columns", [])
-                    )
-                if has_tests:
+                if _table_has_tests(table):
                     found.add((source_name, table_name))
 
     return sorted(found)
