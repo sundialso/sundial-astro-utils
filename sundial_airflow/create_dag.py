@@ -57,6 +57,7 @@ from sundial_airflow.source_discovery import (
     discover_source_to_models,
 )
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
+from sundial_airflow.warehouse_sizing import build_warehouse_sizing_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -550,6 +551,16 @@ def create_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
+        # Snowflake: resize WH before dbt; restore after backfill (teardown).
+        before_dbt = dbt_args
+        restore_wh = None
+        if warehouse == "snowflake":
+            resize_wh, restore_wh = build_warehouse_sizing_tasks(
+                conn_id=warehouse_conn_id,
+            )
+            dbt_args >> resize_wh
+            before_dbt = resize_wh
+
         # Per-source fan-out (no global gate):
         #
         #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
@@ -559,8 +570,10 @@ def create_dag(
         # that consume that source; sibling branches are unaffected. Models
         # with no source dependency (or whose sources have no tests) just run
         # after ``prepare_dbt_args``.
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        before_dbt >> source_test_group
+        before_dbt >> dbt_models
+        if restore_wh is not None:
+            [source_test_group, dbt_models] >> restore_wh
 
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
@@ -577,7 +590,7 @@ def create_dag(
                 profile_config=profile_config,
                 profile_config_factory=profile_config_factory,
                 chunk_var_keys=chunk_var_keys,
-                upstream_task=dbt_args,
+                upstream_task=before_dbt,
                 parent_group=dbt_models,
             )
             models_by_key = {m.node_key: m for m in _chunk_order}

@@ -36,6 +36,7 @@ from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
 )
+from sundial_airflow.warehouse_sizing import build_warehouse_sizing_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ def make_dbt_dag(
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
+    warehouse_conn_id: str | None = None,
 ):
     """Build a Cosmos-only Sundial dbt DAG (no chunk task groups)."""
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
@@ -365,8 +367,20 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        # Snowflake: resize WH before dbt; restore after backfill (teardown).
+        before_dbt = dbt_args
+        restore_wh = None
+        if warehouse == "snowflake":
+            resize_wh, restore_wh = build_warehouse_sizing_tasks(
+                conn_id=warehouse_conn_id,
+            )
+            dbt_args >> resize_wh
+            before_dbt = resize_wh
+
+        before_dbt >> source_test_group
+        before_dbt >> dbt_models
+        if restore_wh is not None:
+            [source_test_group, dbt_models] >> restore_wh
 
         # Terminal notification trigger — fires the tenant's enabled
         # notification triggers once the pipeline completes successfully (backfill
