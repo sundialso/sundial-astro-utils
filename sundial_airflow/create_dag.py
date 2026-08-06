@@ -165,6 +165,7 @@ def create_dag(
     extra_tags: list[str] | None = None,
     pre_tasks: list[Callable[[], Any]] | None = None,
     max_active_tasks: int = 8,
+    max_active_runs: int = 1,
     catchup: bool = False,
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
@@ -219,9 +220,11 @@ def create_dag(
     pre_tasks:
         Optional list of zero-arg callables that return TaskFlow tasks; they
         run before ``prepare_dbt_args``.
-    max_active_tasks, catchup, target_choices, sources_yml_candidates,
-    recursive_tests:
+    max_active_tasks, max_active_runs, catchup, target_choices,
+    sources_yml_candidates, recursive_tests:
         Tuning knobs with sensible defaults; see the implementation.
+        ``max_active_runs`` defaults to ``1`` so concurrent DAG runs of the
+        same DAG cannot overlap.
     """
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
@@ -275,6 +278,7 @@ def create_dag(
         catchup=catchup,
         tags=tags,
         max_active_tasks=max_active_tasks,
+        max_active_runs=max_active_runs,
         render_template_as_native_obj=True,
         default_args=merged_default_args,
         params=params,
