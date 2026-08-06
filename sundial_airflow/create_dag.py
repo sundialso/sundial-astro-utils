@@ -226,6 +226,11 @@ def create_dag(
         Tuning knobs with sensible defaults; see the implementation.
         ``max_active_runs`` defaults to ``1`` so concurrent DAG runs of the
         same DAG cannot overlap.
+    warehouse_conn_id:
+        Snowflake only. Airflow connection id for the warehouse resize/restore
+        setup-teardown tasks; the warehouse name is read from the connection's
+        ``extra.warehouse``. Defaults to the tenant's default Snowflake
+        connection when omitted, and is ignored for BigQuery.
     """
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")

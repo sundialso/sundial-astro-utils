@@ -117,7 +117,14 @@ def make_dbt_dag(
     recursive_tests: bool = True,
     warehouse_conn_id: str | None = None,
 ):
-    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups)."""
+    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups).
+
+    ``warehouse_conn_id`` (Snowflake only) is the Airflow connection id for the
+    warehouse resize/restore setup-teardown tasks; the warehouse name is read
+    from the connection's ``extra.warehouse``, defaulting to the tenant's
+    default Snowflake connection when omitted and ignored for BigQuery. See
+    ``create_dag`` and ``README.md`` for the shared arguments.
+    """
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
 

@@ -15,7 +15,7 @@ import os
 from datetime import timedelta
 from typing import Any
 
-from airflow.decorators import setup, teardown
+from airflow.decorators import setup, task, teardown
 from airflow.exceptions import AirflowSkipException
 
 from sundial_airflow.task_log import log_block, quiet_sql_hook_loggers
@@ -136,7 +136,7 @@ def resize_snowflake_warehouse(
             f"  dag_id:          {dag_id}",
             f"  run_id:          {run_id}",
             f"  backfill_mode:   {mode}",
-            f"  result:          NO-OP — warehouse or connection not resolvable",
+            "  result:          NO-OP — warehouse or connection not resolvable",
         ])
         return {
             "warehouse": None, "size": None,
@@ -183,7 +183,7 @@ def restore_snowflake_warehouse(
             f"  dag_id:          {dag_id}",
             f"  run_id:          {run_id}",
             f"  backfill_mode:   {mode}",
-            f"  result:          SKIP — not a backfill",
+            "  result:          SKIP — not a backfill",
         ])
         raise AirflowSkipException("not a backfill; steady-state already set by setup")
 
@@ -214,15 +214,16 @@ def build_warehouse_sizing_tasks(*, conn_id: str | None = None) -> tuple[Any, An
     Explicit ``resize >> restore`` edge pairs setup with teardown.
     """
 
-    @setup(task_id=RESIZE_TASK_ID)
+    @setup
+    @task(task_id=RESIZE_TASK_ID)
     def resize_snowflake_wh(**context: Any) -> dict[str, Any]:
         return resize_snowflake_warehouse(conn_id=conn_id, **_task_context(context))
 
-    @teardown(
+    @teardown(on_failure_fail_dagrun=True)
+    @task(
         task_id=RESTORE_TASK_ID,
         retries=_RESTORE_RETRIES,
         retry_delay=_RESTORE_RETRY_DELAY,
-        on_failure_fail_dagrun=True,
     )
     def restore_snowflake_wh(**context: Any) -> None:
         restore_snowflake_warehouse(conn_id=conn_id, **_task_context(context))

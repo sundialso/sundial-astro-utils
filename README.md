@@ -120,6 +120,19 @@ WH name comes from the Snowflake connection (`extra.warehouse`). Override sizes
 per Astro deployment as needed. Setup heals drift on normal runs; teardown
 restores after backfill (including mark-failed/success).
 
+`warehouse_conn_id` (a `create_dag` / `make_dbt_dag` argument) selects the
+Snowflake connection whose `extra.warehouse` names the warehouse to resize. It
+defaults to the tenant's default Snowflake connection when omitted, and is
+ignored for BigQuery:
+
+```python
+create_dag(
+    ...,
+    warehouse="snowflake",
+    warehouse_conn_id=SNOWFLAKE_CONN_ID,
+)
+```
+
 ## Chunking
 
 Chunking is built into `create_dag` — there is no separate backfill DAG.
