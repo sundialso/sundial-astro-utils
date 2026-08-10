@@ -15,6 +15,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
 | `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task (added by the factories) that posts one Slack alert via the `sundial_slack_webhook` connection listing every failed task (self-skips on success). Runs on a worker so its logs are visible (Airflow 3 hides DAG-level callback logs). |
+| `sundial_airflow.warehouse_sizing` | Snowflake setup/teardown that sets WH size (`Medium` / `Large` defaults; overridable via env). |
 | `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -105,6 +106,32 @@ pip install -e ~/Documents/sundial-airflow-utils
 
 That overrides the `git+https://...` URL from `requirements.txt` until you run
 `pip install -r requirements.txt --force-reinstall` again.
+
+## Snowflake warehouse resize
+
+Snowflake DAGs get a setup/teardown pair that sets warehouse size:
+
+| Env var | Purpose | Default |
+| --- | --- | --- |
+| `SUNDIAL_SF_WH_SIZE` | Steady-state size | `Medium` |
+| `SUNDIAL_SF_BACKFILL_WH_SIZE` | Backfill size (`full` / `partial`) | `Large` |
+
+WH name comes from the Snowflake connection (`extra.warehouse`). Override sizes
+per Astro deployment as needed. Setup heals drift on normal runs; teardown
+restores after backfill (including mark-failed/success).
+
+`warehouse_conn_id` (a `create_dag` / `make_dbt_dag` argument) selects the
+Snowflake connection whose `extra.warehouse` names the warehouse to resize. It
+defaults to the tenant's default Snowflake connection when omitted, and is
+ignored for BigQuery:
+
+```python
+create_dag(
+    ...,
+    warehouse="snowflake",
+    warehouse_conn_id=SNOWFLAKE_CONN_ID,
+)
+```
 
 ## Chunking
 

@@ -36,6 +36,7 @@ from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
 )
+from sundial_airflow.warehouse_sizing import build_warehouse_sizing_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +115,9 @@ def make_dbt_dag(
     target_choices: list[str] | None = None,
     sources_yml_candidates: list[Path] | None = None,
     recursive_tests: bool = True,
+    warehouse_conn_id: str | None = None,
 ):
-    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups)."""
+    """Build a Cosmos-only Sundial dbt DAG (no chunking). See ``create_dag`` for param docs."""
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
 
@@ -365,25 +367,27 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        dbt_args >> source_test_group
-        dbt_args >> dbt_models
+        before_dbt = dbt_args
+        restore_wh = None
+        if warehouse == "snowflake":
+            resize_wh, restore_wh = build_warehouse_sizing_tasks(
+                conn_id=warehouse_conn_id,
+            )
+            dbt_args >> resize_wh
+            before_dbt = resize_wh
 
-        # Terminal notification trigger — fires the tenant's enabled
-        # notification triggers once the pipeline completes successfully (backfill
-        # runs are skipped). Added for every tenant here (not opt-in) so consumers
-        # get it with no repo changes;
-        # self-skips unless the SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
-        # env vars are set on the deployment. Waits on both branches (source
-        # tests + models); a source test with no dependent model would otherwise
-        # still be running when notify fires.
+        before_dbt >> source_test_group
+        before_dbt >> dbt_models
+        if restore_wh is not None:
+            [source_test_group, dbt_models] >> restore_wh
+
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — ``all_done`` so it waits for the whole
-        # run, then posts one alert listing every failed task (self-skips on
-        # success). A worker task, not a DAG-level callback, which Airflow 3 runs
-        # unreliably in the DAG processor.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
+        alert_upstreams = [source_test_group, dbt_models, notify_task]
+        if restore_wh is not None:
+            alert_upstreams.append(restore_wh)
+        alert_upstreams >> build_failure_alert_task(
             tenant=tenant, dag_id=dag_id
         )
 
