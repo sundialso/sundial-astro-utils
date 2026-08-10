@@ -1,12 +1,22 @@
-"""Snowflake warehouse size setup/teardown for Sundial dbt DAGs.
+"""Snowflake warehouse resize/restore for Sundial dbt DAGs.
 
 Factories wire this when ``warehouse == "snowflake"``:
 
-- setup: backfill → ``SUNDIAL_SF_BACKFILL_WH_SIZE`` (default ``Large``);
+- resize: backfill → ``SUNDIAL_SF_BACKFILL_WH_SIZE`` (default ``Large``);
   otherwise → ``SUNDIAL_SF_WH_SIZE`` (default ``Medium``)
-- teardown: backfill only → restore to ``SUNDIAL_SF_WH_SIZE``
+- restore (``trigger_rule=ALL_DONE``): backfill only → restore to
+  ``SUNDIAL_SF_WH_SIZE``
 
 WH name comes from the Snowflake connection ``extra.warehouse``.
+
+.. note::
+
+   Airflow 3's ``@setup`` / ``@teardown`` decorators require all direct
+   downstream tasks to use ``trigger_rule=ALL_SUCCESS``, which conflicts
+   with the ``none_failed`` trigger rule the Cosmos ``DbtTaskGroup`` sets
+   on model tasks.  We use plain ``@task`` here instead; the
+   ``trigger_rule=ALL_DONE`` on the restore task provides equivalent
+   always-run semantics.
 """
 from __future__ import annotations
 
@@ -15,8 +25,9 @@ import os
 from datetime import timedelta
 from typing import Any
 
-from airflow.decorators import setup, task, teardown
+from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
+from airflow.utils.trigger_rule import TriggerRule
 
 from sundial_airflow.task_log import log_block, quiet_sql_hook_loggers
 
@@ -211,19 +222,18 @@ def build_warehouse_sizing_tasks(*, conn_id: str | None = None) -> tuple[Any, An
     """Return ``(resize_task, restore_task)``.
 
     Wire as ``prepare >> resize >> [work] >> restore``.
-    Explicit ``resize >> restore`` edge pairs setup with teardown.
+    Explicit ``resize >> restore`` edge ensures restore runs after resize.
     """
 
-    @setup
     @task(task_id=RESIZE_TASK_ID)
     def resize_snowflake_wh(**context: Any) -> dict[str, Any]:
         return resize_snowflake_warehouse(conn_id=conn_id, **_task_context(context))
 
-    @teardown(on_failure_fail_dagrun=True)
     @task(
         task_id=RESTORE_TASK_ID,
         retries=_RESTORE_RETRIES,
         retry_delay=_RESTORE_RETRY_DELAY,
+        trigger_rule=TriggerRule.ALL_DONE,
     )
     def restore_snowflake_wh(**context: Any) -> None:
         restore_snowflake_warehouse(conn_id=conn_id, **_task_context(context))
