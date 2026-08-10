@@ -117,14 +117,7 @@ def make_dbt_dag(
     recursive_tests: bool = True,
     warehouse_conn_id: str | None = None,
 ):
-    """Build a Cosmos-only Sundial dbt DAG (no chunk task groups).
-
-    ``warehouse_conn_id`` (Snowflake only) is the Airflow connection id for the
-    warehouse resize/restore setup-teardown tasks; the warehouse name is read
-    from the connection's ``extra.warehouse``, defaulting to the tenant's
-    default Snowflake connection when omitted and ignored for BigQuery. See
-    ``create_dag`` and ``README.md`` for the shared arguments.
-    """
+    """Build a Cosmos-only Sundial dbt DAG (no chunking). See ``create_dag`` for param docs."""
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
 
@@ -374,7 +367,6 @@ def make_dbt_dag(
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        # Snowflake: resize WH before dbt; restore after backfill (teardown).
         before_dbt = dbt_args
         restore_wh = None
         if warehouse == "snowflake":
@@ -389,22 +381,13 @@ def make_dbt_dag(
         if restore_wh is not None:
             [source_test_group, dbt_models] >> restore_wh
 
-        # Terminal notification trigger — fires the tenant's enabled
-        # notification triggers once the pipeline completes successfully (backfill
-        # runs are skipped). Added for every tenant here (not opt-in) so consumers
-        # get it with no repo changes;
-        # self-skips unless the SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
-        # env vars are set on the deployment. Waits on both branches (source
-        # tests + models); a source test with no dependent model would otherwise
-        # still be running when notify fires.
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — ``all_done`` so it waits for the whole
-        # run, then posts one alert listing every failed task (self-skips on
-        # success). A worker task, not a DAG-level callback, which Airflow 3 runs
-        # unreliably in the DAG processor.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
+        alert_upstreams = [source_test_group, dbt_models, notify_task]
+        if restore_wh is not None:
+            alert_upstreams.append(restore_wh)
+        alert_upstreams >> build_failure_alert_task(
             tenant=tenant, dag_id=dag_id
         )
 

@@ -175,62 +175,23 @@ def create_dag(
     warehouse_conn_id: str | None = None,
     chunk_var_keys: tuple[str, str] = ("backfill_start_ts", "backfill_end_ts"),
 ):
-    """Build and register a fully-wired Sundial dbt DAG.
-
-    See ``README.md`` for an end-to-end usage example. All keyword arguments
-    are required unless documented otherwise.
+    """Build and register a chunking-enabled Sundial dbt DAG.
 
     Parameters
     ----------
-    dag_id:
-        Airflow DAG id
-    tenant:
-        Short tenant slug; used in the Slack alert and the
-        ``run_context_tag`` (``"<tenant>_normal"``, etc).
-    warehouse:
-        ``"bigquery"`` or ``"snowflake"``. Controls the ``target_dataset``
-        vs ``target_schema`` var key passed to dbt.
-    dbt_project_path:
-        Absolute path to the dbt project (the directory containing
-        ``dbt_project.yml``).
-    dbt_profile_name:
-        Profile name as it appears in ``profiles.yml``; used by ``dbt ls``
-        when resolving model selection.
-    venv_execution_config:
-        Cosmos ``ExecutionConfig`` pointing at the dbt venv.
-    profile_config_factory:
-        Callable ``(target, dataset_or_schema) -> ProfileConfig``. Tenants
-        keep this in their ``include/constants.py`` so warehouse-specific
-        profile-mapping details (BigQuery vs Snowflake) stay tenant-side.
-    default_dataset_or_schema:
-        The default dataset (BigQuery) or schema (Snowflake) for this tenant.
-        Must match the schema/dataset in the tenant's dbt profile (the value
-        passed to ``profile_config_factory``). Flows into dbt as
-        ``target_dataset`` / ``target_schema`` and drives watermark queries,
-        Cosmos runs, and chunked model runs.
-    default_project:
-        BigQuery project where dbt writes (same value dbt uses for
-        ``var('target_project')``). Passed through ``dbt_vars`` in XCom so the
-        DbtCompletionsListener can locate the ``dbt_completions`` table on a
-        manual UI state change. Optional; the listener no-ops without it.
-    default_args:
-        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. Slack failure alerts are
-        handled separately by the terminal ``slack_failure_alert`` task.
-    extra_tags:
-        Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
-    pre_tasks:
-        Optional list of zero-arg callables that return TaskFlow tasks; they
-        run before ``prepare_dbt_args``.
-    max_active_tasks, max_active_runs, catchup, target_choices,
-    sources_yml_candidates, recursive_tests:
-        Tuning knobs with sensible defaults; see the implementation.
-        ``max_active_runs`` defaults to ``1`` so concurrent DAG runs of the
-        same DAG cannot overlap.
-    warehouse_conn_id:
-        Snowflake only. Airflow connection id for the warehouse resize/restore
-        setup-teardown tasks; the warehouse name is read from the connection's
-        ``extra.warehouse``. Defaults to the tenant's default Snowflake
-        connection when omitted, and is ignored for BigQuery.
+    dag_id:                     Airflow DAG id.
+    tenant:                     Tenant slug (Slack alerts, run_context_tag).
+    warehouse:                  ``"bigquery"`` or ``"snowflake"``.
+    dbt_project_path:           Path to the dbt project directory.
+    dbt_profile_name:           Profile name in ``profiles.yml``.
+    venv_execution_config:      Cosmos ``ExecutionConfig`` for the dbt venv.
+    profile_config_factory:     ``(target, dataset_or_schema) -> ProfileConfig``.
+    default_dataset_or_schema:  Default dataset (BQ) or schema (SF).
+    default_project:            BigQuery project (optional, for completions listener).
+    default_args:               Merged on top of ``DEFAULT_DEFAULT_ARGS``.
+    extra_tags:                 Additional DAG tags.
+    pre_tasks:                  Zero-arg callables run before ``prepare_dbt_args``.
+    warehouse_conn_id:          Snowflake connection for resize/restore (ignored for BQ).
     """
     if warehouse not in ("bigquery", "snowflake"):  # pragma: no cover
         raise ValueError(f"Unsupported warehouse: {warehouse!r}")
@@ -540,23 +501,16 @@ def create_dag(
                 ),
                 "install_deps": False,
                 "pre_execute": skip_unselected,
-                # ``none_failed`` lets a model run when its upstream source
-                # test was *skipped* (skip_tests / empty mode) but still
-                # propagates ``upstream_failed`` if the test actually failed.
                 "trigger_rule": "none_failed",
             },
         )
 
-        # Optional pre-tasks (e.g. ami_dbt's S3 -> Snowflake EMR ingest) run
-        # serially before ``prepare_dbt_args``. ``pre_tasks`` items are
-        # zero-arg factories that build the TaskFlow task instance.
         pre_task_chain = [factory() for factory in pre_tasks or []]
         for prev, nxt in zip(pre_task_chain, pre_task_chain[1:]):
             prev >> nxt
         if pre_task_chain:
             pre_task_chain[-1] >> dbt_args
 
-        # Snowflake: resize WH before dbt; restore after backfill (teardown).
         before_dbt = dbt_args
         restore_wh = None
         if warehouse == "snowflake":
@@ -566,19 +520,8 @@ def create_dag(
             dbt_args >> resize_wh
             before_dbt = resize_wh
 
-        # Per-source fan-out (no global gate):
-        #
-        #   prepare_dbt_args ─┬─ test_s_t ──→ models that select source(s,t)
-        #                     └─ <models with no tested source> (run after prepare)
-        #
-        # A failing ``test_s_t`` only flips ``upstream_failed`` on the models
-        # that consume that source; sibling branches are unaffected. Models
-        # with no source dependency (or whose sources have no tests) just run
-        # after ``prepare_dbt_args``.
         before_dbt >> source_test_group
         before_dbt >> dbt_models
-        if restore_wh is not None:
-            [source_test_group, dbt_models] >> restore_wh
 
         cosmos_runs = _collect_run_tasks(dbt_models)
         run_tasks_by_model = dict(cosmos_runs)
@@ -640,20 +583,16 @@ def create_dag(
                     continue
                 test_task >> run_task
 
-        # Terminal notification trigger — appended after the full graph (chunk
-        # groups + source-test wiring) is built so it waits on every branch,
-        # including chunk sub-groups added to ``dbt_models`` above. Added for
-        # every tenant (not opt-in) so consumers get it with no repo changes;
-        # self-skips unless SUNDIAL_AI_SERVICE_URL + NOTIFICATION_TRIGGER_SECRET
-        # env vars are set on the deployment.
+        if restore_wh is not None:
+            [source_test_group, dbt_models] >> restore_wh
+
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — ``all_done`` so it waits for the whole
-        # run, then posts one alert listing every failed task (self-skips on
-        # success). A worker task, not a DAG-level callback, which Airflow 3 runs
-        # unreliably in the DAG processor.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
+        alert_upstreams = [source_test_group, dbt_models, notify_task]
+        if restore_wh is not None:
+            alert_upstreams.append(restore_wh)
+        alert_upstreams >> build_failure_alert_task(
             tenant=tenant, dag_id=dag_id
         )
 

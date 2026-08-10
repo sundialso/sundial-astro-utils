@@ -1,4 +1,4 @@
-"""Tests for Snowflake warehouse sizing helpers."""
+"""Unit tests for sundial_airflow.warehouse_sizing."""
 from __future__ import annotations
 
 import unittest
@@ -141,12 +141,23 @@ class RestoreTest(unittest.TestCase):
                 conn_id="sf", params={"backfill_mode": "none"}, **self._CALL
             )
 
-    def test_backfill_restores(self) -> None:
+    def test_full_backfill_restores(self) -> None:
         with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
             wh, "_resolve_warehouse", return_value=("sf", "COMPUTE_WH")
         ), mock.patch.object(wh, "alter_warehouse_size") as alter:
             wh.restore_snowflake_warehouse(
                 conn_id="sf", params={"backfill_mode": "full"}, **self._CALL
+            )
+        alter.assert_called_once_with(
+            conn_id="sf", warehouse="COMPUTE_WH", size=wh._DEFAULT_WH_SIZE
+        )
+
+    def test_partial_backfill_restores(self) -> None:
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch.object(
+            wh, "_resolve_warehouse", return_value=("sf", "COMPUTE_WH")
+        ), mock.patch.object(wh, "alter_warehouse_size") as alter:
+            wh.restore_snowflake_warehouse(
+                conn_id="sf", params={"backfill_mode": "partial"}, **self._CALL
             )
         alter.assert_called_once_with(
             conn_id="sf", warehouse="COMPUTE_WH", size=wh._DEFAULT_WH_SIZE
@@ -180,21 +191,36 @@ class AlterTest(unittest.TestCase):
         self.assertIn('ALTER WAREHOUSE "AMI_ASTRO_WH"', sql)
         self.assertIn("WAREHOUSE_SIZE = 'Medium'", sql)
 
-    def test_rejects_semicolon(self) -> None:
-        with self.assertRaises(ValueError):
-            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="Medium'; DROP")
+    def test_accepts_all_valid_sizes(self) -> None:
+        for size in wh._VALID_SNOWFLAKE_SIZES:
+            hook = mock.Mock()
+            fake = mock.Mock(SnowflakeHook=mock.Mock(return_value=hook))
+            with mock.patch.dict(
+                "sys.modules",
+                {
+                    "airflow.providers.snowflake": mock.Mock(),
+                    "airflow.providers.snowflake.hooks": mock.Mock(),
+                    "airflow.providers.snowflake.hooks.snowflake": fake,
+                },
+            ):
+                wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size=size)
+            self.assertTrue(hook.run.called, f"Expected SQL call for size={size!r}")
 
-    def test_rejects_single_quote(self) -> None:
+    def test_rejects_invalid_size(self) -> None:
         with self.assertRaises(ValueError):
-            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="Large' OR '1")
+            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="Huge")
 
-    def test_rejects_double_quote(self) -> None:
+    def test_rejects_typo(self) -> None:
         with self.assertRaises(ValueError):
-            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size='Med"ium')
+            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="Mediun")
 
     def test_rejects_empty(self) -> None:
         with self.assertRaises(ValueError):
             wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="")
+
+    def test_rejects_injection_attempt(self) -> None:
+        with self.assertRaises(ValueError):
+            wh.alter_warehouse_size(conn_id="sf", warehouse="WH", size="Medium'; DROP")
 
 
 if __name__ == "__main__":

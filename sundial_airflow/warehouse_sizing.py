@@ -1,23 +1,4 @@
-"""Snowflake warehouse resize/restore for Sundial dbt DAGs.
-
-Factories wire this when ``warehouse == "snowflake"``:
-
-- resize: backfill → ``SUNDIAL_SF_BACKFILL_WH_SIZE`` (default ``Large``);
-  otherwise → ``SUNDIAL_SF_WH_SIZE`` (default ``Medium``)
-- restore (``trigger_rule=ALL_DONE``): backfill only → restore to
-  ``SUNDIAL_SF_WH_SIZE``
-
-WH name comes from the Snowflake connection ``extra.warehouse``.
-
-.. note::
-
-   Airflow 3's ``@setup`` / ``@teardown`` decorators require all direct
-   downstream tasks to use ``trigger_rule=ALL_SUCCESS``, which conflicts
-   with the ``none_failed`` trigger rule the Cosmos ``DbtTaskGroup`` sets
-   on model tasks.  We use plain ``@task`` here instead; the
-   ``trigger_rule=ALL_DONE`` on the restore task provides equivalent
-   always-run semantics.
-"""
+"""Snowflake warehouse resize/restore tasks for Sundial dbt DAGs."""
 from __future__ import annotations
 
 import logging
@@ -45,19 +26,25 @@ _BACKFILL_MODES = frozenset({"full", "partial"})
 _RESTORE_RETRIES = 5
 _RESTORE_RETRY_DELAY = timedelta(seconds=60)
 
+_VALID_SNOWFLAKE_SIZES = frozenset({
+    "X-Small", "Small", "Medium", "Large", "X-Large",
+    "2X-Large", "3X-Large", "4X-Large", "5X-Large", "6X-Large",
+})
+
 
 def _env_size(env_var: str, default: str) -> tuple[str, str]:
-    """Return ``(size, source_label)`` — source is the env var name or ``"default"``."""
+    """Return ``(size, source_label)`` from env var or default."""
     raw = (os.environ.get(env_var) or "").strip()
     return (raw, env_var) if raw else (default, "default")
 
 
 def _backfill_mode(params: dict[str, Any] | None) -> str:
+    """Return ``backfill_mode`` from params (default ``"none"``)."""
     return str((params or {}).get("backfill_mode", "none"))
 
 
 def _quote_ident(name: str) -> str:
-    """Double-quote a Snowflake identifier, escaping embedded double-quotes."""
+    """Double-quote and uppercase a Snowflake identifier."""
     stripped = name.strip()
     if not stripped:
         raise ValueError("Warehouse name must not be empty")
@@ -65,6 +52,7 @@ def _quote_ident(name: str) -> str:
 
 
 def _warehouse_from_conn(conn_id: str) -> str | None:
+    """Return the warehouse name from the connection's extras, or ``None``."""
     from airflow.hooks.base import BaseHook
 
     extra = BaseHook.get_connection(conn_id).extra_dejson or {}
@@ -81,7 +69,7 @@ def _resolve_conn_id(conn_id: str | None) -> str | None:
 
         adapter = get_adapter("snowflake")
         return adapter.resolve_conn_id() if adapter else None
-    except Exception:
+    except (ImportError, AttributeError, LookupError):
         logger.warning("Failed to resolve Snowflake connection", exc_info=True)
         return None
 
@@ -98,7 +86,7 @@ def _resolve_warehouse(conn_id: str | None) -> tuple[str, str] | None:
 
 
 def _task_context(context: dict[str, Any]) -> dict[str, Any]:
-    """Extract the fields resize/restore need from an Airflow task context."""
+    """Pick resize/restore kwargs from an Airflow task context."""
     return {
         "params": context.get("params"),
         "dag_id": str(context["dag"].dag_id),
@@ -107,9 +95,12 @@ def _task_context(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def alter_warehouse_size(*, conn_id: str, warehouse: str, size: str) -> None:
-    """``ALTER WAREHOUSE … SET WAREHOUSE_SIZE = …`` (idempotent)."""
-    if not size or any(ch in size for ch in "\"';"):
-        raise ValueError(f"Invalid warehouse size: {size!r}")
+    """``ALTER WAREHOUSE … SET WAREHOUSE_SIZE``."""
+    if size not in _VALID_SNOWFLAKE_SIZES:
+        raise ValueError(
+            f"Invalid warehouse size: {size!r}. "
+            f"Valid: {sorted(_VALID_SNOWFLAKE_SIZES)}"
+        )
     try:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
     except ImportError as exc:  # pragma: no cover
@@ -131,11 +122,7 @@ def resize_snowflake_warehouse(
     dag_id: str,
     run_id: str,
 ) -> dict[str, Any]:
-    """Setup: backfill → large size; normal → steady-state (heals drift).
-
-    Never raises ``AirflowSkipException`` — a skip would cascade to all
-    downstream work tasks.  Returns a no-op dict when config is missing.
-    """
+    """Resize warehouse: backfill size or steady-state. No-ops if unresolvable."""
     mode = _backfill_mode(params)
     is_backfill = mode in _BACKFILL_MODES
     steady_size, steady_src = _env_size(_WH_SIZE_ENV, _DEFAULT_WH_SIZE)
@@ -143,6 +130,12 @@ def resize_snowflake_warehouse(
 
     resolved = _resolve_warehouse(conn_id)
     if not resolved:
+        logger.warning(
+            "Warehouse resize NO-OP: connection or warehouse not resolvable "
+            "(conn_id=%r, dag_id=%s)",
+            conn_id,
+            dag_id,
+        )
         log_block(RESIZE_TASK_ID, [
             f"  dag_id:          {dag_id}",
             f"  run_id:          {run_id}",
@@ -187,7 +180,7 @@ def restore_snowflake_warehouse(
     dag_id: str,
     run_id: str,
 ) -> None:
-    """Teardown: restore steady-state size after backfill (skip otherwise)."""
+    """Restore warehouse to steady-state size. Skips non-backfill runs."""
     mode = _backfill_mode(params)
     if mode not in _BACKFILL_MODES:
         log_block(RESTORE_TASK_ID, [
@@ -219,11 +212,7 @@ def restore_snowflake_warehouse(
 
 
 def build_warehouse_sizing_tasks(*, conn_id: str | None = None) -> tuple[Any, Any]:
-    """Return ``(resize_task, restore_task)``.
-
-    Wire as ``prepare >> resize >> [work] >> restore``.
-    Explicit ``resize >> restore`` edge ensures restore runs after resize.
-    """
+    """Return ``(resize_task, restore_task)`` with a ``resize >> restore`` edge."""
 
     @task(task_id=RESIZE_TASK_ID)
     def resize_snowflake_wh(**context: Any) -> dict[str, Any]:
