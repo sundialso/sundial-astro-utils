@@ -14,7 +14,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory.make_dbt_dag` | Cosmos-only factory (no chunk task groups) for all other tenants. |
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
-| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task (added by the factories) that posts one Slack alert listing every failed task (self-skips on success). Posts via the `astro_alerts_new` Slack API connection to `#astro-alerts-testing` by default; override per deployment with `SUNDIAL_SLACK_ALERT_CHANNEL`. Falls back to the legacy `sundial_slack_webhook` connection if the new app is not configured. Runs on a worker so its logs are visible (Airflow 3 hides DAG-level callback logs). |
+| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task that posts one Slack alert listing failed tasks (skips on success). Channel: `SUNDIAL_SLACK_ALERT_CHANNEL` or `#etl-alerts`. |
 | `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -84,10 +84,7 @@ legacy_dag = make_dbt_dag(
 
 The factory takes care of:
 - Slack failure alert as a terminal `all_done` task (`slack_failure_alert`) that
-  posts one message listing every failed task via the `astro_alerts_new` Slack
-  app (self-skips on success). Default channel is `#astro-alerts-testing`; set
-  `SUNDIAL_SLACK_ALERT_CHANNEL` on a deployment to override. Invite
-  `@astro_alerts_new` into the target channel (required for private channels).
+  posts one message listing every failed task (skips on success).
 - `tenant:<name>` DAG tag.
 - The full standard parameter set (`backfill_mode`, `select`, `exclude`,
   `skip_tests`, `empty`, `vars`, `target`, ...).
@@ -96,33 +93,13 @@ The factory takes care of:
 - Per-source-table `DbtTestLocalOperator`s.
 - The Cosmos `DbtTaskGroup`.
 
-## Slack failure alerts (`astro_alerts_new`)
+## Slack failure alerts
 
-Incoming Webhooks are locked to one channel, so alerts post via Slack's
-`chat.postMessage` API. That is what makes a per-deployment channel override
-possible.
+Posts via Slack API connection `astro-alerts-bot`.
 
-| Setting | Default | Override |
-| --- | --- | --- |
-| Slack app | `astro_alerts_new` | — |
-| Airflow connection | `astro_alerts_new` (type **Slack API**, bot token in password) | Workspace auto-link; same token for every deployment |
-| Channel | `#astro-alerts-testing` (`SUNDIAL_SLACK_ALERT_CHANNEL`) | Set `SUNDIAL_SLACK_ALERT_CHANNEL` on that deployment (name or Slack ID) |
-
-New deployments inherit the workspace default (`#astro-alerts-testing`) because
-`SUNDIAL_SLACK_ALERT_CHANNEL` is auto-linked. To send a tenant somewhere else:
-
-1. Invite `@astro_alerts_new` to the target channel (required for private channels).
-2. On that deployment: **Environment → Variables →**
-   `SUNDIAL_SLACK_ALERT_CHANNEL=<channel>`.
-
-Create the Slack app from [`astro_alerts_new.manifest.yaml`](astro_alerts_new.manifest.yaml)
-(Create from manifest at [api.slack.com/apps](https://api.slack.com/apps)), install it
-to the workspace, copy the **Bot User OAuth Token**, and store it as the
-`astro_alerts_new` connection password. Then `/invite @astro_alerts_new` into
-`#astro-alerts-testing`.
-
-Until that connection exists, alerts fall back to the legacy
-`sundial_slack_webhook` Incoming Webhook (channel cannot be overridden).
+- Default channel: `#etl-alerts`
+- Override: env `SUNDIAL_SLACK_ALERT_CHANNEL` (name or Slack ID)
+- Private channels: invite `@astro-alerts-bot` into the target channel
 
 ## Local development
 

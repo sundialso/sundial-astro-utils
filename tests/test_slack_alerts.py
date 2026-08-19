@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest import mock
 
-from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
+from airflow.exceptions import AirflowSkipException
 
 from sundial_airflow import slack_alerts
 
@@ -22,10 +22,9 @@ def _states(run_id: str = _RUN_ID, **task_states: str) -> dict[str, dict[str, st
 
 
 class ResolveAlertChannelTest(unittest.TestCase):
-    def test_defaults_to_astro_alerts_testing(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            os.environ.pop(slack_alerts.CHANNEL_ENV_VAR, None)
-            self.assertEqual(slack_alerts.resolve_alert_channel(), "#astro-alerts-testing")
+    def test_defaults_to_etl_alerts(self) -> None:
+        with mock.patch.dict(os.environ, {slack_alerts.CHANNEL_ENV_VAR: ""}):
+            self.assertEqual(slack_alerts.resolve_alert_channel(), "#etl-alerts")
 
     def test_env_override_adds_hash(self) -> None:
         with mock.patch.dict(os.environ, {slack_alerts.CHANNEL_ENV_VAR: "tenant-alerts"}):
@@ -74,26 +73,24 @@ class FailedTaskIdsTest(unittest.TestCase):
 
 
 class SendFailureAlertTest(unittest.TestCase):
-    def test_sends_via_new_app_to_default_channel(self) -> None:
+    def test_sends_via_api_to_default_channel(self) -> None:
         ctx = {"run_id": _RUN_ID}
         with mock.patch(
             _GET_TASK_STATES,
             return_value=_states(model_a="failed", model_b="failed", ok="success"),
-        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, mock.patch(
-            f"{_MODULE}.SlackWebhookHook"
-        ) as webhook_hook, mock.patch.dict(os.environ, {}, clear=True):
-            os.environ.pop(slack_alerts.CHANNEL_ENV_VAR, None)
+        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, mock.patch.dict(
+            os.environ, {slack_alerts.CHANNEL_ENV_VAR: ""}
+        ):
             slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
 
             api_hook.assert_called_once_with(slack_conn_id=slack_alerts.SLACK_API_CONN_ID)
             payload = api_hook.return_value.call.call_args.kwargs["json"]
-            self.assertEqual(payload["channel"], "#astro-alerts-testing")
+            self.assertEqual(payload["channel"], "#etl-alerts")
             self.assertIn("`acme`", payload["text"])
             self.assertIn("Failed Tasks (2)", payload["text"])
             self.assertIn("• `model_a`", payload["text"])
             self.assertIn("• `model_b`", payload["text"])
             self.assertIn(_RUN_ID, payload["text"])
-            webhook_hook.assert_not_called()
 
     def test_env_overrides_channel(self) -> None:
         ctx = {"run_id": _RUN_ID}
@@ -107,21 +104,6 @@ class SendFailureAlertTest(unittest.TestCase):
             payload = api_hook.return_value.call.call_args.kwargs["json"]
             self.assertEqual(payload["channel"], "#picsart-alerts")
 
-    def test_falls_back_to_webhook_when_new_app_missing(self) -> None:
-        ctx = {"run_id": _RUN_ID}
-        with mock.patch(
-            _GET_TASK_STATES, return_value=_states(model_a="failed")
-        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, mock.patch(
-            f"{_MODULE}.SlackWebhookHook"
-        ) as webhook_hook:
-            api_hook.return_value.call.side_effect = AirflowNotFoundException("no conn")
-            slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
-
-            webhook_hook.assert_called_once_with(
-                slack_webhook_conn_id=slack_alerts.SLACK_WEBHOOK_CONN_ID
-            )
-            webhook_hook.return_value.send_text.assert_called_once()
-
     def test_skips_when_nothing_failed(self) -> None:
         ctx = {"run_id": _RUN_ID}
         with mock.patch(
@@ -133,8 +115,6 @@ class SendFailureAlertTest(unittest.TestCase):
             api_hook.assert_not_called()
 
     def test_raises_when_send_fails(self) -> None:
-        # Passthrough retry so the test doesn't sleep through tenacity backoff, and
-        # so a send failure surfaces (the task must go red, not swallow the error).
         ctx = {"run_id": _RUN_ID}
         with mock.patch(
             _GET_TASK_STATES, return_value=_states(model_a="failed")
