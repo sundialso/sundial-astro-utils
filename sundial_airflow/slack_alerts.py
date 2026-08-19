@@ -1,9 +1,11 @@
 import logging
+import os
 from typing import Any
 
 from airflow.configuration import conf as airflow_conf
 from airflow.decorators import task
-from airflow.exceptions import AirflowSkipException
+from airflow.exceptions import AirflowNotFoundException, AirflowSkipException
+from airflow.providers.slack.hooks.slack import SlackHook
 from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 from airflow.utils.trigger_rule import TriggerRule
 from tenacity import (
@@ -15,10 +17,17 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-SLACK_CONN_ID = "sundial_slack_webhook"
+# Slack app ``astro_alerts_new`` — bot token in this connection (type ``slack``).
+SLACK_API_CONN_ID = "astro_alerts_new"
+# Legacy Incoming Webhook; used only when ``astro_alerts_new`` is not configured.
+SLACK_WEBHOOK_CONN_ID = "sundial_slack_webhook"
+SLACK_CONN_ID = SLACK_WEBHOOK_CONN_ID  # backward-compat alias
 FAILURE_ALERT_TASK_ID = "slack_failure_alert"
 
-# Retry the webhook on any exception (network blip, 429, 5xx): 5 attempts with
+CHANNEL_ENV_VAR = "SUNDIAL_SLACK_ALERT_CHANNEL"
+DEFAULT_CHANNEL = "astro-alerts-testing"
+
+# Retry the send on any exception (network blip, 429, 5xx): 5 attempts with
 # exponential backoff (~30s total), enough to ride out Slack's short rate-limit
 # windows without stalling the task.
 _send_with_retry = retry(
@@ -27,6 +36,23 @@ _send_with_retry = retry(
     wait=wait_exponential(multiplier=1, min=1, max=15),
     retry=retry_if_exception_type(Exception),
 )
+
+
+def resolve_alert_channel() -> str:
+    """Return the Slack channel this deployment should post failure alerts to.
+
+    Defaults to ``#astro-alerts-testing``. Override per deployment with the
+    workspace-auto-linked env var ``SUNDIAL_SLACK_ALERT_CHANNEL`` (channel name
+    or Slack ID). Incoming webhooks cannot change channel at send time, so the
+    new ``astro_alerts_new`` app posts via ``chat.postMessage``.
+    """
+    raw = (os.environ.get(CHANNEL_ENV_VAR) or "").strip() or DEFAULT_CHANNEL
+    if raw.startswith("#"):
+        return raw
+    # Encoded Slack IDs (public channel / private group / DM) — don't prefix.
+    if len(raw) >= 9 and raw[0] in "CGD" and raw[1:].isalnum():
+        return raw
+    return f"#{raw}"
 
 
 def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
@@ -46,6 +72,25 @@ def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
         if str(getattr(state, "value", state)).lower() == "failed"
         and task_id != FAILURE_ALERT_TASK_ID
     )
+
+
+def _post_to_slack(message: str, *, channel: str) -> str:
+    """Post ``message`` to Slack. Returns ``api`` or ``webhook``.
+
+    Prefers the ``astro_alerts_new`` Slack API connection so the destination
+    channel can be chosen per deployment. Falls back to the legacy Incoming
+    Webhook when that connection is missing (rollout). A webhook is bound to
+    one channel, so the fallback ignores ``channel``.
+    """
+    try:
+        SlackHook(slack_conn_id=SLACK_API_CONN_ID).call(
+            "chat.postMessage",
+            json={"channel": channel, "text": message, "unfurl_links": False},
+        )
+        return "api"
+    except AirflowNotFoundException:
+        SlackWebhookHook(slack_webhook_conn_id=SLACK_WEBHOOK_CONN_ID).send_text(message)
+        return "webhook"
 
 
 def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
@@ -74,11 +119,15 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
         + f"\n{link}"
     )
 
-    logger.info("%s sending Slack alert (%d failed) via %r", log_prefix, len(failed), SLACK_CONN_ID)
-    _send_with_retry(
-        lambda: SlackWebhookHook(slack_webhook_conn_id=SLACK_CONN_ID).send_text(message)
-    )()
-    logger.info("%s alert sent", log_prefix)
+    channel = resolve_alert_channel()
+    logger.info(
+        "%s sending Slack alert (%d failed) to %s",
+        log_prefix,
+        len(failed),
+        channel,
+    )
+    path = _send_with_retry(lambda: _post_to_slack(message, channel=channel))()
+    logger.info("%s alert sent via %s", log_prefix, path)
 
 
 def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
