@@ -14,7 +14,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory.make_dbt_dag` | Cosmos-only factory (no chunk task groups) for all other tenants. |
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
-| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task that posts one Slack alert listing failed tasks (skips on success). Channel: `SUNDIAL_SLACK_ALERT_CHANNEL` or `#etl-alerts`. |
+| `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task that posts a Slack alert listing failed tasks (skips on success). Always to `#etl-alerts`, plus any `SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS`. |
 | `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
@@ -97,9 +97,14 @@ The factory takes care of:
 
 Posts via Slack API connection `astro-alerts-bot`.
 
-- Default channel: `#etl-alerts`
-- Override: env `SUNDIAL_SLACK_ALERT_CHANNEL` (name or Slack ID)
-- Private channels: invite `@astro-alerts-bot` into the target channel
+- Always posts to `#etl-alerts`.
+- To also alert elsewhere, set `SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS` on that
+  deployment — comma-separated channel names or Slack IDs.
+- Invite `@astro-alerts-bot` into every target channel (required for private ones).
+
+Each channel is attempted independently, so a misconfigured extra channel still
+lets the `#etl-alerts` message through; the task then fails listing the channels
+that could not be reached.
 
 ## Local development
 

@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 SLACK_API_CONN_ID = "astro-alerts-bot"
 FAILURE_ALERT_TASK_ID = "slack_failure_alert"
-CHANNEL_ENV_VAR = "SUNDIAL_SLACK_ALERT_CHANNEL"
-DEFAULT_CHANNEL = "etl-alerts"
+ALERT_CHANNEL = "etl-alerts"
+EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
 
 _send_with_retry = retry(
     reraise=True,
@@ -29,14 +29,27 @@ _send_with_retry = retry(
 )
 
 
-def resolve_alert_channel() -> str:
-    """Channel from ``SUNDIAL_SLACK_ALERT_CHANNEL``, else ``#etl-alerts``."""
-    raw = (os.environ.get(CHANNEL_ENV_VAR) or "").strip() or DEFAULT_CHANNEL
+def _normalize_channel(name: str) -> str | None:
+    """``#``-prefix a channel name; pass encoded Slack IDs through unchanged."""
+    raw = name.strip()
+    if not raw:
+        return None
     if raw.startswith("#"):
         return raw
     if len(raw) >= 9 and raw[0] in "CGD" and raw[1:].isalnum():
         return raw
     return f"#{raw}"
+
+
+def resolve_alert_channels() -> list[str]:
+    """``#etl-alerts`` first, then any comma-separated extras from the env var."""
+    raw_extras = os.environ.get(EXTRA_CHANNELS_ENV_VAR) or ""
+    channels: list[str] = []
+    for name in [ALERT_CHANNEL, *raw_extras.split(",")]:
+        channel = _normalize_channel(name)
+        if channel and channel not in channels:
+            channels.append(channel)
+    return channels
 
 
 def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
@@ -62,7 +75,7 @@ def _post_to_slack(message: str, *, channel: str) -> None:
 
 
 def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
-    """Post one Slack message listing failed tasks, or skip if none failed."""
+    """Post one message per target channel listing failed tasks, or skip if none failed."""
     run_id = str(context["run_id"])
     log_prefix = f"[slack_alert dag_id={dag_id} run_id={run_id}]"
 
@@ -82,14 +95,26 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
         + f"\n{link}"
     )
 
-    channel = resolve_alert_channel()
-    logger.info("%s sending Slack alert (%d failed) to %s", log_prefix, len(failed), channel)
-    _send_with_retry(_post_to_slack)(message, channel=channel)
+    # Every channel is attempted so a misconfigured extra can't suppress the
+    # alert in the others; the task still goes red if any send failed.
+    errors: dict[str, Exception] = {}
+    for channel in resolve_alert_channels():
+        logger.info("%s sending Slack alert (%d failed) to %s", log_prefix, len(failed), channel)
+        try:
+            _send_with_retry(_post_to_slack)(message, channel=channel)
+        except Exception as exc:  # noqa: BLE001 — reported per channel below
+            logger.exception("%s could not post to %s", log_prefix, channel)
+            errors[channel] = exc
+
+    if errors:
+        raise RuntimeError(
+            f"{log_prefix} Slack alert failed for: {', '.join(errors)}"
+        ) from next(iter(errors.values()))
     logger.info("%s alert sent", log_prefix)
 
 
 def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
-    """Terminal ``all_done`` task: one Slack alert for failed tasks, or skip."""
+    """Terminal ``all_done`` task: Slack alert for failed tasks, or skip."""
 
     @task(task_id=FAILURE_ALERT_TASK_ID, trigger_rule=TriggerRule.ALL_DONE, retries=1)
     def slack_failure_alert(**context: Any) -> None:
