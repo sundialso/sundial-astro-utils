@@ -1,10 +1,11 @@
 import logging
+import os
 from typing import Any
 
 from airflow.configuration import conf as airflow_conf
 from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
-from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
+from airflow.providers.slack.hooks.slack import SlackHook
 from airflow.utils.trigger_rule import TriggerRule
 from tenacity import (
     retry,
@@ -15,12 +16,11 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
-SLACK_CONN_ID = "sundial_slack_webhook"
+SLACK_API_CONN_ID = "astro-alerts-bot"
 FAILURE_ALERT_TASK_ID = "slack_failure_alert"
+ALERT_CHANNEL = "etl-alerts"
+EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
 
-# Retry the webhook on any exception (network blip, 429, 5xx): 5 attempts with
-# exponential backoff (~30s total), enough to ride out Slack's short rate-limit
-# windows without stalling the task.
 _send_with_retry = retry(
     reraise=True,
     stop=stop_after_attempt(5),
@@ -29,13 +29,31 @@ _send_with_retry = retry(
 )
 
 
-def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
-    """Return the ids of tasks that ended in the ``failed`` state for this run.
+def _normalize_channel(name: str) -> str | None:
+    """``#``-prefix a channel name; pass encoded Slack IDs through unchanged."""
+    raw = name.strip()
+    if not raw:
+        return None
+    if raw.startswith("#"):
+        return raw
+    if len(raw) >= 9 and raw[0] in "CGD" and raw[1:].isalnum():
+        return raw
+    return f"#{raw}"
 
-    Uses the Task SDK ``get_task_states`` comms call (the Airflow 3 worker has no
-    direct metadata-DB access). Excludes cascade skips (``upstream_failed``) and
-    this alert task itself, so only the real failures are reported.
-    """
+
+def resolve_alert_channels() -> list[str]:
+    """``#etl-alerts`` first, then any comma-separated extras from the env var."""
+    raw_extras = os.environ.get(EXTRA_CHANNELS_ENV_VAR) or ""
+    channels: list[str] = []
+    for name in [ALERT_CHANNEL, *raw_extras.split(",")]:
+        channel = _normalize_channel(name)
+        if channel and channel not in channels:
+            channels.append(channel)
+    return channels
+
+
+def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
+    """Task ids in ``failed`` for this run, excluding this alert task."""
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
 
     states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
@@ -48,13 +66,16 @@ def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
     )
 
 
-def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
-    """Post one Slack alert listing every failed task in the run.
+def _post_to_slack(message: str, *, channel: str) -> None:
+    """Post via the ``astro-alerts-bot`` Slack API connection."""
+    SlackHook(slack_conn_id=SLACK_API_CONN_ID).call(
+        "chat.postMessage",
+        json={"channel": channel, "text": message, "unfurl_links": False},
+    )
 
-    Runs as an ``all_done`` task, so it also fires on success; it self-skips when
-    nothing failed. The send is left to raise on failure so a dropped alert shows
-    as a red task, not a silent no-op.
-    """
+
+def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
+    """Post one message per target channel listing failed tasks, or skip if none failed."""
     run_id = str(context["run_id"])
     log_prefix = f"[slack_alert dag_id={dag_id} run_id={run_id}]"
 
@@ -74,21 +95,26 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
         + f"\n{link}"
     )
 
-    logger.info("%s sending Slack alert (%d failed) via %r", log_prefix, len(failed), SLACK_CONN_ID)
-    _send_with_retry(
-        lambda: SlackWebhookHook(slack_webhook_conn_id=SLACK_CONN_ID).send_text(message)
-    )()
+    # Every channel is attempted so a misconfigured extra can't suppress the
+    # alert in the others; the task still goes red if any send failed.
+    errors: dict[str, Exception] = {}
+    for channel in resolve_alert_channels():
+        logger.info("%s sending Slack alert (%d failed) to %s", log_prefix, len(failed), channel)
+        try:
+            _send_with_retry(_post_to_slack)(message, channel=channel)
+        except Exception as exc:  # noqa: BLE001 — reported per channel below
+            logger.exception("%s could not post to %s", log_prefix, channel)
+            errors[channel] = exc
+
+    if errors:
+        raise RuntimeError(
+            f"{log_prefix} Slack alert failed for: {', '.join(errors)}"
+        ) from next(iter(errors.values()))
     logger.info("%s alert sent", log_prefix)
 
 
 def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
-    """Terminal ``all_done`` task that posts one Slack alert listing every failed
-    task, or self-skips when the run succeeded.
-
-    Runs on a worker (reliable + visible logs) rather than as a DAG-level
-    ``on_failure_callback``, which Airflow 3 runs unreliably in the DAG processor
-    and whose logs Astro doesn't surface. Tenant comes from the factory.
-    """
+    """Terminal ``all_done`` task: Slack alert for failed tasks, or skip."""
 
     @task(task_id=FAILURE_ALERT_TASK_ID, trigger_rule=TriggerRule.ALL_DONE, retries=1)
     def slack_failure_alert(**context: Any) -> None:

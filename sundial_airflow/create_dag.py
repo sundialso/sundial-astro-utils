@@ -10,7 +10,7 @@ the tenant DAGs:
   failing source test only blocks its own subtree, not the whole pipeline)
 - the Cosmos ``DbtTaskGroup``
 - ``report_data_processed`` task (BigQuery / Snowflake variant)
-- Slack failure alert wired into ``default_args``
+- terminal ``slack_failure_alert`` task
 
 Tenant DAG files reduce to ~25 lines: a single ``create_dag(...)`` call
 configured with their connection IDs / dataset name / schedule.
@@ -213,8 +213,7 @@ def create_dag(
         DbtCompletionsListener can locate the ``dbt_completions`` table on a
         manual UI state change. Optional; the listener no-ops without it.
     default_args:
-        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`. Slack failure alerts are
-        handled separately by the terminal ``slack_failure_alert`` task.
+        Merged on top of :data:`DEFAULT_DEFAULT_ARGS`.
     extra_tags:
         Extra tags appended after ``["dbt", f"tenant:{tenant}"]``.
     pre_tasks:
@@ -631,10 +630,7 @@ def create_dag(
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — ``all_done`` so it waits for the whole
-        # run, then posts one alert listing every failed task (self-skips on
-        # success). A worker task, not a DAG-level callback, which Airflow 3 runs
-        # unreliably in the DAG processor.
+        # Terminal Slack failure alert — waits for the whole run; skips if none failed.
         [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
             tenant=tenant, dag_id=dag_id
         )
