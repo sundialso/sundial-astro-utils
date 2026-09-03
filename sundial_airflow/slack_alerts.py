@@ -14,7 +14,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from sundial_airflow.hooks import PREPARE_TASK_ID
+from sundial_airflow.run_input import RunInput, run_input_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +25,6 @@ FAILURE_ALERT_CHANNEL = "etl-alerts"
 SUCCESS_ALERT_CHANNEL = "pipeline-completion-alerts"
 EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
 _ALERT_TASK_IDS = frozenset({FAILURE_ALERT_TASK_ID, SUCCESS_ALERT_TASK_ID})
-_BACKFILL_MODE_TO_RUN_TYPE = {
-    "full": "full_backfill",
-    "partial": "partial_backfill",
-}
 
 _send_with_retry = retry(
     reraise=True,
@@ -92,6 +88,14 @@ def _log_prefix(task_id: str, dag_id: str, run_id: str) -> str:
     return f"[{task_id} dag_id={dag_id} run_id={run_id}]"
 
 
+def _selection_lines(run: RunInput) -> str:
+    """The ``select`` the run used, or ``all`` when the DAG ran every model."""
+    lines = [f"*Models:* `{run.models_selector}`"]
+    if run.exclude:
+        lines.append(f"*Exclude:* `{run.exclude}`")
+    return "\n".join(lines)
+
+
 def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
     """Post one message per target channel listing failed tasks, or skip if none failed."""
     run_id = str(context["run_id"])
@@ -106,6 +110,7 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
         f"*Tenant:* `{tenant}`\n"
         f"*DAG:* `{dag_id}`\n"
         f"*Run ID:* `{run_id}`\n"
+        f"{_selection_lines(run_input_from_context(context))}\n"
         f"*Failed Tasks ({len(failed)}):*\n"
         + "\n".join(f"• `{task_id}`" for task_id in failed)
         + f"\n{_dag_link(dag_id)}"
@@ -129,45 +134,15 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
     logger.info("%s alert sent", log_prefix)
 
 
-def _prepare_payload(context: dict[str, Any]) -> dict[str, Any]:
-    """``prepare_dbt_args`` XCom, or ``{}`` if missing / unreadable."""
-    ti = context.get("ti")
-    if ti is None:
-        return {}
-    try:
-        pulled = ti.xcom_pull(task_ids=PREPARE_TASK_ID)
-    except Exception:  # noqa: BLE001 — params are a sufficient fallback
-        logger.warning("could not read %s XCom; falling back to DAG params", PREPARE_TASK_ID)
-        return {}
-    return pulled if isinstance(pulled, dict) else {}
-
-
-def _resolve_run_details(context: dict[str, Any]) -> dict[str, Any]:
-    """Run type and window from ``prepare_dbt_args`` XCom, falling back to params."""
-    params = context.get("params") or {}
-    prep = _prepare_payload(context)
-    dbt_vars = prep.get("vars") if isinstance(prep.get("vars"), dict) else {}
-    backfill_mode = params.get("backfill_mode") or "none"
-    run_type = prep.get("run_context") or _BACKFILL_MODE_TO_RUN_TYPE.get(
-        backfill_mode, "normal"
-    )
-    return {
-        "run_type": run_type,
-        "execution_ts": dbt_vars.get("execution_ts") or params.get("execution_ts"),
-        "start_ts": dbt_vars.get("backfill_start_ts") or params.get("start_ts"),
-        "end_ts": dbt_vars.get("backfill_end_ts") or params.get("end_ts"),
-    }
-
-
-def _format_success_window_lines(details: dict[str, Any]) -> str:
-    lines = [f"*Run Type:* `{details['run_type']}`"]
-    if details["run_type"] == "partial_backfill":
-        if details.get("start_ts"):
-            lines.append(f"*Start TS:* `{details['start_ts']}`")
-        if details.get("end_ts"):
-            lines.append(f"*End TS:* `{details['end_ts']}`")
-    elif details.get("execution_ts"):
-        lines.append(f"*Execution TS:* `{details['execution_ts']}`")
+def _format_success_window_lines(run: RunInput) -> str:
+    lines = [f"*Run Type:* `{run.run_context}`"]
+    if run.run_context == "partial_backfill":
+        if run.start_ts:
+            lines.append(f"*Start TS:* `{run.start_ts}`")
+        if run.end_ts:
+            lines.append(f"*End TS:* `{run.end_ts}`")
+    elif run.execution_ts:
+        lines.append(f"*Execution TS:* `{run.execution_ts}`")
     return "\n".join(lines)
 
 
@@ -186,13 +161,14 @@ def _send_success_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
             f"{log_prefix} {len(failed)} task failure(s); skipping success alert"
         )
 
-    details = _resolve_run_details(context)
+    run = run_input_from_context(context)
     message = (
         f":large_green_circle: *DAG Succeeded*\n"
         f"*Tenant:* `{tenant}`\n"
         f"*DAG:* `{dag_id}`\n"
         f"*Run ID:* `{run_id}`\n"
-        f"{_format_success_window_lines(details)}\n"
+        f"{_selection_lines(run)}\n"
+        f"{_format_success_window_lines(run)}\n"
         f"{_dag_link(dag_id)}"
     )
 

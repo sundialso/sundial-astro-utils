@@ -110,6 +110,7 @@ class SendFailureAlertTest(unittest.TestCase):
             self.assertIn("• `model_a`", payload["text"])
             self.assertIn("• `model_b`", payload["text"])
             self.assertIn(_RUN_ID, payload["text"])
+            self.assertIn("*Models:* `all`", payload["text"])
 
     def test_extra_channel_gets_the_alert_too(self) -> None:
         ctx = {"run_id": _RUN_ID}
@@ -162,6 +163,18 @@ class SendFailureAlertTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
 
+    def test_select_selector_is_shown_not_all(self) -> None:
+        ctx = {"run_id": _RUN_ID, "params": {"select": "A+"}}
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_a="failed")
+        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, _extras(""):
+            slack_alerts._send_failure_alert(ctx, tenant="acme", dag_id="dbt_acme")
+
+            text = api_hook.return_value.call.call_args.kwargs["json"]["text"]
+            self.assertIn("*Models:* `A+`", text)
+            self.assertNotIn("*Models:* `all`", text)
+            self.assertNotIn("Exclude", text)
+
 
 class BuildFailureAlertTaskTest(unittest.TestCase):
     def test_task_has_all_done_trigger_rule(self) -> None:
@@ -207,6 +220,7 @@ class SendSuccessAlertTest(unittest.TestCase):
             self.assertIn("`acme`", payload["text"])
             self.assertIn("*Run Type:* `normal`", payload["text"])
             self.assertIn("*Execution TS:* `2026-09-01`", payload["text"])
+            self.assertIn("*Models:* `all`", payload["text"])
             self.assertIn(_RUN_ID, payload["text"])
             self.assertNotIn("Failed Tasks", payload["text"])
             self.assertNotIn("#etl-alerts", _channels_posted_to(api_hook))
@@ -270,6 +284,24 @@ class SendSuccessAlertTest(unittest.TestCase):
 
             text = api_hook.return_value.call.call_args.kwargs["json"]["text"]
             self.assertIn("*Execution TS:* `2026-04-02`", text)
+
+    def test_select_and_exclude_are_shown(self) -> None:
+        ctx = _success_ctx(
+            params={
+                "backfill_mode": "none",
+                "select": "A+",
+                "exclude": "tag:wip",
+            }
+        )
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_a="success")
+        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, _extras(""):
+            slack_alerts._send_success_alert(ctx, tenant="acme", dag_id="dbt_acme")
+
+            text = api_hook.return_value.call.call_args.kwargs["json"]["text"]
+            self.assertIn("*Models:* `A+`", text)
+            self.assertIn("*Exclude:* `tag:wip`", text)
+            self.assertNotIn("*Models:* `all`", text)
 
     def test_omits_missing_window_fields(self) -> None:
         ctx = _success_ctx(params={"backfill_mode": "none"})

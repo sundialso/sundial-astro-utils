@@ -20,6 +20,7 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |
+| `sundial_airflow.run_input` | Shared parse of DAG params (`select`, backfill window, `run_context`, …) used by `prepare_dbt_args`, Slack alerts, and notify. |
 
 ## Using it from a tenant repo
 
@@ -110,6 +111,7 @@ target channel (required for private ones).
   lets the `#etl-alerts` message through; the task then fails listing the
   channels that could not be reached.
 - Skips when no tasks failed.
+- Includes the `select` used (`A+`, `tag:daily`, …) or `all` when none was set.
 
 ### Success (`slack_success_alert`)
 
@@ -118,6 +120,7 @@ target channel (required for private ones).
 - Includes run type (`normal` / `full_backfill` / `partial_backfill`), plus
   `execution_ts` for normal and full backfill, or `start_ts` / `end_ts` for
   partial backfill.
+- Includes the `select` used (`A+`, `tag:daily`, …) or `all` when none was set.
 - Skips when any task failed.
 - Also skips if Slack cannot be reached (bot not in the channel, Slack down),
   so a successful dbt run is not marked failed by the ping.
