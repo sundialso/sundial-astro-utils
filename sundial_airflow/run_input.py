@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
 from sundial_airflow.hooks import PREPARE_TASK_ID
@@ -67,6 +67,15 @@ class RunInput:
             return str(self.execution_ts)
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    def validate(self) -> None:
+        """Reject inconsistent backfill-window params. Same rules in both factories."""
+        validate_backfill_params(
+            backfill_mode=self.backfill_mode,
+            start_ts=self.start_ts,
+            end_ts=self.end_ts,
+            execution_ts=self.execution_ts,
+        )
+
 
 def parse_run_input(params: Mapping[str, Any] | None) -> RunInput:
     """Parse Airflow DAG params into a :class:`RunInput` (no XCom overlay)."""
@@ -84,6 +93,41 @@ def parse_run_input(params: Mapping[str, Any] | None) -> RunInput:
         end_ts=params.get("end_ts") or None,
         extra_vars=extra_vars_str or None,
     )
+
+
+def validate_backfill_params(
+    *, backfill_mode: str, start_ts: Any, end_ts: Any, execution_ts: Any,
+) -> None:
+    """Validate the run-window params against the selected ``backfill_mode``."""
+    has_start = bool(start_ts)
+    has_end = bool(end_ts)
+
+    if backfill_mode == "partial":
+        if not (has_start and has_end):
+            raise ValueError(
+                "backfill_mode=partial requires both start_ts and end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if _as_datetime(start_ts) >= _as_datetime(end_ts):
+            raise ValueError(
+                "backfill_mode=partial requires start_ts < end_ts "
+                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
+            )
+        if execution_ts:
+            raise ValueError(
+                "backfill_mode=partial does not accept execution_ts "
+                f"(got execution_ts={execution_ts!r}); the window is defined "
+                "by start_ts and end_ts."
+            )
+        return
+
+    if has_start or has_end:
+        raise ValueError(
+            f"backfill_mode={backfill_mode!r} does not accept start_ts/end_ts "
+            f"(got start_ts={start_ts!r}, end_ts={end_ts!r}). "
+            "Use backfill_mode=partial for an explicit window, otherwise leave "
+            "start_ts/end_ts blank and rely on execution_ts."
+        )
 
 
 def run_input_from_context(
@@ -138,3 +182,22 @@ def _overlay_prepare_payload(
         start_ts=dbt_vars.get(start_var) or run.start_ts,
         end_ts=dbt_vars.get(end_var) or run.end_ts,
     )
+
+
+def _as_datetime(value: Any) -> datetime:
+    """Coerce a date/datetime/ISO string to a UTC-aware datetime for window checks."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day)
+    else:
+        text = str(value).strip().replace(" ", "T")
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            dt = datetime.fromisoformat(text[:10])
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

@@ -91,6 +91,24 @@ class RunInputFromContextTest(unittest.TestCase):
         run = run_input_from_context(ctx)
         self.assertEqual(run.execution_ts, "2026-05-01")
 
+    def test_custom_boundary_var_names(self) -> None:
+        ti = mock.Mock()
+        ti.xcom_pull.return_value = {
+            "run_context": "partial_backfill",
+            "vars": {
+                "custom_start": "2025-01-01",
+                "custom_end": "2025-06-30",
+                "backfill_start_ts": "ignored",
+            },
+        }
+        ctx = {
+            "params": {"backfill_mode": "partial"},
+            "ti": ti,
+        }
+        run = run_input_from_context(ctx, start_var="custom_start", end_var="custom_end")
+        self.assertEqual(run.start_ts, "2025-01-01")
+        self.assertEqual(run.end_ts, "2025-06-30")
+
 
 if __name__ == "__main__":
     unittest.main()

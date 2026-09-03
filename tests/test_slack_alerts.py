@@ -352,6 +352,49 @@ class SendSuccessAlertTest(unittest.TestCase):
 
             api_hook.assert_not_called()
 
+    def test_skips_when_a_task_is_upstream_failed(self) -> None:
+        ctx = _success_ctx()
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_b="upstream_failed")
+        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook:
+            with self.assertRaises(AirflowSkipException):
+                slack_alerts._send_success_alert(ctx, tenant="acme", dag_id="dbt_acme")
+
+            api_hook.assert_not_called()
+
+    def test_custom_chunk_var_keys_used_for_window(self) -> None:
+        ctx = _success_ctx(
+            params={
+                "backfill_mode": "partial",
+                "start_ts": "params-start",
+                "end_ts": "params-end",
+            },
+            prep={
+                "run_context": "partial_backfill",
+                "vars": {
+                    "custom_start": "2025-01-01T00:00:00",
+                    "custom_end": "2025-06-30T23:59:59",
+                    "backfill_start_ts": "wrong-default",
+                },
+            },
+        )
+        with mock.patch(
+            _GET_TASK_STATES, return_value=_states(model_a="success")
+        ), mock.patch(f"{_MODULE}.SlackHook") as api_hook, _extras(""):
+            slack_alerts._send_success_alert(
+                ctx,
+                tenant="acme",
+                dag_id="dbt_acme",
+                start_var="custom_start",
+                end_var="custom_end",
+            )
+
+            text = api_hook.return_value.call.call_args.kwargs["json"]["text"]
+            self.assertIn("*Start TS:* `2025-01-01T00:00:00`", text)
+            self.assertIn("*End TS:* `2025-06-30T23:59:59`", text)
+            self.assertNotIn("wrong-default", text)
+            self.assertNotIn("params-start", text)
+
     def test_skips_when_send_fails(self) -> None:
         ctx = _success_ctx(params={"backfill_mode": "none", "execution_ts": "2026-09-01"})
         with mock.patch(

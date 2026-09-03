@@ -25,6 +25,9 @@ FAILURE_ALERT_CHANNEL = "etl-alerts"
 SUCCESS_ALERT_CHANNEL = "pipeline-completion-alerts"
 EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
 _ALERT_TASK_IDS = frozenset({FAILURE_ALERT_TASK_ID, SUCCESS_ALERT_TASK_ID})
+_FAILED_STATES = frozenset({"failed"})
+_UNSUCCESSFUL_STATES = frozenset({"failed", "upstream_failed"})
+_DEFAULT_CHUNK_VAR_KEYS = ("backfill_start_ts", "backfill_end_ts")
 
 _send_with_retry = retry(
     reraise=True,
@@ -57,18 +60,23 @@ def resolve_failure_alert_channels() -> list[str]:
     return channels
 
 
-def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
-    """Task ids in ``failed`` for this run, excluding the Slack alert tasks."""
+def _task_ids_in_states(dag_id: str, run_id: str, states: frozenset[str]) -> list[str]:
+    """Task ids in ``states`` for this run, excluding the Slack alert tasks."""
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
 
-    states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
-    per_run = (states or {}).get(run_id, {})
+    run_states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
+    per_run = (run_states or {}).get(run_id, {})
     return sorted(
         task_id
         for task_id, state in per_run.items()
-        if str(getattr(state, "value", state)).lower() == "failed"
+        if str(getattr(state, "value", state)).lower() in states
         and task_id not in _ALERT_TASK_IDS
     )
+
+
+def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
+    """Root-cause failures only — ``upstream_failed`` is a consequence, not listed."""
+    return _task_ids_in_states(dag_id, run_id, _FAILED_STATES)
 
 
 def _post_to_slack(message: str, *, channel: str) -> None:
@@ -146,22 +154,30 @@ def _format_success_window_lines(run: RunInput) -> str:
     return "\n".join(lines)
 
 
-def _send_success_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
+def _send_success_alert(
+    context: dict[str, Any],
+    *,
+    tenant: str,
+    dag_id: str,
+    start_var: str = _DEFAULT_CHUNK_VAR_KEYS[0],
+    end_var: str = _DEFAULT_CHUNK_VAR_KEYS[1],
+) -> None:
     """Post a completion message to ``#pipeline-completion-alerts``, or skip.
 
-    Skips when any task failed *or* Slack cannot be reached, so a Slack outage
-    or a missing channel invite cannot turn a successful dbt run red.
+    Skips when any task failed or is ``upstream_failed``, or Slack cannot be
+    reached, so a Slack outage or a missing channel invite cannot turn a
+    successful dbt run red.
     """
     run_id = str(context["run_id"])
     log_prefix = _log_prefix(SUCCESS_ALERT_TASK_ID, dag_id, run_id)
 
-    failed = _get_failed_task_ids(dag_id, run_id)
-    if failed:
+    unsuccessful = _task_ids_in_states(dag_id, run_id, _UNSUCCESSFUL_STATES)
+    if unsuccessful:
         raise AirflowSkipException(
-            f"{log_prefix} {len(failed)} task failure(s); skipping success alert"
+            f"{log_prefix} {len(unsuccessful)} unsuccessful task(s); skipping success alert"
         )
 
-    run = run_input_from_context(context)
+    run = run_input_from_context(context, start_var=start_var, end_var=end_var)
     message = (
         f":large_green_circle: *DAG Succeeded*\n"
         f"*Tenant:* `{tenant}`\n"
@@ -194,11 +210,23 @@ def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
     return slack_failure_alert()
 
 
-def build_success_alert_task(*, tenant: str, dag_id: str) -> Any:
+def build_success_alert_task(
+    *,
+    tenant: str,
+    dag_id: str,
+    chunk_var_keys: tuple[str, str] = _DEFAULT_CHUNK_VAR_KEYS,
+) -> Any:
     """Terminal ``all_done`` task: Slack success ping, or skip if anything failed."""
+    start_var, end_var = chunk_var_keys
 
     @task(task_id=SUCCESS_ALERT_TASK_ID, trigger_rule=TriggerRule.ALL_DONE, retries=1)
     def slack_success_alert(**context: Any) -> None:
-        _send_success_alert(context, tenant=tenant, dag_id=dag_id)
+        _send_success_alert(
+            context,
+            tenant=tenant,
+            dag_id=dag_id,
+            start_var=start_var,
+            end_var=end_var,
+        )
 
     return slack_success_alert()

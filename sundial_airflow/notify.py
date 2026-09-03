@@ -35,7 +35,7 @@ from airflow.exceptions import AirflowSkipException
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.types import DagRunType
 
-from sundial_airflow.run_input import parse_run_input
+from sundial_airflow.run_input import run_input_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +128,7 @@ def build_notify_task(*, tenant: str, dag_id: str) -> Any:
 def _notify_from_context(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
     """Gate on run type, resolve the run date, and fire. Split out from the task
     body so it is unit-testable with a plain context dict."""
-    params = context["params"]
-    run = parse_run_input(params)
+    run = run_input_from_context(context)
     run_type = context["dag_run"].run_type
     # Skip both Airflow backfill jobs and param-driven backfills (which run as
     # MANUAL) — a backfill reprocesses historical data dates and must not notify.

@@ -183,11 +183,8 @@ def make_dbt_dag(
             if run_id:
                 dbt_vars["run_group_id"] = run_id
 
+            run.validate()
             if run.backfill_mode == "partial":
-                if not run.start_ts or not run.end_ts:
-                    raise ValueError(
-                        "backfill_mode=partial requires both start_ts and end_ts"
-                    )
                 dbt_vars["backfill_start_ts"] = run.start_ts
                 dbt_vars["backfill_end_ts"] = run.end_ts
 
