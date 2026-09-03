@@ -634,10 +634,11 @@ def create_dag(
         [source_test_group, dbt_models] >> notify_task
 
         # Terminal Slack alerts — wait for the whole run. Failure skips if
-        # nothing failed; success skips if anything failed.
-        [source_test_group, dbt_models, notify_task] >> [
-            build_failure_alert_task(tenant=tenant, dag_id=dag_id),
-            build_success_alert_task(tenant=tenant, dag_id=dag_id),
-        ]
+        # nothing failed; success skips if anything failed. Airflow does not
+        # allow ``list >> list``; ``list >> task`` is valid.
+        failure_alert = build_failure_alert_task(tenant=tenant, dag_id=dag_id)
+        success_alert = build_success_alert_task(tenant=tenant, dag_id=dag_id)
+        [source_test_group, dbt_models, notify_task] >> failure_alert
+        [source_test_group, dbt_models, notify_task] >> success_alert
 
     return _build()
