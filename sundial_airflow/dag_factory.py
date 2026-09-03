@@ -30,7 +30,11 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import build_failure_alert_task
+from sundial_airflow.run_input import parse_run_input
+from sundial_airflow.slack_alerts import (
+    build_failure_alert_task,
+    build_success_alert_task,
+)
 from sundial_airflow.task_log import log_prepare_dbt_args_summary
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
@@ -160,6 +164,7 @@ def make_dbt_dag(
         @task(task_id=PREPARE_TASK_ID, show_return_value_in_logs=False)
         def prepare_dbt_args(**context):
             params = context["params"]
+            run = parse_run_input(params)
             dbt_vars: dict[str, Any] = {}
 
             target_value = params.get(param_field) or default_dataset_or_schema
@@ -168,10 +173,7 @@ def make_dbt_dag(
             if default_project:
                 dbt_vars["target_project"] = default_project
 
-            dbt_vars["execution_ts"] = (
-                params.get("execution_ts")
-                or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
-            )
+            dbt_vars["execution_ts"] = run.resolved_execution_ts()
 
             # TODO: re-enable cross-run lock when stable.
             dbt_vars["enable_dbt_run_lock"] = False
@@ -181,38 +183,23 @@ def make_dbt_dag(
             if run_id:
                 dbt_vars["run_group_id"] = run_id
 
-            backfill_mode = params.get("backfill_mode", "none")
-            if backfill_mode == "partial":
-                start = params.get("start_ts")
-                end = params.get("end_ts")
-                if not start or not end:
-                    raise ValueError(
-                        "backfill_mode=partial requires both start_ts and end_ts"
-                    )
-                dbt_vars["backfill_start_ts"] = start
-                dbt_vars["backfill_end_ts"] = end
+            run.validate()
+            if run.backfill_mode == "partial":
+                dbt_vars["backfill_start_ts"] = run.start_ts
+                dbt_vars["backfill_end_ts"] = run.end_ts
 
-            run_context = "normal"
-            if backfill_mode == "full":
-                run_context = "full_backfill"
-            elif backfill_mode == "partial":
-                run_context = "partial_backfill"
-            dbt_vars["run_context"] = run_context
-            run_context_tag = f"{tenant}_{run_context}"
+            dbt_vars["run_context"] = run.run_context
+            run_context_tag = run.run_context_tag(tenant)
             dbt_vars["run_context_tag"] = run_context_tag
 
-            custom_vars = params.get("vars")
-            if custom_vars:
+            if run.extra_vars:
                 try:
-                    dbt_vars.update(json.loads(custom_vars))
+                    dbt_vars.update(json.loads(run.extra_vars))
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Invalid JSON in 'vars' param: {e}") from e
 
             selected_models = None
-            select_param = (params.get("select") or "").strip()
-            exclude_param = (params.get("exclude") or "").strip()
-
-            if select_param or exclude_param:
+            if run.select or run.exclude:
                 ls_profile_config = profile_config_factory("dev", target_value)
                 with ls_profile_config.ensure_profile() as (
                     profile_path,
@@ -258,10 +245,10 @@ def make_dbt_dag(
                         "--output",
                         "name",
                     ]
-                    if select_param:
-                        cmd.extend(["--select", select_param])
-                    if exclude_param:
-                        cmd.extend(["--exclude", exclude_param])
+                    if run.select:
+                        cmd.extend(["--select", run.select])
+                    if run.exclude:
+                        cmd.extend(["--exclude", run.exclude])
 
                     result = subprocess.run(
                         cmd,
@@ -286,9 +273,9 @@ def make_dbt_dag(
                 param_field: target_value,
                 "vars": dbt_vars,
                 "warehouse": warehouse,
-                "full_refresh": backfill_mode == "full",
+                "full_refresh": run.full_refresh,
                 "selected_models": selected_models,
-                "run_context": run_context,
+                "run_context": run.run_context,
                 "run_context_tag": run_context_tag,
             }
             log_prepare_dbt_args_summary(
@@ -297,8 +284,8 @@ def make_dbt_dag(
                 param_field=param_field,
                 target_value=target_value,
                 warehouse=warehouse,
-                backfill_mode=backfill_mode,
-                run_context=run_context,
+                backfill_mode=run.backfill_mode,
+                run_context=run.run_context,
                 full_refresh=payload["full_refresh"],
                 dbt_vars=dbt_vars,
                 selected_models=selected_models,
@@ -379,10 +366,13 @@ def make_dbt_dag(
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — waits for the whole run; skips if none failed.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
-            tenant=tenant, dag_id=dag_id
-        )
+        # Terminal Slack alerts — wait for the whole run. Failure skips if
+        # nothing failed; success skips if anything failed. Airflow does not
+        # allow ``list >> list``; ``list >> task`` is valid.
+        failure_alert = build_failure_alert_task(tenant=tenant, dag_id=dag_id)
+        success_alert = build_success_alert_task(tenant=tenant, dag_id=dag_id)
+        [source_test_group, dbt_models, notify_task] >> failure_alert
+        [source_test_group, dbt_models, notify_task] >> success_alert
 
         run_tasks_by_model = _collect_run_tasks(dbt_models)
         for (source_name, table_name), test_task in source_test_tasks.items():

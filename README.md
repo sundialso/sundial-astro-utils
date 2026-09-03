@@ -15,10 +15,12 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.dag_factory_legacy.make_dbt_dag_legacy` | Deprecated alias for `make_dbt_dag` (backward compat). |
 | `sundial_airflow.feature_flags` | `SUNDIAL_CHUNKING_ENABLED` flag and `resolve_dag_schedules()` helper. |
 | `sundial_airflow.slack_alerts.build_failure_alert_task` | Terminal `all_done` task that posts a Slack alert listing failed tasks (skips on success). Always to `#etl-alerts`, plus any `SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS`. |
+| `sundial_airflow.slack_alerts.build_success_alert_task` | Terminal `all_done` task that posts a Slack success ping when no tasks failed (skips on failure or Slack errors). Always to `#pipeline-completion-alerts` only. |
 | `sundial_airflow.profiles.bigquery_profile_args` | Builds the BigQuery Cosmos `profile_args` for a tenant's `get_profile_config`; adds Dataproc keys (native dbt Python models) only when `DBT_DATAPROC_REGION` + `DBT_GCS_BUCKET` are set. |
 | `sundial_airflow.hooks` | `_skip_unselected` / `_skip_tests_if_disabled` pre-execute hooks. |
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |
+| `sundial_airflow.run_input` | Shared parse of DAG params (`select`, backfill window, `run_context`, …) used by `prepare_dbt_args`, Slack alerts, and notify. |
 
 ## Using it from a tenant repo
 
@@ -85,6 +87,8 @@ legacy_dag = make_dbt_dag(
 The factory takes care of:
 - Slack failure alert as a terminal `all_done` task (`slack_failure_alert`) that
   posts one message listing every failed task (skips on success).
+- Slack success alert as a sibling `all_done` task (`slack_success_alert`) that
+  posts to `#pipeline-completion-alerts` when no tasks failed (skips on failure).
 - `tenant:<name>` DAG tag.
 - The full standard parameter set (`backfill_mode`, `select`, `exclude`,
   `skip_tests`, `empty`, `vars`, `target`, ...).
@@ -93,18 +97,33 @@ The factory takes care of:
 - Per-source-table `DbtTestLocalOperator`s.
 - The Cosmos `DbtTaskGroup`.
 
-## Slack failure alerts
+## Slack alerts
 
-Posts via Slack API connection `astro-alerts-bot`.
+Posts via Slack API connection `astro-alerts-bot`. Invite the bot into every
+target channel (required for private ones).
+
+### Failure (`slack_failure_alert`)
 
 - Always posts to `#etl-alerts`.
 - To also alert elsewhere, set `SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS` on that
   deployment — comma-separated channel names or Slack IDs.
-- Invite `@astro-alerts-bot` into every target channel (required for private ones).
+- Each extra channel is attempted independently, so a misconfigured extra still
+  lets the `#etl-alerts` message through; the task then fails listing the
+  channels that could not be reached.
+- Skips when no tasks failed.
+- Includes the `select` used (`A+`, `tag:daily`, …) or `all` when none was set.
 
-Each channel is attempted independently, so a misconfigured extra channel still
-lets the `#etl-alerts` message through; the task then fails listing the channels
-that could not be reached.
+### Success (`slack_success_alert`)
+
+- Posts only to `#pipeline-completion-alerts` (internal; extras are ignored).
+  Invite `@astro-alerts-bot` into that channel before the first deploy.
+- Includes run type (`normal` / `full_backfill` / `partial_backfill`), plus
+  `execution_ts` for normal and full backfill, or `start_ts` / `end_ts` for
+  partial backfill.
+- Includes the `select` used (`A+`, `tag:daily`, …) or `all` when none was set.
+- Skips when any task failed.
+- Also skips if Slack cannot be reached (bot not in the channel, Slack down),
+  so a successful dbt run is not marked failed by the ping.
 
 ## Local development
 

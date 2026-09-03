@@ -10,7 +10,7 @@ the tenant DAGs:
   failing source test only blocks its own subtree, not the whole pipeline)
 - the Cosmos ``DbtTaskGroup``
 - ``report_data_processed`` task (BigQuery / Snowflake variant)
-- terminal ``slack_failure_alert`` task
+- terminal ``slack_failure_alert`` / ``slack_success_alert`` tasks
 
 Tenant DAG files reduce to ~25 lines: a single ``create_dag(...)`` call
 configured with their connection IDs / dataset name / schedule.
@@ -41,7 +41,7 @@ from sundial_airflow.chunking.manifest_parser import (
 )
 from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.graph import build_chunked_model_graph
-from sundial_airflow.chunking.run_plan import _as_datetime, build_run_plan, serialize_run_plan
+from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
@@ -51,7 +51,11 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import build_failure_alert_task
+from sundial_airflow.run_input import parse_run_input
+from sundial_airflow.slack_alerts import (
+    build_failure_alert_task,
+    build_success_alert_task,
+)
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
@@ -75,41 +79,6 @@ def _vars_field_name(warehouse: Warehouse) -> str:
 
 def _param_field_name(warehouse: Warehouse) -> str:
     return "dataset" if warehouse == "bigquery" else "schema"
-
-
-def _validate_backfill_params(
-    *, backfill_mode: str, start_ts: Any, end_ts: Any, execution_ts: Any,
-) -> None:
-    """Validate the run-window params against the selected ``backfill_mode``."""
-    has_start = bool(start_ts)
-    has_end = bool(end_ts)
-
-    if backfill_mode == "partial":
-        if not (has_start and has_end):
-            raise ValueError(
-                "backfill_mode=partial requires both start_ts and end_ts "
-                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
-            )
-        if _as_datetime(start_ts) >= _as_datetime(end_ts):
-            raise ValueError(
-                "backfill_mode=partial requires start_ts < end_ts "
-                f"(got start_ts={start_ts!r}, end_ts={end_ts!r})."
-            )
-        if execution_ts:
-            raise ValueError(
-                "backfill_mode=partial does not accept execution_ts "
-                f"(got execution_ts={execution_ts!r}); the window is defined "
-                "by start_ts and end_ts."
-            )
-        return
-
-    if has_start or has_end:
-        raise ValueError(
-            f"backfill_mode={backfill_mode!r} does not accept start_ts/end_ts "
-            f"(got start_ts={start_ts!r}, end_ts={end_ts!r}). "
-            "Use backfill_mode=partial for an explicit window, otherwise leave "
-            "start_ts/end_ts blank and rely on execution_ts."
-        )
 
 
 def _collect_run_tasks(group: Any) -> dict[str, Any]:
@@ -287,6 +256,7 @@ def create_dag(
         def prepare_dbt_args(**context):
             start_var, end_var = chunk_var_keys
             params = context["params"]
+            run = parse_run_input(params)
             dbt_vars: dict[str, Any] = {}
 
             target_value = params.get(param_field) or default_dataset_or_schema
@@ -297,10 +267,7 @@ def create_dag(
                 if warehouse == "snowflake":
                     dbt_vars["target_database"] = default_project
 
-            dbt_vars["execution_ts"] = (
-                params.get("execution_ts")
-                or _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
-            )
+            dbt_vars["execution_ts"] = run.resolved_execution_ts()
 
             # TODO: re-enable cross-run lock when stable.
             dbt_vars["enable_dbt_run_lock"] = False
@@ -312,41 +279,23 @@ def create_dag(
             if run_id:
                 dbt_vars["run_group_id"] = run_id
 
-            backfill_mode = params.get("backfill_mode", "none")
-            start_ts = params.get("start_ts")
-            end_ts = params.get("end_ts")
+            run.validate()
+            if run.backfill_mode == "partial":
+                dbt_vars[start_var] = run.start_ts
+                dbt_vars[end_var] = run.end_ts
 
-            _validate_backfill_params(
-                backfill_mode=backfill_mode,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                execution_ts=params.get("execution_ts"),
-            )
-            if backfill_mode == "partial":
-                dbt_vars[start_var] = start_ts
-                dbt_vars[end_var] = end_ts
-
-            run_context = "normal"
-            if backfill_mode == "full":
-                run_context = "full_backfill"
-            elif backfill_mode == "partial":
-                run_context = "partial_backfill"
-            dbt_vars["run_context"] = run_context
-            run_context_tag = f"{tenant}_{run_context}"
+            dbt_vars["run_context"] = run.run_context
+            run_context_tag = run.run_context_tag(tenant)
             dbt_vars["run_context_tag"] = run_context_tag
 
-            custom_vars = params.get("vars")
-            if custom_vars:
+            if run.extra_vars:
                 try:
-                    dbt_vars.update(json.loads(custom_vars))
+                    dbt_vars.update(json.loads(run.extra_vars))
                 except json.JSONDecodeError as e:
                     raise ValueError(f"Invalid JSON in 'vars' param: {e}") from e
 
             selected_models = None
-            select_param = (params.get("select") or "").strip()
-            exclude_param = (params.get("exclude") or "").strip()
-
-            if select_param or exclude_param:
+            if run.select or run.exclude:
                 ls_profile_config = profile_config_factory("dev", target_value)
                 with ls_profile_config.ensure_profile() as (
                     profile_path,
@@ -392,10 +341,10 @@ def create_dag(
                         "--output",
                         "name",
                     ]
-                    if select_param:
-                        cmd.extend(["--select", select_param])
-                    if exclude_param:
-                        cmd.extend(["--exclude", exclude_param])
+                    if run.select:
+                        cmd.extend(["--select", run.select])
+                    if run.exclude:
+                        cmd.extend(["--exclude", run.exclude])
 
                     result = subprocess.run(
                         cmd,
@@ -439,13 +388,13 @@ def create_dag(
                 plans = build_run_plan(
                     models=plan_models,
                     watermarks=watermarks,
-                    backfill_mode=backfill_mode,
+                    backfill_mode=run.backfill_mode,
                     execution_ts=execution_date,
                     window_start=dbt_vars.get(start_var)
-                    if backfill_mode == "partial"
+                    if run.backfill_mode == "partial"
                     else None,
                     window_end=dbt_vars.get(end_var)
-                    if backfill_mode == "partial"
+                    if run.backfill_mode == "partial"
                     else None,
                 )
                 run_plan = serialize_run_plan(plans)
@@ -457,9 +406,9 @@ def create_dag(
                 "vars": dbt_vars,
                 # Selects the warehouse adapter in the dbt_completions listener.
                 "warehouse": warehouse,
-                "full_refresh": backfill_mode == "full",
+                "full_refresh": run.full_refresh,
                 "selected_models": selected_models,
-                "run_context": run_context,
+                "run_context": run.run_context,
                 "run_context_tag": run_context_tag,
                 "run_plan": run_plan,
                 "chunk_units": chunk_units,
@@ -470,8 +419,8 @@ def create_dag(
                 param_field=param_field,
                 target_value=target_value,
                 warehouse=warehouse,
-                backfill_mode=backfill_mode,
-                run_context=run_context,
+                backfill_mode=run.backfill_mode,
+                run_context=run.run_context,
                 full_refresh=payload["full_refresh"],
                 dbt_vars=dbt_vars,
                 selected_models=selected_models,
@@ -630,9 +579,14 @@ def create_dag(
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — waits for the whole run; skips if none failed.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
-            tenant=tenant, dag_id=dag_id
+        # Terminal Slack alerts — wait for the whole run. Failure skips if
+        # nothing failed; success skips if anything failed. Airflow does not
+        # allow ``list >> list``; ``list >> task`` is valid.
+        failure_alert = build_failure_alert_task(tenant=tenant, dag_id=dag_id)
+        success_alert = build_success_alert_task(
+            tenant=tenant, dag_id=dag_id, chunk_var_keys=chunk_var_keys
         )
+        [source_test_group, dbt_models, notify_task] >> failure_alert
+        [source_test_group, dbt_models, notify_task] >> success_alert
 
     return _build()

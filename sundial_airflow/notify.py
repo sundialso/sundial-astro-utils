@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -35,6 +34,8 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowSkipException
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.types import DagRunType
+
+from sundial_airflow.run_input import run_input_from_context
 
 logger = logging.getLogger(__name__)
 
@@ -127,19 +128,16 @@ def build_notify_task(*, tenant: str, dag_id: str) -> Any:
 def _notify_from_context(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
     """Gate on run type, resolve the run date, and fire. Split out from the task
     body so it is unit-testable with a plain context dict."""
-    params = context["params"]
+    run = run_input_from_context(context)
     run_type = context["dag_run"].run_type
-    backfill_mode = params.get("backfill_mode", "none")
     # Skip both Airflow backfill jobs and param-driven backfills (which run as
     # MANUAL) — a backfill reprocesses historical data dates and must not notify.
-    if run_type == DagRunType.BACKFILL_JOB or backfill_mode in {"full", "partial"}:
+    if run_type == DagRunType.BACKFILL_JOB or run.is_backfill:
         raise AirflowSkipException(
-            f"notify skipped for backfill (run_type={run_type!r}, backfill_mode={backfill_mode!r})"
+            f"notify skipped for backfill (run_type={run_type!r}, backfill_mode={run.backfill_mode!r})"
         )
     # Resolve run_date exactly as the DAG factories resolve the dbt execution_ts
     # var (execution_ts, else current UTC date), so notify reports the same data
     # date the run processed. execution_ts defaults to None.
-    run_date = str(params.get("execution_ts") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))[
-        :10
-    ]
+    run_date = str(run.resolved_execution_ts())[:10]
     notify_end_of_pipeline(tenant=tenant, run_date=run_date, dag_id=dag_id, run_id=context["run_id"])

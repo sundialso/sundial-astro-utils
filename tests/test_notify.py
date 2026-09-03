@@ -147,6 +147,18 @@ class NotifyFromContextTest(unittest.TestCase):
             )
             self.assertEqual(fire.call_args.kwargs["run_date"], expected)
 
+    def test_honors_prepare_xcom_execution_ts_override(self) -> None:
+        ti = mock.Mock()
+        ti.xcom_pull.return_value = {
+            "run_context": "normal",
+            "vars": {"execution_ts": "2026-01-15"},
+        }
+        ctx = _context(DagRunType.SCHEDULED, execution_ts="2026-07-20T00:00:00")
+        ctx["ti"] = ti
+        with mock.patch(f"{_MODULE}.notify_end_of_pipeline") as fire:
+            notify._notify_from_context(ctx, tenant="acme", dag_id="dbt_acme")
+            self.assertEqual(fire.call_args.kwargs["run_date"], "2026-01-15")
+
 
 if __name__ == "__main__":
     unittest.main()
