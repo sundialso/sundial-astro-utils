@@ -14,12 +14,21 @@ from tenacity import (
     wait_exponential,
 )
 
+from sundial_airflow.hooks import PREPARE_TASK_ID
+
 logger = logging.getLogger(__name__)
 
 SLACK_API_CONN_ID = "astro-alerts-bot"
 FAILURE_ALERT_TASK_ID = "slack_failure_alert"
-ALERT_CHANNEL = "etl-alerts"
+SUCCESS_ALERT_TASK_ID = "slack_success_alert"
+FAILURE_ALERT_CHANNEL = "etl-alerts"
+SUCCESS_ALERT_CHANNEL = "pipeline-completion-alerts"
 EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
+_ALERT_TASK_IDS = frozenset({FAILURE_ALERT_TASK_ID, SUCCESS_ALERT_TASK_ID})
+_BACKFILL_MODE_TO_RUN_TYPE = {
+    "full": "full_backfill",
+    "partial": "partial_backfill",
+}
 
 _send_with_retry = retry(
     reraise=True,
@@ -41,11 +50,11 @@ def _normalize_channel(name: str) -> str | None:
     return f"#{raw}"
 
 
-def resolve_alert_channels() -> list[str]:
+def resolve_failure_alert_channels() -> list[str]:
     """``#etl-alerts`` first, then any comma-separated extras from the env var."""
     raw_extras = os.environ.get(EXTRA_CHANNELS_ENV_VAR) or ""
     channels: list[str] = []
-    for name in [ALERT_CHANNEL, *raw_extras.split(",")]:
+    for name in [FAILURE_ALERT_CHANNEL, *raw_extras.split(",")]:
         channel = _normalize_channel(name)
         if channel and channel not in channels:
             channels.append(channel)
@@ -53,7 +62,7 @@ def resolve_alert_channels() -> list[str]:
 
 
 def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
-    """Task ids in ``failed`` for this run, excluding this alert task."""
+    """Task ids in ``failed`` for this run, excluding the Slack alert tasks."""
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
 
     states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
@@ -62,7 +71,7 @@ def _get_failed_task_ids(dag_id: str, run_id: str) -> list[str]:
         task_id
         for task_id, state in per_run.items()
         if str(getattr(state, "value", state)).lower() == "failed"
-        and task_id != FAILURE_ALERT_TASK_ID
+        and task_id not in _ALERT_TASK_IDS
     )
 
 
@@ -74,17 +83,24 @@ def _post_to_slack(message: str, *, channel: str) -> None:
     )
 
 
+def _dag_link(dag_id: str) -> str:
+    base_url = airflow_conf.get("webserver", "base_url", fallback="").rstrip("/")
+    return f"<{base_url}/dags/{dag_id}/|View DAG>" if base_url else f"DAG: `{dag_id}`"
+
+
+def _log_prefix(task_id: str, dag_id: str, run_id: str) -> str:
+    return f"[{task_id} dag_id={dag_id} run_id={run_id}]"
+
+
 def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
     """Post one message per target channel listing failed tasks, or skip if none failed."""
     run_id = str(context["run_id"])
-    log_prefix = f"[slack_alert dag_id={dag_id} run_id={run_id}]"
+    log_prefix = _log_prefix(FAILURE_ALERT_TASK_ID, dag_id, run_id)
 
     failed = _get_failed_task_ids(dag_id, run_id)
     if not failed:
         raise AirflowSkipException(f"{log_prefix} no task failures; nothing to alert")
 
-    base_url = airflow_conf.get("webserver", "base_url", fallback="").rstrip("/")
-    link = f"<{base_url}/dags/{dag_id}/|View DAG>" if base_url else f"DAG: `{dag_id}`"
     message = (
         f":red_circle: *DAG Failed*\n"
         f"*Tenant:* `{tenant}`\n"
@@ -92,13 +108,13 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
         f"*Run ID:* `{run_id}`\n"
         f"*Failed Tasks ({len(failed)}):*\n"
         + "\n".join(f"• `{task_id}`" for task_id in failed)
-        + f"\n{link}"
+        + f"\n{_dag_link(dag_id)}"
     )
 
     # Every channel is attempted so a misconfigured extra can't suppress the
     # alert in the others; the task still goes red if any send failed.
     errors: dict[str, Exception] = {}
-    for channel in resolve_alert_channels():
+    for channel in resolve_failure_alert_channels():
         logger.info("%s sending Slack alert (%d failed) to %s", log_prefix, len(failed), channel)
         try:
             _send_with_retry(_post_to_slack)(message, channel=channel)
@@ -113,6 +129,85 @@ def _send_failure_alert(context: dict[str, Any], *, tenant: str, dag_id: str) ->
     logger.info("%s alert sent", log_prefix)
 
 
+def _prepare_payload(context: dict[str, Any]) -> dict[str, Any]:
+    """``prepare_dbt_args`` XCom, or ``{}`` if missing / unreadable."""
+    ti = context.get("ti")
+    if ti is None:
+        return {}
+    try:
+        pulled = ti.xcom_pull(task_ids=PREPARE_TASK_ID)
+    except Exception:  # noqa: BLE001 — params are a sufficient fallback
+        logger.warning("could not read %s XCom; falling back to DAG params", PREPARE_TASK_ID)
+        return {}
+    return pulled if isinstance(pulled, dict) else {}
+
+
+def _resolve_run_details(context: dict[str, Any]) -> dict[str, Any]:
+    """Run type and window from ``prepare_dbt_args`` XCom, falling back to params."""
+    params = context.get("params") or {}
+    prep = _prepare_payload(context)
+    dbt_vars = prep.get("vars") if isinstance(prep.get("vars"), dict) else {}
+    backfill_mode = params.get("backfill_mode") or "none"
+    run_type = prep.get("run_context") or _BACKFILL_MODE_TO_RUN_TYPE.get(
+        backfill_mode, "normal"
+    )
+    return {
+        "run_type": run_type,
+        "execution_ts": dbt_vars.get("execution_ts") or params.get("execution_ts"),
+        "start_ts": dbt_vars.get("backfill_start_ts") or params.get("start_ts"),
+        "end_ts": dbt_vars.get("backfill_end_ts") or params.get("end_ts"),
+    }
+
+
+def _format_success_window_lines(details: dict[str, Any]) -> str:
+    lines = [f"*Run Type:* `{details['run_type']}`"]
+    if details["run_type"] == "partial_backfill":
+        if details.get("start_ts"):
+            lines.append(f"*Start TS:* `{details['start_ts']}`")
+        if details.get("end_ts"):
+            lines.append(f"*End TS:* `{details['end_ts']}`")
+    elif details.get("execution_ts"):
+        lines.append(f"*Execution TS:* `{details['execution_ts']}`")
+    return "\n".join(lines)
+
+
+def _send_success_alert(context: dict[str, Any], *, tenant: str, dag_id: str) -> None:
+    """Post a completion message to ``#pipeline-completion-alerts``, or skip.
+
+    Skips when any task failed *or* Slack cannot be reached, so a Slack outage
+    or a missing channel invite cannot turn a successful dbt run red.
+    """
+    run_id = str(context["run_id"])
+    log_prefix = _log_prefix(SUCCESS_ALERT_TASK_ID, dag_id, run_id)
+
+    failed = _get_failed_task_ids(dag_id, run_id)
+    if failed:
+        raise AirflowSkipException(
+            f"{log_prefix} {len(failed)} task failure(s); skipping success alert"
+        )
+
+    details = _resolve_run_details(context)
+    message = (
+        f":large_green_circle: *DAG Succeeded*\n"
+        f"*Tenant:* `{tenant}`\n"
+        f"*DAG:* `{dag_id}`\n"
+        f"*Run ID:* `{run_id}`\n"
+        f"{_format_success_window_lines(details)}\n"
+        f"{_dag_link(dag_id)}"
+    )
+
+    channel = _normalize_channel(SUCCESS_ALERT_CHANNEL) or f"#{SUCCESS_ALERT_CHANNEL}"
+    logger.info("%s sending Slack success alert to %s", log_prefix, channel)
+    try:
+        _send_with_retry(_post_to_slack)(message, channel=channel)
+    except Exception as exc:  # noqa: BLE001 — skip so a green run stays green
+        logger.exception("%s could not post to %s", log_prefix, channel)
+        raise AirflowSkipException(
+            f"{log_prefix} Slack success alert failed for {channel}; skipping"
+        ) from exc
+    logger.info("%s alert sent", log_prefix)
+
+
 def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
     """Terminal ``all_done`` task: Slack alert for failed tasks, or skip."""
 
@@ -121,3 +216,13 @@ def build_failure_alert_task(*, tenant: str, dag_id: str) -> Any:
         _send_failure_alert(context, tenant=tenant, dag_id=dag_id)
 
     return slack_failure_alert()
+
+
+def build_success_alert_task(*, tenant: str, dag_id: str) -> Any:
+    """Terminal ``all_done`` task: Slack success ping, or skip if anything failed."""
+
+    @task(task_id=SUCCESS_ALERT_TASK_ID, trigger_rule=TriggerRule.ALL_DONE, retries=1)
+    def slack_success_alert(**context: Any) -> None:
+        _send_success_alert(context, tenant=tenant, dag_id=dag_id)
+
+    return slack_success_alert()

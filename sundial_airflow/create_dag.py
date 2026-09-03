@@ -10,7 +10,7 @@ the tenant DAGs:
   failing source test only blocks its own subtree, not the whole pipeline)
 - the Cosmos ``DbtTaskGroup``
 - ``report_data_processed`` task (BigQuery / Snowflake variant)
-- terminal ``slack_failure_alert`` task
+- terminal ``slack_failure_alert`` / ``slack_success_alert`` tasks
 
 Tenant DAG files reduce to ~25 lines: a single ``create_dag(...)`` call
 configured with their connection IDs / dataset name / schedule.
@@ -51,7 +51,10 @@ from sundial_airflow.hooks import (
 )
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
-from sundial_airflow.slack_alerts import build_failure_alert_task
+from sundial_airflow.slack_alerts import (
+    build_failure_alert_task,
+    build_success_alert_task,
+)
 from sundial_airflow.source_discovery import (
     discover_source_tables_with_tests,
     discover_source_to_models,
@@ -630,9 +633,11 @@ def create_dag(
         notify_task = build_notify_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models] >> notify_task
 
-        # Terminal Slack failure alert — waits for the whole run; skips if none failed.
-        [source_test_group, dbt_models, notify_task] >> build_failure_alert_task(
-            tenant=tenant, dag_id=dag_id
-        )
+        # Terminal Slack alerts — wait for the whole run. Failure skips if
+        # nothing failed; success skips if anything failed.
+        [source_test_group, dbt_models, notify_task] >> [
+            build_failure_alert_task(tenant=tenant, dag_id=dag_id),
+            build_success_alert_task(tenant=tenant, dag_id=dag_id),
+        ]
 
     return _build()
