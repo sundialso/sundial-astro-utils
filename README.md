@@ -21,6 +21,32 @@ its own connection IDs, schedule, and dbt project files.
 | `sundial_airflow.source_discovery` | Parse `sources.yml` + singular tests to find source tables that need source tests. |
 | `sundial_airflow.params` | Standard `airflow.models.param.Param` set used by every tenant. |
 | `sundial_airflow.run_input` | Shared parse of DAG params (`select`, backfill window, `run_context`, …) used by `prepare_dbt_args`, Slack alerts, and notify. |
+| `_sundial_csid` | Snowflake partner attribution (CSID). Autoloaded at interpreter startup by `_sundial_csid.pth`; no import needed from a DAG. See below. |
+
+### Snowflake partner attribution (CSID)
+
+Installing this package tags Snowflake sessions opened by dbt with Sundial's
+CSID, `Sundial_Analytics`. Nothing to wire up — `_sundial_csid.pth` runs at
+interpreter startup and arms a lazy import hook.
+
+`dbt-snowflake` hardcodes `application="dbt"` in its `connect` call, with no
+profiles.yml key or env var to override it, and the connector's `SF_PARTNER`
+fallback only fires when `application` is absent. The hook wraps
+`SnowflakeConnection.__init__` and rewrites the value when it is unset or
+dbt-shaped; a deliberate value from tenant code is left alone, as are calls
+that resolve through `connections.toml`.
+
+This reaches dbt because Cosmos runs it **in-process**: with dbt-core importable
+alongside Airflow — which every Snowflake tenant has, via either
+`astronomer-cosmos[dbt-snowflake]` or a direct `dbt-snowflake` pin —
+`_discover_invocation_mode` selects `InvocationMode.DBT_RUNNER` and
+`ExecutionConfig.dbt_executable_path` is not used. A tenant that drops dbt from
+the Airflow environment falls back to `SUBPROCESS` against `dbt_venv`, where
+this package is not installed, and attribution is lost silently.
+
+Ground truth is `ACCOUNT_USAGE.SESSIONS.CLIENT_APPLICATION_ID`, not this repo.
+If a patch ever fails it is parked rather than raised — read it with
+`python -c "import _sundial_csid; print(_sundial_csid.PATCH_FAILURES)"`.
 
 ## Using it from a tenant repo
 
