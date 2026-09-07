@@ -65,6 +65,26 @@ class PythonPathTest(unittest.TestCase):
             os.pathsep.join([csid.csid_site_dir(), "/a", "/b"]),
         )
 
+    def test_preserves_empty_components(self):
+        # Python reads an empty component as the working directory, so dropping
+        # one would take cwd off the dbt subprocess's sys.path. ``:/x`` is what
+        # ``export PYTHONPATH=$PYTHONPATH:/x`` yields when the var was unset.
+        for given in (f"/a{os.pathsep}{os.pathsep}/b", f"{os.pathsep}/b", f"/a{os.pathsep}"):
+            with self.subTest(given=given):
+                env = csid.with_csid_pythonpath({"PYTHONPATH": given})
+                self.assertEqual(
+                    env["PYTHONPATH"], os.pathsep.join([csid.csid_site_dir(), given])
+                )
+
+    def test_an_empty_value_contributes_nothing(self):
+        # CPython treats PYTHONPATH="" exactly like unset. Splitting it would
+        # leave a trailing empty component and *add* a cwd entry that was not
+        # there — the mirror image of dropping a real one.
+        self.assertEqual(
+            csid.with_csid_pythonpath({"PYTHONPATH": ""}),
+            {"PYTHONPATH": csid.csid_site_dir()},
+        )
+
     def test_is_idempotent(self):
         once = csid.with_csid_pythonpath()
         self.assertEqual(csid.with_csid_pythonpath(once), once)
@@ -146,6 +166,39 @@ class SubprocessAutoloadTest(unittest.TestCase):
             # Every dbt subprocess pays interpreter startup; importing the
             # connector eagerly there would cost hundreds of ms.
             self.assertEqual(result.stdout.strip(), "False")
+
+    def test_an_empty_component_still_puts_cwd_on_sys_path(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            # Run a script file rather than ``-c``: with ``-c`` sys.path[0] is
+            # already "", which would mask whether the component survived.
+            scripts = tmp / "scripts"
+            scripts.mkdir()
+            (scripts / "probe.py").write_text(
+                "import os, sys\n"
+                "print(os.getcwd() in sys.path or '' in sys.path)\n"
+            )
+            staged = Path(csid.csid_site_dir()) / "_sundial_csid.py"
+            if not staged.exists():
+                staged.write_text((_ROOT / "_sundial_csid.py").read_text())
+                self.addCleanup(staged.unlink)
+
+            env = dict(os.environ)
+            env.update(
+                csid.with_csid_pythonpath({"PYTHONPATH": f"{os.pathsep}{tmp}"})
+            )
+            result = subprocess.run(
+                [sys.executable, str(scripts / "probe.py")],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(tmp),
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "True")
 
     def test_a_shadowed_sitecustomize_still_runs(self):
         import tempfile

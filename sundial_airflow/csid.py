@@ -35,12 +35,20 @@ def with_csid_pythonpath(env: Mapping[str, str] | None = None) -> dict[str, str]
     Called with no argument it yields just that one variable, which is what the
     Cosmos operators want: they default to ``append_env=False``, so the dbt
     subprocess does not inherit ``os.environ`` and this is layered on top of the
-    env Cosmos builds itself. Existing entries are preserved, and re-applying is
-    a no-op.
+    env Cosmos builds itself. Re-applying is a no-op.
+
+    Existing components are preserved verbatim, empty ones included: Python
+    reads an empty ``PYTHONPATH`` component as the working directory, so
+    dropping it would quietly take cwd off the dbt subprocess's ``sys.path``.
+    ``PYTHONPATH=":/x"`` is what ``export PYTHONPATH=$PYTHONPATH:/x`` produces
+    when the variable was unset, so this is not a hypothetical shape. An unset
+    or empty value contributes nothing, which is what CPython does with it —
+    splitting ``""`` would otherwise *add* a cwd entry that was not there.
     """
     result = dict(env or {})
     entry = csid_site_dir()
-    parts = [p for p in (result.get("PYTHONPATH") or "").split(os.pathsep) if p]
+    pythonpath = result.get("PYTHONPATH")
+    parts = pythonpath.split(os.pathsep) if pythonpath else []
     if entry not in parts:
         parts.insert(0, entry)
     result["PYTHONPATH"] = os.pathsep.join(parts)
