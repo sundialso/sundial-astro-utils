@@ -38,6 +38,12 @@ sundial_dbt_completions = "sundial_airflow.listeners:SundialDbtCompletionsPlugin
 # Airflow and Cosmos in every process on the image.
 py-modules = ["_sundial_csid"]
 
+[tool.setuptools.package-data]
+# Autoloaded as ``sitecustomize`` off the dbt subprocess's PYTHONPATH, with the
+# payload staged beside it by setup.py. Not a package: it must contain nothing
+# importable beyond those two names.
+sundial_airflow = ["_csid_site/*.py"]
+
 [tool.setuptools.packages.find]
 include = ["sundial_airflow*"]
 

@@ -43,6 +43,7 @@ from sundial_airflow.chunking.chunk_spec import build_chunk_units
 from sundial_airflow.chunking.graph import build_chunked_model_graph
 from sundial_airflow.chunking.run_plan import build_run_plan, serialize_run_plan
 from sundial_airflow.chunking.watermarks import fetch_partition_watermarks
+from sundial_airflow.csid import with_csid_pythonpath
 from sundial_airflow.dbt_runtime import ensure_dbt_deps
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
@@ -301,7 +302,7 @@ def create_dag(
                     profile_path,
                     profile_env,
                 ):
-                    env = {**os.environ, **profile_env}
+                    env = with_csid_pythonpath({**os.environ, **profile_env})
                     # `dbt ls` compiles the project, which fails when
                     # packages.yml declares packages not installed in
                     # dbt_packages/. The scheduled path skips this block
@@ -454,6 +455,9 @@ def create_dag(
                     ),
                     install_deps=True,
                     pre_execute=make_source_test_skip_hook(dependents),
+                    # Autoloads the CSID patch in the dbt venv. Layered on top
+                    # of the env Cosmos builds; append_env stays False.
+                    env=with_csid_pythonpath(),
                 )
 
         cosmos_render = RenderConfig(
@@ -482,6 +486,8 @@ def create_dag(
                 ),
                 "install_deps": False,
                 "pre_execute": skip_unselected,
+                # Autoloads the CSID patch in the dbt venv Cosmos shells out to.
+                "env": with_csid_pythonpath(),
                 # ``none_failed`` lets a model run when its upstream source
                 # test was *skipped* (skip_tests / empty mode) but still
                 # propagates ``upstream_failed`` if the test actually failed.
