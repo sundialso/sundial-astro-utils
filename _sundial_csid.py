@@ -1,12 +1,12 @@
 """Snowflake partner attribution (CSID) for Cosmos-run dbt.
 
-Autoloaded by ``_sundial_csid.pth``, which ``site`` executes at every
-interpreter startup once this distribution is installed. That reaches the
-Airflow worker, which is where Cosmos actually runs dbt: with dbt-core
-importable alongside Airflow, ``DbtLocalBaseOperator._discover_invocation_mode``
-selects ``InvocationMode.DBT_RUNNER`` and invokes dbt in-process, ignoring
-``ExecutionConfig.dbt_executable_path``. Every tenant on this package installs a
-dbt adapter into the Airflow environment, so that is the branch taken.
+Loaded two ways, because two interpreters matter. ``_sundial_csid.pth`` covers
+the Airflow environment, where the ``SnowflakeHook`` connections happen
+(partition watermarks, ``report_data_processed``). dbt runs somewhere else:
+``create_dag`` requires an ``ExecutionConfig`` pointing at a dbt virtualenv, so
+Cosmos shells out to ``dbt_venv/bin/dbt`` and that interpreter never processes
+our ``.pth``. It picks this module up as ``sitecustomize`` off ``PYTHONPATH``
+instead — see ``sundial_airflow.csid``.
 
 ``dbt-snowflake`` hardcodes ``application="dbt"`` in its
 ``snowflake.connector.connect`` call, with no profiles.yml key or env var to
@@ -21,8 +21,9 @@ importing the package would pull Airflow and Cosmos into *every* Python process
 on the image at interpreter startup. Nothing here imports beyond the stdlib, and
 the connector itself is touched only once something else imports it.
 
-Ground truth for whether attribution lands is
-``ACCOUNT_USAGE.SESSIONS.CLIENT_APPLICATION_ID``, not this file.
+Ground truth for whether attribution lands is ``ACCOUNT_USAGE.SESSIONS``:
+``client_environment`` carries the tag as its ``APPLICATION`` key, and
+``APPLICATION_PATH`` alongside it names the interpreter that connected.
 """
 from __future__ import annotations
 
