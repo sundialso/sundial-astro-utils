@@ -12,6 +12,7 @@ assertion about what the patch did to it.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
 import subprocess
@@ -19,6 +20,7 @@ import sys
 import textwrap
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
 _ROOT = Path(__file__).resolve().parent.parent
 
@@ -33,6 +35,93 @@ def _load_csid_module():
 
 
 csid = _load_csid_module()
+
+
+_CSID_CALL = "with_csid_pythonpath"
+
+
+class _Site(NamedTuple):
+    lineno: int
+    description: str
+    covered: bool
+
+
+def _enclosing_scopes(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    """Map each node to the function (or module) that contains it."""
+    scopes: dict[ast.AST, ast.AST] = {}
+
+    def walk(node: ast.AST, scope: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = child if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else scope
+            scopes[child] = inner if child is not inner else scope
+            walk(child, inner)
+
+    scopes[tree] = tree
+    walk(tree, tree)
+    return scopes
+
+
+def _env_expression(call: ast.Call) -> ast.expr | None:
+    """The env passed to a call — directly, or inside Cosmos operator_args."""
+    for kw in call.keywords:
+        if kw.arg == "env":
+            return kw.value
+        if kw.arg == "operator_args" and isinstance(kw.value, ast.Dict):
+            for key, value in zip(kw.value.keys, kw.value.values):
+                if isinstance(key, ast.Constant) and key.value == "env":
+                    return value
+    return None
+
+
+def _describe(call: ast.Call) -> str | None:
+    """Name the dbt invocation this call represents, or None if it isn't one."""
+    func = ast.unparse(call.func)
+    if func.endswith("subprocess.run"):
+        return "subprocess.run"
+    if any(kw.arg == "dbt_executable_path" for kw in call.keywords):
+        return f"{func}(dbt_executable_path=...)"
+    if func.endswith("DbtTaskGroup"):
+        return "DbtTaskGroup"
+    if func.endswith("ensure_dbt_deps"):
+        return "ensure_dbt_deps"
+    return None
+
+
+def dbt_invocation_sites(source: str) -> list[_Site]:
+    """Every dbt invocation in a module, and whether its env carries the CSID.
+
+    A bare `env=env` is resolved against assignments to that name *within the
+    same function*, so a covered `env` in one function cannot vouch for an
+    uncovered one in another.
+    """
+    tree = ast.parse(source)
+    scopes = _enclosing_scopes(tree)
+    sites: list[_Site] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        description = _describe(node)
+        if description is None:
+            continue
+
+        env = _env_expression(node)
+        covered = False
+        if env is not None:
+            covered = _CSID_CALL in ast.unparse(env)
+            if not covered and isinstance(env, ast.Name):
+                scope = scopes.get(node, tree)
+                covered = any(
+                    _CSID_CALL in ast.unparse(assign.value)
+                    for assign in ast.walk(scope)
+                    if isinstance(assign, ast.Assign)
+                    and any(
+                        isinstance(t, ast.Name) and t.id == env.id for t in assign.targets
+                    )
+                )
+        sites.append(_Site(node.lineno, description, covered))
+
+    return sites
 
 
 class SiteDirTest(unittest.TestCase):
@@ -250,15 +339,47 @@ class ChunkedModelCoverageTest(unittest.TestCase):
         src = self._source("sundial_airflow/chunking/graph.py")
         self.assertIn("env=with_csid_pythonpath()", src)
 
-    def test_every_dbt_executable_call_site_is_covered(self):
-        # Guards the class of bug rather than the two instances: any new
-        # subprocess built from dbt_executable, or any new Cosmos operator
-        # taking dbt_executable_path, needs the env too.
+    def test_every_dbt_invocation_carries_the_env(self):
+        # Per-call-site, not module-wide totals: a second unpatched operator
+        # alongside a well-covered one has to fail, and subprocess calls have
+        # to be checked too. Both are things a count comparison misses.
         for rel in ("sundial_airflow/create_dag.py", "sundial_airflow/chunking/graph.py"):
-            src = self._source(rel)
-            operators = src.count("dbt_executable_path=dbt_executable")
-            envs = src.count("with_csid_pythonpath")
-            self.assertGreaterEqual(
-                envs, operators,
-                f"{rel}: {operators} dbt operator(s) but only {envs} csid env call(s)",
-            )
+            for site in dbt_invocation_sites(self._source(rel)):
+                with self.subTest(module=rel, line=site.lineno, call=site.description):
+                    self.assertTrue(
+                        site.covered,
+                        f"{rel}:{site.lineno} {site.description} has no env "
+                        f"resolving to with_csid_pythonpath()",
+                    )
+
+    def test_the_guard_finds_every_known_invocation(self):
+        # If the finder silently matched nothing, the test above would pass
+        # vacuously — which is the failure mode it exists to prevent.
+        counts = {
+            rel: len(dbt_invocation_sites(self._source(rel)))
+            for rel in ("sundial_airflow/create_dag.py", "sundial_airflow/chunking/graph.py")
+        }
+        self.assertGreaterEqual(counts["sundial_airflow/create_dag.py"], 3, counts)
+        self.assertGreaterEqual(counts["sundial_airflow/chunking/graph.py"], 2, counts)
+
+    def test_the_guard_catches_an_unpatched_addition(self):
+        # The scenario that produced this bug: a new dbt invocation added
+        # beside well-covered ones. Module-wide counting passes here.
+        source = textwrap.dedent(
+            """
+            def build(dbt_executable, profile_config):
+                env = with_csid_pythonpath({**os.environ, **profile_env})
+                subprocess.run(cmd, env=env)
+                covered = DbtTestLocalOperator(
+                    dbt_executable_path=dbt_executable,
+                    env=with_csid_pythonpath(),
+                )
+                forgotten = DbtTestLocalOperator(
+                    dbt_executable_path=dbt_executable,
+                )
+            """
+        )
+        sites = dbt_invocation_sites(source)
+        uncovered = [s for s in sites if not s.covered]
+        self.assertEqual(len(uncovered), 1, [(s.lineno, s.description) for s in sites])
+        self.assertIn("DbtTestLocalOperator", uncovered[0].description)
