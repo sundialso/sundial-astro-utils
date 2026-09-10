@@ -87,12 +87,36 @@ def _describe(call: ast.Call) -> str | None:
     return None
 
 
+def _local_assignments(scope: ast.AST, name: str, before_lineno: int) -> list[ast.expr]:
+    """Assignments to ``name`` in this function's own body, before ``before_lineno``.
+
+    Neither restriction is incidental. An assignment *after* the call cannot
+    cover it, and one inside a *nested* function says nothing about the
+    enclosing body — without both, an unwrapped ``env`` reads as covered.
+    """
+    found: list[ast.expr] = []
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+            ):
+                continue
+            if isinstance(child, ast.Assign) and child.lineno < before_lineno:
+                if any(isinstance(t, ast.Name) and t.id == name for t in child.targets):
+                    found.append(child.value)
+            walk(child)
+
+    walk(scope)
+    return found
+
+
 def dbt_invocation_sites(source: str) -> list[_Site]:
     """Every dbt invocation in a module, and whether its env carries the CSID.
 
-    A bare `env=env` is resolved against assignments to that name *within the
-    same function*, so a covered `env` in one function cannot vouch for an
-    uncovered one in another.
+    A bare ``env=env`` is resolved against assignments to that name in the same
+    function body, before the call. A covered ``env`` in another function, in a
+    nested helper, or on a later line cannot vouch for this one.
     """
     tree = ast.parse(source)
     scopes = _enclosing_scopes(tree)
@@ -112,12 +136,8 @@ def dbt_invocation_sites(source: str) -> list[_Site]:
             if not covered and isinstance(env, ast.Name):
                 scope = scopes.get(node, tree)
                 covered = any(
-                    _CSID_CALL in ast.unparse(assign.value)
-                    for assign in ast.walk(scope)
-                    if isinstance(assign, ast.Assign)
-                    and any(
-                        isinstance(t, ast.Name) and t.id == env.id for t in assign.targets
-                    )
+                    _CSID_CALL in ast.unparse(value)
+                    for value in _local_assignments(scope, env.id, node.lineno)
                 )
         sites.append(_Site(node.lineno, description, covered))
 
@@ -383,3 +403,30 @@ class ChunkedModelCoverageTest(unittest.TestCase):
         uncovered = [s for s in sites if not s.covered]
         self.assertEqual(len(uncovered), 1, [(s.lineno, s.description) for s in sites])
         self.assertIn("DbtTestLocalOperator", uncovered[0].description)
+
+    def test_an_assignment_after_the_call_does_not_cover_it(self):
+        # Resolution has to respect ordering: dbt has already run by the time
+        # the wrapped env is built.
+        source = textwrap.dedent(
+            """
+            def build(dbt_executable):
+                subprocess.run(cmd, env=env)
+                env = with_csid_pythonpath({**os.environ})
+            """
+        )
+        uncovered = [s for s in dbt_invocation_sites(source) if not s.covered]
+        self.assertEqual([s.description for s in uncovered], ["subprocess.run"])
+
+    def test_a_nested_wrapped_assignment_does_not_cover_the_outer_call(self):
+        # A wrapped env inside a helper says nothing about the enclosing body.
+        source = textwrap.dedent(
+            """
+            def build(dbt_executable):
+                def inner():
+                    env = with_csid_pythonpath({**os.environ})
+                env = {**os.environ}
+                subprocess.run(cmd, env=env)
+            """
+        )
+        uncovered = [s for s in dbt_invocation_sites(source) if not s.covered]
+        self.assertEqual([s.description for s in uncovered], ["subprocess.run"])
