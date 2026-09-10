@@ -13,6 +13,7 @@ from airflow.utils.task_group import TaskGroup
 from cosmos.operators.local import DbtTestLocalOperator
 
 from sundial_airflow.chunking.manifest_parser import CHUNKED, BackfillModel
+from sundial_airflow.csid import with_csid_pythonpath
 from sundial_airflow.hooks import (
     PREPARE_TASK_ID,
     skip_chunked_incremental,
@@ -73,7 +74,7 @@ def build_chunked_model_graph(
                 cmd.append("--full-refresh")
             if empty:
                 cmd.append("--empty")
-            env = {**os.environ, **profile_env}
+            env = with_csid_pythonpath({**os.environ, **profile_env})
             result = subprocess.run(
                 cmd, capture_output=True, text=True, env=env, check=False,
             )
@@ -192,6 +193,8 @@ def build_chunked_model_graph(
                     + "')['vars'] }}"
                 ),
                 install_deps=False,
+                # Autoloads the CSID patch in the dbt venv Cosmos shells out to.
+                env=with_csid_pythonpath(),
                 trigger_rule="none_failed_min_one_success",
                 pre_execute=partial(skip_chunked_model_test, model_name=model.name),
             )

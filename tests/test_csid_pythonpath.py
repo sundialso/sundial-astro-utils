@@ -226,3 +226,39 @@ class SubprocessAutoloadTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunkedModelCoverageTest(unittest.TestCase):
+    """Every dbt-invoking surface in the factory must carry the CSID env.
+
+    ami's first post-pin run tagged 35 of 192 dbt_venv sessions: the Cosmos
+    task group and source tests were covered, the chunked models were not.
+    Chunked models are excluded from the Cosmos group
+    (``RenderConfig(exclude=_chunked_names)``) and built separately in
+    ``chunking/graph.py``, which the first pass missed.
+    """
+
+    def _source(self, rel: str) -> str:
+        return (_ROOT / rel).read_text()
+
+    def test_chunked_model_run_carries_the_csid_env(self):
+        src = self._source("sundial_airflow/chunking/graph.py")
+        self.assertIn("with_csid_pythonpath({**os.environ, **profile_env})", src)
+        self.assertNotIn("env = {**os.environ, **profile_env}", src)
+
+    def test_chunk_test_operator_carries_the_csid_env(self):
+        src = self._source("sundial_airflow/chunking/graph.py")
+        self.assertIn("env=with_csid_pythonpath()", src)
+
+    def test_every_dbt_executable_call_site_is_covered(self):
+        # Guards the class of bug rather than the two instances: any new
+        # subprocess built from dbt_executable, or any new Cosmos operator
+        # taking dbt_executable_path, needs the env too.
+        for rel in ("sundial_airflow/create_dag.py", "sundial_airflow/chunking/graph.py"):
+            src = self._source(rel)
+            operators = src.count("dbt_executable_path=dbt_executable")
+            envs = src.count("with_csid_pythonpath")
+            self.assertGreaterEqual(
+                envs, operators,
+                f"{rel}: {operators} dbt operator(s) but only {envs} csid env call(s)",
+            )
