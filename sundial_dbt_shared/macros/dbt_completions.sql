@@ -212,6 +212,10 @@
   across that run's chunks. A model keeps one row per execution_ts it ran on in
   the window — not just its most recent date.
 
+  Run selection: a run_group holding a terminal row wins over one that only ever
+  wrote 'started'; ties break on latest, then run_group_id. A model whose only
+  rows for a date are 'started' still reports 'started' — genuinely in flight.
+
   Rollup rule (per chunk, take its LATEST status by updated_at — so a retry that
   succeeds clears an earlier 'failed' for the same chunk):
     - failed    if ANY chunk's latest status is 'failed'
@@ -256,15 +260,24 @@
     WHERE status NOT IN ('locked_out', 'crashed')
       AND execution_ts >= {{ sundial_dbt_shared.execution_ts_days_ago(days) }}
   ),
-  {# Per (model, execution_ts): pick the latest run_group (max updated_at, then
-     run_group_id for a deterministic tie-break). A later re-run / backfill on the
-     same date supersedes an earlier one. #}
+  {# Per (model, execution_ts): pick the winning run_group. A run_group that
+     reached a terminal ('succeeded'/'failed') outranks one that only ever wrote
+     'started', however recent — an invocation that renders models but runs no
+     hooks (a bare `dbt compile`; `execute` is true at compile time, so the
+     start_ts()/end_ts() watermark MERGEs still insert a 'started' row) leaves a
+     row nothing ever closes, and it must not mask a completed run. Within each
+     of those tiers the latest run_group wins (max updated_at, then
+     run_group_id for a deterministic tie-break), so a later re-run / backfill on
+     the same date still supersedes an earlier one. #}
   ranked AS (
     SELECT
       model_name, execution_ts, run_group_id,
       ROW_NUMBER() OVER (
         PARTITION BY model_name, execution_ts
-        ORDER BY MAX(updated_at) DESC, run_group_id DESC
+        ORDER BY
+          MAX(CASE WHEN status <> 'started' THEN 1 ELSE 0 END) DESC,
+          MAX(updated_at) DESC,
+          run_group_id DESC
       ) AS _rn
     FROM live
     GROUP BY model_name, execution_ts, run_group_id
