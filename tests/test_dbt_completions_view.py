@@ -39,7 +39,10 @@ ranked AS (
     model_name, execution_ts, run_group_id,
     ROW_NUMBER() OVER (
       PARTITION BY model_name, execution_ts
-      ORDER BY MAX(updated_at) DESC, run_group_id DESC
+      ORDER BY
+        MAX(CASE WHEN status <> 'started' THEN 1 ELSE 0 END) DESC,
+        MAX(updated_at) DESC,
+        run_group_id DESC
     ) AS _rn
   FROM live
   GROUP BY model_name, execution_ts, run_group_id
@@ -280,6 +283,62 @@ class ViewTestCase(unittest.TestCase):
         self.add("b", "failed", "R1", "full", 2)
         rows = {r["model_name"]: r["status"] for r in self.view()}
         self.assertEqual(rows, {"a": "succeeded", "b": "failed"})
+
+    # -- terminal-beats-orphan --------------------------------------------
+    # A bare `dbt compile` inserts a 'started' row via the watermark macros and
+    # runs no hooks, so nothing closes it. It must never outrank a finished run.
+
+    def test_orphan_started_does_not_mask_succeeded(self):
+        self.add("orders", "started", "RUN", "full", 1)
+        self.add("orders", "succeeded", "RUN", "full", 2)
+        self.add("orders", "started", "compile-uuid", "full", 3, ws=_T(1), we=_T(2))
+        self.assertEqual(self.one()["status"], "succeeded")
+        self.assertEqual(self.one()["run_group_id"], "RUN")
+
+    def test_orphan_started_does_not_mask_failed(self):
+        self.add("orders", "started", "RUN", "full", 1)
+        self.add("orders", "failed", "RUN", "full", 2)
+        self.add("orders", "started", "compile-uuid", "full", 3)
+        self.assertEqual(self.one()["status"], "failed")
+
+    def test_multiple_orphans_do_not_mask_succeeded(self):
+        self.add("orders", "started", "RUN", "full", 5)
+        self.add("orders", "succeeded", "RUN", "full", 6)
+        for i, rg in enumerate(("c1", "c2", "c3", "c4")):
+            self.add("orders", "started", rg, "full", 7 + i)
+        self.assertEqual(self.one()["status"], "succeeded")
+
+    def test_genuinely_in_flight_still_started(self):
+        """No terminal row for the date -> the model really is running."""
+        self.add("orders", "started", "RUN", "full", 1)
+        self.assertEqual(self.one()["status"], "started")
+
+    def test_later_real_run_still_supersedes_earlier_one(self):
+        """Newest still wins among finished runs."""
+        self.add("orders", "started", "RUN1", "full", 1)
+        self.add("orders", "failed", "RUN1", "full", 2)
+        self.add("orders", "started", "RUN2", "full", 3)
+        self.add("orders", "succeeded", "RUN2", "full", 4)
+        r = self.one()
+        self.assertEqual(r["status"], "succeeded")
+        self.assertEqual(r["run_group_id"], "RUN2")
+
+    def test_orphan_then_real_run_still_succeeded(self):
+        """Arrival order must not matter."""
+        self.add("orders", "started", "compile-uuid", "full", 1)
+        self.add("orders", "started", "RUN", "full", 2)
+        self.add("orders", "succeeded", "RUN", "full", 3)
+        self.assertEqual(self.one()["status"], "succeeded")
+
+    def test_chunked_in_flight_not_masked_by_orphan(self):
+        """An in-flight chunked run keeps its own status and run_group."""
+        self.add("orders", "started", "RUN", "c1", 1)
+        self.add("orders", "succeeded", "RUN", "c1", 2)
+        self.add("orders", "started", "RUN", "c2", 3)
+        self.add("orders", "started", "compile-uuid", "full", 4)
+        r = self.one()
+        self.assertEqual(r["status"], "started")
+        self.assertEqual(r["run_group_id"], "RUN")
 
 
 if __name__ == "__main__":
