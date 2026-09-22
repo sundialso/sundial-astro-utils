@@ -1,8 +1,7 @@
 """Terminal task that fails the DagRun when any task failed.
 
-Airflow derives the DagRun state from leaf tasks only. Both Slack alerts are
-leaves that succeed or skip, so without this task a run with a failed source
-test or model still finishes green.
+Airflow reads the DagRun state from leaf tasks only, and the Slack alerts —
+the other leaves — only ever succeed or skip.
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ _UNSUCCESSFUL_STATES = frozenset({"failed", "upstream_failed"})
 
 
 def _unsuccessful_task_ids(dag_id: str, run_id: str) -> list[str]:
-    """Task ids in this run that failed, or were skipped by a failed upstream."""
+    """Task ids in this run that failed or were blocked by a failed upstream."""
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
 
     run_states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
@@ -33,11 +32,11 @@ def _unsuccessful_task_ids(dag_id: str, run_id: str) -> list[str]:
 
 
 def build_run_state_task(*, dag_id: str) -> Any:
-    """Build the task. Wire it to the same upstreams as the Slack alerts.
+    """Build the task; wire it to the same upstreams as the Slack alerts.
 
-    ``all_done`` so it always runs and ends green on a clean run, red otherwise
-    — a skipped task would read as neither. ``retries=0`` overrides the tenant
-    ``default_args``: the check has no side effect worth repeating.
+    ``all_done`` so it always runs: green on a clean run, red otherwise.
+    ``retries=0`` overrides the tenant ``default_args``; the check has no side
+    effect worth repeating.
     """
 
     @task(task_id=RUN_STATE_TASK_ID, trigger_rule=TriggerRule.ALL_DONE, retries=0)
