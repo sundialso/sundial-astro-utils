@@ -31,6 +31,7 @@ from sundial_airflow.hooks import (
 from sundial_airflow.notify import build_notify_task
 from sundial_airflow.params import build_standard_params
 from sundial_airflow.run_input import parse_run_input
+from sundial_airflow.run_state import build_run_state_task
 from sundial_airflow.slack_alerts import (
     build_failure_alert_task,
     build_success_alert_task,
@@ -373,6 +374,11 @@ def make_dbt_dag(
         success_alert = build_success_alert_task(tenant=tenant, dag_id=dag_id)
         [source_test_group, dbt_models, notify_task] >> failure_alert
         [source_test_group, dbt_models, notify_task] >> success_alert
+
+        # The alerts only ever succeed or skip, so neither can turn the run
+        # red. This leaf is the one that does.
+        run_state = build_run_state_task(dag_id=dag_id)
+        [source_test_group, dbt_models, notify_task] >> run_state
 
         run_tasks_by_model = _collect_run_tasks(dbt_models)
         for (source_name, table_name), test_task in source_test_tasks.items():
