@@ -15,6 +15,7 @@ from tenacity import (
 )
 
 from sundial_airflow.run_input import RunInput, run_input_from_context
+from sundial_airflow.run_state import RUN_STATE_TASK_ID
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,10 @@ SUCCESS_ALERT_TASK_ID = "slack_success_alert"
 FAILURE_ALERT_CHANNEL = "etl-alerts"
 SUCCESS_ALERT_CHANNEL = "pipeline-completion-alerts"
 EXTRA_CHANNELS_ENV_VAR = "SUNDIAL_SLACK_EXTRA_ALERT_CHANNELS"
-_ALERT_TASK_IDS = frozenset({FAILURE_ALERT_TASK_ID, SUCCESS_ALERT_TASK_ID})
+# Terminal bookkeeping tasks: they report on the run, they are not part of it.
+_NON_PIPELINE_TASK_IDS = frozenset(
+    {FAILURE_ALERT_TASK_ID, SUCCESS_ALERT_TASK_ID, RUN_STATE_TASK_ID}
+)
 _FAILED_STATES = frozenset({"failed"})
 _UNSUCCESSFUL_STATES = frozenset({"failed", "upstream_failed"})
 _DEFAULT_CHUNK_VAR_KEYS = ("backfill_start_ts", "backfill_end_ts")
@@ -61,7 +65,7 @@ def resolve_failure_alert_channels() -> list[str]:
 
 
 def _task_ids_in_states(dag_id: str, run_id: str, states: frozenset[str]) -> list[str]:
-    """Task ids in ``states`` for this run, excluding the Slack alert tasks."""
+    """Task ids in ``states`` for this run, excluding alert / run-status tasks."""
     from airflow.sdk.execution_time.task_runner import RuntimeTaskInstance
 
     run_states = RuntimeTaskInstance.get_task_states(dag_id=dag_id, run_ids=[run_id])
@@ -70,7 +74,7 @@ def _task_ids_in_states(dag_id: str, run_id: str, states: frozenset[str]) -> lis
         task_id
         for task_id, state in per_run.items()
         if str(getattr(state, "value", state)).lower() in states
-        and task_id not in _ALERT_TASK_IDS
+        and task_id not in _NON_PIPELINE_TASK_IDS
     )
 
 
