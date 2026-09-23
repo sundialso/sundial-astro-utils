@@ -71,6 +71,17 @@ class FailedTaskIdsTest(unittest.TestCase):
 
         self.assertEqual(result, ["model_a"])
 
+    def test_excludes_check_run_status(self) -> None:
+        from sundial_airflow.run_state import RUN_STATE_TASK_ID
+
+        with mock.patch(
+            _GET_TASK_STATES,
+            return_value=_states(model_a="failed", **{RUN_STATE_TASK_ID: "failed"}),
+        ):
+            result = slack_alerts._get_failed_task_ids("dbt_acme", _RUN_ID)
+
+        self.assertEqual(result, ["model_a"])
+
     def test_returns_sorted_failures(self) -> None:
         with mock.patch(
             _GET_TASK_STATES,
